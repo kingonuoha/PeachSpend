@@ -1,50 +1,61 @@
-# Welcome to your Expo app 👋
+# PeachSpend
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+PeachSpend is a premium, AI-powered expense tracking application built with **React Native (Expo)** and **Google Gemini**. It features a stunning "Luminous Noir" design system, local-first storage with **SQLite**, and intelligent expense categorization.
 
-## Get started
+## ✨ Features
 
-1. Install dependencies
+- **Luminous Noir UI:** A sophisticated, glassmorphic design system with vibrant "Peach" accents.
+- **AI Scanning:** Instant expense categorization and data extraction powered by Google Gemini 1.5 Flash.
+- **Local-First:** All data stays on your device using `expo-sqlite`. No cloud sync required.
+- **Beautiful Typography:** Uses Google Fonts (Noto Serif & Manrope) for a premium reading experience.
+- **Native Performance:** Fully optimized for both iOS and Android with equal parity.
 
+## 🚀 Getting Started
+
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) (v18+)
+- [Expo CLI](https://docs.expo.dev/get-started/installation/)
+- [EAS CLI](https://docs.expo.dev/build/setup/) (for builds)
+
+### Installation
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/kingonuoha/PeachSpend.git
+   ```
+
+2. Navigate to the app directory:
+   ```bash
+   cd app
+   ```
+
+3. Install dependencies:
    ```bash
    npm install
    ```
 
-2. Start the app
-
+4. Start the development server:
    ```bash
    npx expo start
    ```
 
-In the output, you'll find options to open the app in a
+## 🛠 Tech Stack
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+- **Framework:** Expo SDK 52 (React Native)
+- **Navigation:** Expo Router v4
+- **Styling:** NativeWind (Tailwind CSS) + Luminous Noir Tokens
+- **Database:** `expo-sqlite`
+- **AI:** Google Gemini 1.5 Flash
+- **Icons:** Lucide React Native
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+## 🎨 Design Guidelines
 
-## Get a fresh project
+The app follows the **Luminous Noir** design system. Key principles:
+- **Depth:** Use glassmorphism and subtle gradients instead of solid borders.
+- **Contrast:** High-contrast text on deep surface containers.
+- **Color:** Peach accents (`#FF8C69`) for interactive elements.
 
-When you're ready, run:
+## 📄 License
 
-```bash
-npm run reset-project
-```
-
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+MIT License - see [LICENSE](LICENSE) for details.

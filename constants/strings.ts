@@ -1,0 +1,48 @@
+export const Strings = {
+  app_name: 'PeachSpend',
+  onboarding: {
+    slide1_title: 'Track Beautifully',
+    slide1_subtitle: 'Experience expense tracking with a premium, luminous touch.',
+    slide2_title: 'Scan in Seconds',
+    slide2_subtitle: 'Let Gemini AI handle the data entry from your receipts.',
+    slide3_title: 'Know Your Spending',
+    slide3_subtitle: 'Get deep insights into your financial habits instantly.',
+    get_started: 'Get Started',
+  },
+  home: {
+    greeting_morning: 'Good Morning',
+    greeting_afternoon: 'Good Afternoon',
+    greeting_evening: 'Good Evening',
+    total_balance: 'Total Balance',
+    recent_expenses: 'Recent Expenses',
+    add_funds: 'Add Funds',
+    no_expenses: 'No expenses yet. Start by scanning a receipt!',
+  },
+  scan: {
+    title: 'Scan Receipt',
+    camera_permission: 'We need your permission to show the camera',
+    grant_permission: 'Grant Permission',
+    processing: 'Processing receipt...',
+  },
+  review: {
+    title: 'Review Expense',
+    merchant: 'Merchant',
+    amount: 'Amount',
+    category: 'Category',
+    save: 'Save Expense',
+    subtitle: 'Extract and verify details below.',
+  },
+  analytics: {
+    title: 'Insights',
+    subtitle: 'Your spending trends at a glance.',
+  },
+  settings: {
+    title: 'Settings',
+    profile: 'Profile',
+    security: 'Security',
+    ai_preferences: 'AI Preferences',
+    gemini_api_key: 'Gemini API Key',
+    smart_scan: 'Smart Scan',
+    smart_insights: 'Smart Insights',
+  },
+} as const;

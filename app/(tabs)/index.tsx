@@ -1,98 +1,105 @@
-import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import { View, Text, ScrollView, TouchableOpacity } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { LinearGradient } from 'expo-linear-gradient';
+import { useRouter } from 'expo-router';
+import { Plus, ArrowUpRight } from 'lucide-react-native';
+import Animated, { useSharedValue, useAnimatedStyle, withRepeat, withTiming, withSequence } from 'react-native-reanimated';
+import React, { useMemo, useEffect } from 'react';
 
-import { HelloWave } from '@/components/hello-wave';
-import ParallaxScrollView from '@/components/parallax-scroll-view';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+import { Strings } from '../../constants/strings';
+import { Colors } from '../../constants/tokens';
+import { useExpenses } from '../../hooks/useExpenses';
+import { ExpenseList } from '../../components/expense/ExpenseList';
 
 export default function HomeScreen() {
-  return (
-    <ParallaxScrollView
-      headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
-      headerImage={
-        <Image
-          source={require('@/assets/images/partial-react-logo.png')}
-          style={styles.reactLogo}
-        />
-      }>
-      <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
-        <HelloWave />
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 1: Try it</ThemedText>
-        <ThemedText>
-          Edit <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> to see changes.
-          Press{' '}
-          <ThemedText type="defaultSemiBold">
-            {Platform.select({
-              ios: 'cmd + d',
-              android: 'cmd + m',
-              web: 'F12',
-            })}
-          </ThemedText>{' '}
-          to open developer tools.
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <Link href="/modal">
-          <Link.Trigger>
-            <ThemedText type="subtitle">Step 2: Explore</ThemedText>
-          </Link.Trigger>
-          <Link.Preview />
-          <Link.Menu>
-            <Link.MenuAction title="Action" icon="cube" onPress={() => alert('Action pressed')} />
-            <Link.MenuAction
-              title="Share"
-              icon="square.and.arrow.up"
-              onPress={() => alert('Share pressed')}
-            />
-            <Link.Menu title="More" icon="ellipsis">
-              <Link.MenuAction
-                title="Delete"
-                icon="trash"
-                destructive
-                onPress={() => alert('Delete pressed')}
-              />
-            </Link.Menu>
-          </Link.Menu>
-        </Link>
+  const router = useRouter();
+  const { expenses, isLoading } = useExpenses();
+  const fabScale = useSharedValue(1);
 
-        <ThemedText>
-          {`Tap the Explore tab to learn more about what's included in this starter app.`}
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 3: Get a fresh start</ThemedText>
-        <ThemedText>
-          {`When you're ready, run `}
-          <ThemedText type="defaultSemiBold">npm run reset-project</ThemedText> to get a fresh{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> directory. This will move the current{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> to{' '}
-          <ThemedText type="defaultSemiBold">app-example</ThemedText>.
-        </ThemedText>
-      </ThemedView>
-    </ParallaxScrollView>
+  const greeting = useMemo(() => {
+    const hour = new Date().getHours();
+    if (hour < 12) return Strings.home.greeting_morning;
+    if (hour < 18) return Strings.home.greeting_afternoon;
+    return Strings.home.greeting_evening;
+  }, []);
+
+
+  const balance = useMemo(() => {
+    return expenses.reduce((sum: number, exp: any) => sum - exp.amount, 1000); // Starting balance $1000 for demo
+  }, [expenses]);
+
+  useEffect(() => {
+    fabScale.value = withRepeat(
+      withSequence(
+        withTiming(1.1, { duration: 1000 }),
+        withTiming(1.0, { duration: 1000 })
+      ),
+      -1,
+      true
+    );
+  }, [fabScale]);
+
+  const animatedFabStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: fabScale.value }],
+  }));
+
+  return (
+    <SafeAreaView className="flex-1 bg-background">
+      <ScrollView className="flex-1" contentContainerStyle={{ paddingBottom: 100 }}>
+        {/* Header */}
+        <View className="px-6 pt-8 mb-8">
+          <Text className="text-onSurfaceVariant font-manrope-medium text-lg">
+            {greeting},
+          </Text>
+          <Text className="text-onSurface font-noto-serif-bold text-3xl">
+            Peach User
+          </Text>
+        </View>
+
+        {/* Balance Card */}
+        <View className="px-6 mb-10">
+          <LinearGradient
+            colors={[Colors.primaryContainer, Colors.primary]}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            className="rounded-xl p-8 shadow-xl"
+          >
+            <Text className="text-onPrimaryContainer font-manrope-medium mb-1">
+              {Strings.home.total_balance}
+            </Text>
+            <View className="flex-row items-center justify-between mt-2">
+              <Text className="text-peach-50 text-3xl font-bold">
+                ${balance.toFixed(2)}
+              </Text>
+              <TouchableOpacity
+                className="bg-peach-50/20 px-3 py-1.5 rounded-full flex-row items-center"
+                onPress={() => {/* TODO: Add Funds logic */}}
+              >
+                <ArrowUpRight size={14} color="#FFF5F2" />
+                <Text className="text-peach-50 text-xs font-semibold ml-1">
+                  Add Funds
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </LinearGradient>
+        </View>
+
+        {/* Recent Expenses List */}
+        <ExpenseList expenses={expenses.slice(0, 10)} isLoading={isLoading} />
+      </ScrollView>
+
+      {/* Floating Action Button */}
+      <View className="absolute bottom-6 right-6">
+        <Animated.View style={animatedFabStyle}>
+          <TouchableOpacity
+            onPress={() => router.push('/scan')}
+            className="bg-primary w-16 h-16 rounded-full items-center justify-center shadow-lg"
+            activeOpacity={0.8}
+          >
+            <Plus color={Colors.onPrimary} size={32} />
+          </TouchableOpacity>
+        </Animated.View>
+      </View>
+    </SafeAreaView>
   );
 }
-
-const styles = StyleSheet.create({
-  titleContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  stepContainer: {
-    gap: 8,
-    marginBottom: 8,
-  },
-  reactLogo: {
-    height: 178,
-    width: 290,
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
-  },
-});
