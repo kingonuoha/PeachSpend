@@ -31,9 +31,14 @@ export function useSettings() {
       try {
         const apiKey = await databaseService.getSetting('gemini_api_key');
         const onboarding = await databaseService.getSetting('onboarding_complete');
+        const currency = await databaseService.getSetting('currency');
+        const theme = await databaseService.getSetting('theme');
+        
         setSettings({
           gemini_api_key: apiKey || '',
           onboarding_complete: onboarding || 'false',
+          currency: currency || 'USD',
+          theme: theme || 'dark',
         });
       } catch (error) {
         logger.error('useSettings load error:', error);
@@ -50,5 +55,7 @@ export function useSettings() {
     isLoading,
     getSetting,
     updateSetting,
+    currency: settings.currency || 'USD',
+    theme: settings.theme || 'dark',
   };
 }

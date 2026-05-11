@@ -2,11 +2,13 @@ export interface Expense {
   id: string;
   merchant: string;
   amount: number;
+  currency: string;
   category: string;
   note?: string;
   scanned: number; // 0 or 1
   date: number; // Unix timestamp
   created_at: number; // Unix timestamp
+  image_uri?: string; // Local file URI for attached receipt image
 }
 
 export interface Category {

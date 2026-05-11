@@ -5,8 +5,10 @@ export interface ScannedReceipt {
   merchant: string;
   amount: number;
   category: CategoryKey;
+  currency: string;
   date?: number;
   confidence: number;
+  note?: string; // For item names
 }
 
 export interface GeminiResponse {
@@ -17,4 +19,9 @@ export interface GeminiResponse {
       }[];
     };
   }[];
+  error?: {
+    message: string;
+    code: number;
+    status: string;
+  };
 }

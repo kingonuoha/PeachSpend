@@ -1,35 +1,64 @@
 import React from 'react';
 import { View, Text } from 'react-native';
 import { LuminousCard } from '../ui/LuminousCard';
+import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Colors } from '../../constants/tokens';
 
-interface CategoryBreakdownProps {
-  timeframe: 'week' | 'month';
+interface DistributionItem {
+  name: string;
+  amount: number;
+  percentage: number;
+  color: string;
 }
 
-export const CategoryBreakdown: React.FC<CategoryBreakdownProps> = ({ timeframe }) => {
-  const categories = [
-    { name: 'Dining', amount: 120.50, color: Colors.primary, percentage: 40 },
-    { name: 'Shopping', amount: 85.20, color: Colors.primaryContainer, percentage: 28 },
-    { name: 'Transport', amount: 45.00, color: Colors.success, percentage: 15 },
-    { name: 'Utilities', amount: 50.00, color: Colors.onSurfaceVariant, percentage: 17 },
-  ];
+interface CategoryBreakdownProps {
+  distribution: DistributionItem[];
+  pricesVisible?: boolean;
+}
+
+export const CategoryBreakdown: React.FC<CategoryBreakdownProps> = ({ distribution, pricesVisible = true }) => {
+  const styles = useThemeStyles();
+
+  if (distribution.length === 0) {
+    return (
+      <View className="py-10 items-center">
+        <Text className="text-onSurfaceVariant font-manrope-medium">No activity in this period.</Text>
+      </View>
+    );
+  }
 
   return (
-    <View className="px-6 pb-20">
-      <Text className="text-white font-manrope-bold text-lg mb-4">Categories</Text>
-      {categories.map((cat, i) => (
-        <LuminousCard key={i} containerStyle="flex-row items-center justify-between mb-3 py-4">
-          <View className="flex-row items-center">
-            <View className="w-3 h-3 rounded-full mr-3" style={{ backgroundColor: cat.color }} />
-            <Text className="text-white font-manrope-medium">{cat.name}</Text>
-          </View>
-          <View className="items-end">
-            <Text className="text-white font-manrope-bold">${cat.amount.toFixed(2)}</Text>
-            <Text className="text-textTertiary text-xs">{cat.percentage}%</Text>
-          </View>
-        </LuminousCard>
-      ))}
+    <View style={{ flexWrap: 'wrap', flexDirection: 'row', gap: 12 }}>
+      {distribution.map((item, index) => {
+        const isLarge = index < 2;
+        
+        return (
+          <LuminousCard 
+            key={index} 
+            className={`${isLarge ? 'w-full' : 'w-[48%]'} py-5 px-5`}
+            style={{ borderColor: styles.border.subtle, borderWidth: 1 }}
+          >
+            <View className="flex-row items-center justify-between mb-4">
+              <View className="flex-row items-center">
+                <View className="w-2 h-2 rounded-full mr-2" style={{ backgroundColor: item.color }} />
+                <Text className="text-onSurfaceVariant font-manrope-bold text-xs uppercase tracking-widest">
+                  {item.name}
+                </Text>
+              </View>
+              <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-medium text-[10px]">
+                {item.percentage.toFixed(0)}%
+              </Text>
+            </View>
+
+            <View className="flex-row items-baseline">
+              <Text className="text-primary font-noto-serif-bold text-xs mr-0.5">{pricesVisible ? '$' : ''}</Text>
+              <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-2xl tracking-tighter">
+                {pricesVisible ? item.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '••••'}
+              </Text>
+            </View>
+          </LuminousCard>
+        );
+      })}
     </View>
   );
 };

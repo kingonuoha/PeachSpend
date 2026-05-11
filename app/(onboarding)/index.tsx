@@ -1,10 +1,13 @@
-import React, { useState, useRef } from 'react';
-import { View, FlatList, useWindowDimensions, SafeAreaView } from 'react-native';
+import React, { useState, useRef, useEffect } from 'react';
+import { View, FlatList, useWindowDimensions, Platform } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { OnboardingSlide } from '../../components/onboarding/OnboardingSlide';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { Strings } from '../../constants/strings';
+import { Colors } from '../../constants/tokens';
 import { databaseService } from '../../services/DatabaseService';
+import { useThemeStyles } from '../../hooks/useThemeStyles';
 
 
 const slides = [
@@ -26,10 +29,20 @@ const slides = [
 ];
 
 export default function OnboardingScreen() {
+  const ts = useThemeStyles();
   const [activeIndex, setActiveIndex] = useState(0);
   const { width } = useWindowDimensions();
   const router = useRouter();
   const flatListRef = useRef<FlatList>(null);
+
+  useEffect(() => {
+    (async () => {
+      const completed = await databaseService.getSetting('onboarding_complete');
+      if (completed === 'true') {
+        router.replace('/(tabs)');
+      }
+    })();
+  }, []);
 
   const handleScroll = (event: any) => {
     const scrollPosition = event.nativeEvent.contentOffset.x;
@@ -45,7 +58,7 @@ export default function OnboardingScreen() {
   const isLastSlide = activeIndex === slides.length - 1;
 
   return (
-    <SafeAreaView className="flex-1 bg-background">
+    <SafeAreaView className="flex-1" style={{ backgroundColor: ts.bg.screen }}>
       <View className="flex-[3]">
         <FlatList
           ref={flatListRef}
@@ -62,6 +75,13 @@ export default function OnboardingScreen() {
           showsHorizontalScrollIndicator={false}
           onScroll={handleScroll}
           keyExtractor={(_, index) => index.toString()}
+          getItemLayout={(_, index) => ({
+            length: width,
+            offset: width * index,
+            index,
+          })}
+          windowSize={3}
+          removeClippedSubviews={Platform.OS === 'android'}
         />
       </View>
 
@@ -71,9 +91,8 @@ export default function OnboardingScreen() {
           {slides.map((_, i) => (
             <View
               key={i}
-              className={`h-2 w-2 rounded-full mx-1 ${
-                i === activeIndex ? 'bg-primary' : 'bg-surfaceContainerHigh'
-              }`}
+              style={{ backgroundColor: i === activeIndex ? Colors.primary : ts.bg.card }}
+              className="h-2 w-2 rounded-full mx-1"
             />
           ))}
         </View>

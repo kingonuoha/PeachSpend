@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, FlatList, Image } from 'react-native';
+import { View, Text, Image } from 'react-native';
 import { Expense } from '../../types/database';
 import { ExpenseItem } from './ExpenseItem';
 import { Strings } from '../../constants/strings';
@@ -41,13 +41,11 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ expenses, isLoading })
       <Text className="text-xl text-onSurface font-noto-serif-bold mb-4 px-4">
         {Strings.home.recent_expenses}
       </Text>
-      <FlatList
-        data={expenses}
-        renderItem={({ item }) => <ExpenseItem expense={item} />}
-        keyExtractor={(item) => item.id}
-        scrollEnabled={false} // Home is a scrollview overall
-        contentContainerStyle={{ paddingHorizontal: 16 }}
-      />
+      <View className="px-4">
+        {expenses.map((item) => (
+          <ExpenseItem key={item.id} expense={item} />
+        ))}
+      </View>
     </View>
   );
 };

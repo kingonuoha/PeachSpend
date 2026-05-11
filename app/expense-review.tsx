@@ -11,8 +11,10 @@ import { LuminousCard } from '../components/ui/LuminousCard';
 import { PeachButton } from '../components/ui/PeachButton';
 import { logger } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
+import { useThemeStyles } from '../hooks/useThemeStyles';
 
 export default function ExpenseReviewScreen() {
+  const ts = useThemeStyles();
   const { data } = useLocalSearchParams<{ data: string }>();
   const router = useRouter();
   const parsedData = data ? JSON.parse(data) : {};
@@ -20,6 +22,7 @@ export default function ExpenseReviewScreen() {
   const [merchant, setMerchant] = useState(parsedData.merchant || '');
   const [amount, setAmount] = useState(parsedData.amount?.toString() || '');
   const [category, setCategory] = useState(parsedData.category || 'other');
+  const [currency] = useState(parsedData.currency || 'USD');
   const [note] = useState(parsedData.note || '');
 
   const handleSave = async () => {
@@ -29,6 +32,7 @@ export default function ExpenseReviewScreen() {
         id: uuidv4(),
         merchant,
         amount: parseFloat(amount) || 0,
+        currency,
         category,
         note,
         scanned: 1,
@@ -43,7 +47,7 @@ export default function ExpenseReviewScreen() {
   };
 
   return (
-    <SafeAreaView className="flex-1 bg-black" edges={['bottom']}>
+    <SafeAreaView className="flex-1" style={{ backgroundColor: ts.bg.screen }} edges={['bottom']}>
       <KeyboardAvoidingView 
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         className="flex-1"
@@ -60,13 +64,14 @@ export default function ExpenseReviewScreen() {
             </View>
             <TouchableOpacity 
               onPress={() => router.back()}
-              className="bg-surfaceContainerHigh p-2 rounded-full"
+              className="p-2 rounded-full"
+              style={{ backgroundColor: ts.bg.card }}
             >
               <X color={Colors.textSecondary} size={24} />
             </TouchableOpacity>
           </View>
 
-          <LuminousCard containerStyle="mb-6 p-6">
+          <LuminousCard className="mb-6 p-6">
             {/* Merchant Input */}
             <View className="mb-6">
               <View className="flex-row items-center mb-2">
@@ -80,7 +85,8 @@ export default function ExpenseReviewScreen() {
                 onChangeText={setMerchant}
                 placeholder="Where did you spend?"
                 placeholderTextColor={Colors.textTertiary}
-                className="text-white text-lg font-manrope-medium border-b border-surfaceContainerHigh pb-2"
+                className="text-white text-lg font-manrope-medium border-b pb-2"
+                style={{ borderColor: ts.border.subtle }}
               />
             </View>
 
