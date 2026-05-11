@@ -1,6 +1,10 @@
 import React from 'react';
 import { TouchableOpacity, Text, ActivityIndicator, View } from 'react-native';
+import * as Haptics from 'expo-haptics';
 import { Colors } from '../../constants/tokens';
+
+import { cssInterop } from 'react-native-css-interop';
+import { useThemeStyles } from '../../hooks/useThemeStyles';
 
 interface PeachButtonProps {
   title: string;
@@ -9,6 +13,7 @@ interface PeachButtonProps {
   isLoading?: boolean;
   disabled?: boolean;
   className?: string;
+  style?: any;
   icon?: React.ReactNode;
 }
 
@@ -19,35 +24,42 @@ export const PeachButton: React.FC<PeachButtonProps> = ({
   isLoading = false,
   disabled = false,
   className = '',
+  style,
   icon,
 }) => {
-  const baseStyle = "py-4 px-6 rounded-md flex-row justify-center items-center";
-  
-  const variants = {
-    primary: "bg-primary",
-    secondary: "bg-surfaceContainerHigh",
-    ghost: "bg-transparent border border-outlineVariant",
+  const ts = useThemeStyles();
+  const handlePress = () => {
+    if (!disabled && !isLoading) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      onPress();
+    }
   };
 
-  const textVariants = {
-    primary: "text-onPrimary font-manrope-semibold",
-    secondary: "text-onSurface font-manrope-medium",
-    ghost: "text-primary font-manrope-medium",
+  const baseStyle = "py-4 px-8 rounded-full flex-row justify-center items-center active:scale-95";
+  
+  const variants: Record<string, { bg: string; text: string }> = {
+    primary: { bg: Colors.primary, text: 'text-onPrimary font-manrope-bold' },
+    secondary: { bg: ts.bg.card, text: 'text-onSurface font-manrope-semibold' },
+    ghost: { bg: 'transparent', text: 'text-primary font-manrope-semibold' },
   };
+
+  const v = variants[variant];
+  const borderStyle = variant === 'ghost' ? { borderWidth: 1, borderColor: ts.border.card } : {};
 
   return (
     <TouchableOpacity
-      onPress={onPress}
+      onPress={handlePress}
       disabled={disabled || isLoading}
-      activeOpacity={0.8}
-      className={`${baseStyle} ${variants[variant]} ${disabled ? 'opacity-50' : ''} ${className}`}
+      activeOpacity={0.9}
+      className={`${baseStyle} ${disabled ? 'opacity-40' : ''} ${className}`}
+      style={[{ backgroundColor: v.bg }, borderStyle, style]}
     >
       {isLoading ? (
-        <ActivityIndicator color={variant === 'primary' ? Colors.onPrimary : Colors.primary} />
+        <ActivityIndicator color={variant === 'primary' ? 'black' : Colors.primary} />
       ) : (
         <>
-          {icon && <View className="mr-2">{icon}</View>}
-          <Text className={`text-base ${textVariants[variant]}`}>
+          {icon && <View className="mr-3">{icon}</View>}
+          <Text className={`text-base tracking-tight ${v.text}`}>
             {title}
           </Text>
         </>
@@ -55,3 +67,7 @@ export const PeachButton: React.FC<PeachButtonProps> = ({
     </TouchableOpacity>
   );
 };
+
+cssInterop(PeachButton, {
+  className: 'style',
+});

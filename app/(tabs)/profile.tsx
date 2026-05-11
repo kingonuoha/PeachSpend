@@ -1,64 +1,275 @@
-import React from 'react';
-import { View, Text, ScrollView } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { View, Text, ScrollView, TouchableOpacity, TextInput, Image, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as ImagePicker from 'expo-image-picker';
+import { documentDirectory, makeDirectoryAsync, copyAsync, getInfoAsync } from 'expo-file-system/legacy';
 import { useExpenses } from '../../hooks/useExpenses';
 import { Colors } from '../../constants/tokens';
 import { LuminousCard } from '../../components/ui/LuminousCard';
-import { User, ShieldCheck, Zap } from 'lucide-react-native';
+import { User, ShieldCheck, LogOut, Settings, Bell, HelpCircle, ChevronRight, Camera, Check, X, Pencil } from 'lucide-react-native';
+import { useSettings } from '../../components/ui/SettingsProvider';
+import { useTheme } from '../../components/ui/ThemeProvider';
+import { useThemeStyles } from '../../hooks/useThemeStyles';
+import Animated, { FadeIn, FadeInDown } from 'react-native-reanimated';
+import { useRouter } from 'expo-router';
+
+const PROFILE_DIR = (documentDirectory || '') + 'profile_pics/';
 
 export default function ProfileScreen() {
   const { expenses } = useExpenses();
-  
-  const totalSpent = expenses.reduce((sum, exp) => sum + exp.amount, 0);
+  const { settings, getCurrencySymbol, convertAmount, updateSetting } = useSettings();
+  const { colors } = useTheme();
+  const styles = useThemeStyles();
+  const pricesVisible = settings.prices_visible !== 'false';
+  const router = useRouter();
+
+  const [editingField, setEditingField] = useState<'name' | 'username' | null>(null);
+  const [nameDraft, setNameDraft] = useState('');
+  const [usernameDraft, setUsernameDraft] = useState('');
+  const [profileImageUri, setProfileImageUri] = useState<string | null>(null);
+
+  const displayName = settings.profile_name || 'Peach User';
+  const displayUsername = settings.profile_username || '';
+
+  useEffect(() => {
+    const pic = settings.profile_picture;
+    if (pic) {
+      const path = PROFILE_DIR + pic;
+      getInfoAsync(path).then((info) => {
+        if (info.exists) setProfileImageUri(path);
+      }).catch(() => {});
+    }
+  }, [settings.profile_picture]);
+
+  const totalSpent = expenses.reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
   const scannedCount = expenses.filter(e => e.scanned).length;
 
+  const handlePickImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [1, 1],
+      quality: 0.7,
+    });
+
+    if (result.canceled || !result.assets[0]?.uri) return;
+
+    const uri = result.assets[0].uri;
+    const ext = uri.split('.').pop() || 'jpg';
+    const filename = `avatar_${Date.now()}.${ext}`;
+
+    try {
+      await makeDirectoryAsync(PROFILE_DIR, { intermediates: true });
+      await copyAsync({ from: uri, to: PROFILE_DIR + filename });
+      await updateSetting('profile_picture', filename);
+      setProfileImageUri(PROFILE_DIR + filename);
+    } catch (err) {
+      Alert.alert('Error', 'Failed to save profile picture');
+    }
+  };
+
+  const saveName = async () => {
+    if (nameDraft.trim()) {
+      await updateSetting('profile_name', nameDraft.trim());
+    }
+    setEditingField(null);
+  };
+
+  const saveUsername = async () => {
+    if (usernameDraft.trim()) {
+      await updateSetting('profile_username', usernameDraft.trim());
+    }
+    setEditingField(null);
+  };
+
+  const startEditName = () => {
+    setNameDraft(displayName);
+    setEditingField('name');
+  };
+
+  const startEditUsername = () => {
+    setUsernameDraft(displayUsername);
+    setEditingField('username');
+  };
+
   return (
-    <SafeAreaView className="flex-1 bg-black" edges={['top']}>
-      <ScrollView className="flex-1 px-6 pt-4">
-        {/* Profile Header */}
-        <View className="items-center mb-8">
-          <View className="w-24 h-24 rounded-full bg-surfaceContainerHigh items-center justify-center mb-4 border-2 border-primary/20">
-            <User size={48} color={Colors.primary} />
-          </View>
-          <Text className="text-white text-2xl font-manrope-bold">Kingsley</Text>
-          <Text className="text-textSecondary font-manrope-medium">kingsley@peachspend.app</Text>
+    <SafeAreaView style={{ backgroundColor: styles.bg.screen, flex: 1 }} edges={['top', 'bottom']}>
+      <Animated.ScrollView
+        entering={FadeIn.duration(600)}
+        className="flex-1"
+        showsVerticalScrollIndicator={false}
+      >
+        <View className="px-6 pt-10 pb-12 items-center">
+          {/* Profile Picture */}
+          <Animated.View
+            entering={FadeInDown.delay(200).duration(800).springify()}
+          >
+            <TouchableOpacity onPress={handlePickImage} activeOpacity={0.8}>
+              <View
+                style={{ borderColor: styles.border.primary20 }}
+                className="w-28 h-28 rounded-[40px] bg-primary/10 items-center justify-center mb-6 overflow-hidden"
+              >
+                {profileImageUri ? (
+                  <Image source={{ uri: profileImageUri }} className="w-full h-full" resizeMode="cover" />
+                ) : (
+                  <User size={56} color={Colors.primary} />
+                )}
+                <View className="absolute inset-0 bg-black/30 items-center justify-center opacity-0 active:opacity-100">
+                  <Camera size={24} color="white" />
+                </View>
+              </View>
+              <View
+                style={{ backgroundColor: styles.bg.screen, borderColor: styles.border.card }}
+                className="absolute -bottom-1 right-1 w-8 h-8 rounded-full border-2 items-center justify-center"
+              >
+                <Camera size={14} color={Colors.primary} />
+              </View>
+            </TouchableOpacity>
+          </Animated.View>
+
+          {/* Name */}
+          <Animated.View entering={FadeInDown.delay(300).duration(800).springify()} className="items-center mb-1">
+            {editingField === 'name' ? (
+              <View className="flex-row items-center">
+                <TextInput
+                  value={nameDraft}
+                  onChangeText={setNameDraft}
+                  autoFocus
+                  style={{ color: styles.text.onSurface, borderBottomColor: styles.border.card, borderBottomWidth: 1 }}
+                  className="text-3xl font-noto-serif-bold tracking-tight text-center"
+                />
+                <TouchableOpacity onPress={saveName} className="ml-2 p-1">
+                  <Check size={20} color={Colors.primary} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => setEditingField(null)} className="ml-1 p-1">
+                  <X size={20} color={styles.icon.muted} />
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity onPress={startEditName} className="flex-row items-center">
+                <Text style={{ color: styles.text.onSurface }} className="text-3xl font-noto-serif-bold tracking-tight">
+                  {displayName}
+                </Text>
+                <Pencil size={16} color={styles.icon.muted} style={{ marginLeft: 8 }} />
+              </TouchableOpacity>
+            )}
+          </Animated.View>
+
+          {/* Username */}
+          <Animated.View entering={FadeInDown.delay(350).duration(800).springify()}>
+            {editingField === 'username' ? (
+              <View className="flex-row items-center mt-2">
+                <TextInput
+                  value={usernameDraft}
+                  onChangeText={setUsernameDraft}
+                  autoFocus
+                  style={{ color: styles.text.onSurfaceVariant60, borderBottomColor: styles.border.card, borderBottomWidth: 1 }}
+                  className="font-manrope-medium text-sm text-center"
+                  placeholder="@username"
+                  placeholderTextColor={styles.text.onSurfaceVariant40}
+                />
+                <TouchableOpacity onPress={saveUsername} className="ml-2 p-1">
+                  <Check size={16} color={Colors.primary} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => setEditingField(null)} className="ml-1 p-1">
+                  <X size={16} color={styles.icon.muted} />
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity onPress={startEditUsername} className="flex-row items-center mt-2">
+                <View style={{ backgroundColor: styles.bg.white5, borderColor: styles.border.card }} className="px-3 py-1 rounded-full border flex-row items-center">
+                  <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-medium text-xs">
+                    {displayUsername || '@add_username'}
+                  </Text>
+                  <Pencil size={12} color={styles.icon.muted} style={{ marginLeft: 6 }} />
+                </View>
+              </TouchableOpacity>
+            )}
+          </Animated.View>
         </View>
 
         {/* Stats Grid */}
-        <View className="flex-row justify-between mb-8">
-          <LuminousCard containerStyle="flex-1 mr-2 p-4 items-center">
-            <Text className="text-textSecondary text-xs uppercase tracking-widest font-manrope-semibold mb-1">Tracked</Text>
-            <Text className="text-white text-xl font-manrope-bold">${totalSpent.toFixed(0)}</Text>
+        <Animated.View
+          entering={FadeInDown.delay(400).duration(800).springify()}
+          className="flex-row px-6 mb-12"
+        >
+          <LuminousCard className="flex-1 mr-3 p-6 items-center" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
+            <Text className="text-onSurfaceVariant text-[10px] uppercase tracking-[2px] font-manrope-bold mb-3">Total Flow</Text>
+            <View className="flex-row items-baseline">
+              {pricesVisible && <Text className="text-primary font-noto-serif-bold text-sm mr-1">{getCurrencySymbol()}</Text>}
+              <Text style={{ color: styles.text.onSurface }} className="text-2xl font-noto-serif-bold tracking-tighter">
+                {pricesVisible ? totalSpent.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '••••'}
+              </Text>
+            </View>
           </LuminousCard>
-          <LuminousCard containerStyle="flex-1 ml-2 p-4 items-center">
-            <Text className="text-textSecondary text-xs uppercase tracking-widest font-manrope-semibold mb-1">Scanned</Text>
-            <Text className="text-white text-xl font-manrope-bold">{scannedCount}</Text>
+          <LuminousCard className="flex-1 ml-3 p-6 items-center" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
+            <Text className="text-onSurfaceVariant text-[10px] uppercase tracking-[2px] font-manrope-bold mb-3">Neural Scans</Text>
+            <Text style={{ color: styles.text.onSurface }} className="text-2xl font-noto-serif-bold tracking-tighter">{scannedCount}</Text>
           </LuminousCard>
+        </Animated.View>
+
+        {/* Menu Sections */}
+        <View className="px-6 pb-20">
+          <SectionHeader title="Preferences" />
+          <MenuItem
+            icon={<Settings size={20} color={styles.icon.default} />}
+            label="App Settings"
+            onPress={() => router.push('/settings')}
+          />
+          <MenuItem
+            icon={<Bell size={20} color={styles.icon.default} />}
+            label="Notifications"
+          />
+
+          <View className="mt-8">
+            <SectionHeader title="Security & Help" />
+            <MenuItem
+              icon={<ShieldCheck size={20} color={styles.icon.default} />}
+              label="Privacy Policy"
+              onPress={() => router.push('/privacy-policy')}
+            />
+            <MenuItem
+              icon={<HelpCircle size={20} color={styles.icon.default} />}
+              label="Support Center"
+              onPress={() => router.push('/support-center')}
+            />
+          </View>
+
+          <TouchableOpacity style={{ backgroundColor: styles.bg.error5, borderColor: styles.border.error20, borderWidth: 1 }} className="mt-12 py-5 rounded-[24px] flex-row items-center justify-center">
+            <LogOut color={styles.icon.error} size={20} />
+            <Text style={{ color: styles.text.error }} className="font-manrope-bold ml-3 text-base">Sign Out</Text>
+          </TouchableOpacity>
         </View>
-
-        {/* Lifetime Activity */}
-        <Text className="text-white text-lg font-manrope-bold mb-4">Account Health</Text>
-        
-        <LuminousCard containerStyle="mb-4 p-4 flex-row items-center">
-          <View className="bg-success/20 p-2 rounded-xl mr-4">
-            <ShieldCheck size={20} color={Colors.success} />
-          </View>
-          <View className="flex-1">
-            <Text className="text-white font-manrope-semibold">Data Secure</Text>
-            <Text className="text-textSecondary text-xs">All expenses stored locally on device.</Text>
-          </View>
-        </LuminousCard>
-
-        <LuminousCard containerStyle="mb-8 p-4 flex-row items-center">
-          <View className="bg-primary/20 p-2 rounded-xl mr-4">
-            <Zap size={20} color={Colors.primary} />
-          </View>
-          <View className="flex-1">
-            <Text className="text-white font-manrope-semibold">AI Efficiency</Text>
-            <Text className="text-textSecondary text-xs">Gemini AI is processing your receipts.</Text>
-          </View>
-        </LuminousCard>
-      </ScrollView>
+      </Animated.ScrollView>
     </SafeAreaView>
+  );
+}
+
+function SectionHeader({ title }: { title: string }) {
+  const styles = useThemeStyles();
+  return (
+    <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-bold text-[10px] uppercase tracking-[2px] mb-4 mt-2 px-1">
+      {title}
+    </Text>
+  );
+}
+
+function MenuItem({ icon, label, onPress }: { icon: any, label: string, onPress?: () => void }) {
+  const styles = useThemeStyles();
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.7}
+      style={{ borderBottomColor: styles.border.subtle, borderBottomWidth: 1 }}
+      className="flex-row items-center justify-between py-4"
+    >
+      <View className="flex-row items-center">
+        <View style={{ backgroundColor: styles.bg.white5, borderColor: styles.border.subtle, borderWidth: 1 }} className="p-2.5 rounded-xl mr-4">
+          {icon}
+        </View>
+        <Text style={{ color: styles.text.onSurface }} className="font-manrope-semibold text-base">{label}</Text>
+      </View>
+      <ChevronRight size={18} color={styles.icon.muted} />
+    </TouchableOpacity>
   );
 }

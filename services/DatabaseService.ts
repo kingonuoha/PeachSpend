@@ -1,4 +1,5 @@
 import * as SQLite from 'expo-sqlite';
+import * as FileSystem from 'expo-file-system';
 import { Expense, Setting } from '../types/database';
 import { logger } from '../utils/logger';
 
@@ -6,6 +7,13 @@ const DATABASE_NAME = 'peachspend.db';
 
 class DatabaseService {
   private db: SQLite.SQLiteDatabase | null = null;
+
+  private async getDb(): Promise<SQLite.SQLiteDatabase> {
+    if (!this.db) {
+      await this.init();
+    }
+    return this.db!;
+  }
 
   async init() {
     if (this.db) return;
@@ -24,6 +32,7 @@ class DatabaseService {
   private async createTables() {
     if (!this.db) return;
 
+    // Initial table creation
     await this.db.execAsync(`
       PRAGMA journal_mode = WAL;
       
@@ -31,6 +40,7 @@ class DatabaseService {
         id TEXT PRIMARY KEY NOT NULL,
         merchant TEXT NOT NULL,
         amount REAL NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'USD',
         category TEXT NOT NULL,
         note TEXT,
         scanned INTEGER DEFAULT 0,
@@ -50,6 +60,22 @@ class DatabaseService {
         value TEXT
       );
     `);
+
+    // Migration: Ensure currency column exists for older installations
+    try {
+      await this.db.execAsync('ALTER TABLE expenses ADD COLUMN currency TEXT NOT NULL DEFAULT "USD"');
+      logger.info('Migration: Added currency column to expenses table');
+    } catch (error) {
+      // Column probably already exists, which is fine
+    }
+
+    // Migration: Add image_uri column
+    try {
+      await this.db.execAsync('ALTER TABLE expenses ADD COLUMN image_uri TEXT');
+      logger.info('Migration: Added image_uri column to expenses table');
+    } catch (error) {
+      // Column probably already exists, which is fine
+    }
   }
 
   private async seedCategories() {
@@ -71,35 +97,118 @@ class DatabaseService {
       for (const cat of defaultCategories) {
         await this.db.runAsync(
           'INSERT INTO categories (id, title, icon_name, color) VALUES (?, ?, ?, ?)',
-          cat[0], cat[1], cat[2], cat[3]
+          [cat[0], cat[1], cat[2], cat[3]] as any
         );
       }
     }
   }
 
   // Expenses
+  async getExpenses(): Promise<Expense[]> {
+    const db = await this.getDb();
+    return await db.getAllAsync<Expense>('SELECT * FROM expenses ORDER BY date DESC');
+  }
+
+  async getExpenseById(id: string): Promise<Expense | null> {
+    const db = await this.getDb();
+    return await db.getFirstAsync<Expense>('SELECT * FROM expenses WHERE id = ?', [id]);
+  }
+
   async saveExpense(expense: Expense) {
     if (!this.db) await this.init();
-    await this.db!.runAsync(
-      'INSERT INTO expenses (id, merchant, amount, category, note, scanned, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [expense.id, expense.merchant, expense.amount, expense.category, expense.note || null, expense.scanned, expense.date, expense.created_at]
-    );
+    
+    // Harden parameters for SQLite native layer
+    const params: any[] = [
+      expense.id || Math.random().toString(36),
+      expense.merchant || 'Unknown',
+      (expense.amount !== undefined && expense.amount !== null) ? expense.amount : 0,
+      expense.currency || 'USD',
+      expense.category || 'other',
+      expense.note || '',
+      expense.scanned || 0,
+      expense.date || Date.now(),
+      expense.created_at || Date.now(),
+      expense.image_uri || null
+    ];
+
+    try {
+      await this.db!.runAsync(
+        'INSERT OR REPLACE INTO expenses (id, merchant, amount, currency, category, note, scanned, date, created_at, image_uri) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        params as any
+      );
+      logger.info(`Expense saved: ${expense.id}`);
+    } catch (error) {
+      logger.error('DatabaseService.saveExpense Error:', error);
+      throw error;
+    }
   }
 
   async addExpense(expense: Expense) {
     return this.saveExpense(expense);
   }
 
-  async getExpenses(): Promise<Expense[]> {
+  async deleteExpense(id: string) {
     if (!this.db) await this.init();
-    return await this.db!.getAllAsync<Expense>('SELECT * FROM expenses ORDER BY date DESC');
+
+    const expense = await this.db!.getFirstAsync<Expense>('SELECT * FROM expenses WHERE id = ?', [id]);
+    if (expense?.image_uri) {
+      try {
+        const fileInfo = await FileSystem.getInfoAsync(expense.image_uri);
+        if (fileInfo.exists) {
+          await FileSystem.deleteAsync(expense.image_uri, { idempotent: true });
+        }
+      } catch (error) {
+        logger.warn('Could not delete cached image file', error);
+      }
+    }
+
+    await this.db!.runAsync('DELETE FROM expenses WHERE id = ?', [id]);
+    logger.info(`Expense deleted: ${id}`);
   }
 
   async getExpensesByCategory(): Promise<{ category: string; total: number }[]> {
-    if (!this.db) await this.init();
-    return await this.db!.getAllAsync<{ category: string; total: number }>(
+    const db = await this.getDb();
+    return await db.getAllAsync<{ category: string; total: number }>(
       'SELECT category, SUM(amount) as total FROM expenses GROUP BY category'
     );
+  }
+
+  async convertExpenses(targetCurrency: string) {
+    const db = await this.getDb();
+    const allSettings = await this.getAllSettings();
+    let rates: Record<string, number> = {};
+    try { rates = JSON.parse(allSettings.conversion_rates || '{}'); } catch {}
+
+    const expenses = await db.getAllAsync<Expense>('SELECT * FROM expenses');
+    for (const expense of expenses) {
+      if (expense.currency === targetCurrency) continue;
+      const fromRate = rates[expense.currency] || 1;
+      const toRate = rates[targetCurrency] || 1;
+      const newAmount = expense.amount * fromRate / toRate;
+      await db.runAsync(
+        'UPDATE expenses SET amount = ?, currency = ? WHERE id = ?',
+        [newAmount, targetCurrency, expense.id]
+      );
+    }
+    logger.info(`Converted all expenses to ${targetCurrency}`);
+  }
+
+  // Categories
+  async getCategories(): Promise<{ id: string; title: string; icon_name: string; color: string }[]> {
+    if (!this.db) await this.init();
+    return await this.db!.getAllAsync<{ id: string; title: string; icon_name: string; color: string }>(
+      'SELECT * FROM categories'
+    );
+  }
+
+  async addCategory(title: string, icon: string, color: string) {
+    if (!this.db) await this.init();
+    const id = title.toLowerCase().replace(/\s+/g, '-');
+    await this.db!.runAsync(
+      'INSERT INTO categories (id, title, icon_name, color) VALUES (?, ?, ?, ?)',
+      [id, title, icon, color]
+    );
+    return id;
   }
 
   // Settings
@@ -107,6 +216,16 @@ class DatabaseService {
     if (!this.db) await this.init();
     const result = await this.db!.getFirstAsync<Setting>('SELECT value FROM settings WHERE key = ?', [key]);
     return result ? result.value : null;
+  }
+  
+  async getAllSettings(): Promise<Record<string, string>> {
+    if (!this.db) await this.init();
+    const results = await this.db!.getAllAsync<Setting>('SELECT * FROM settings');
+    const settings: Record<string, string> = {};
+    results.forEach(s => {
+      settings[s.key] = s.value || '';
+    });
+    return settings;
   }
 
   async updateSetting(key: string, value: string) {
@@ -119,11 +238,17 @@ class DatabaseService {
 
   async clearAllData() {
     if (!this.db) await this.init();
+    await this.db!.execAsync('DELETE FROM expenses;');
+    logger.info('Transaction data purged');
+  }
+
+  async resetApp() {
+    if (!this.db) await this.init();
     await this.db!.execAsync(`
       DELETE FROM expenses;
       DELETE FROM settings;
     `);
-    logger.info('All data cleared');
+    logger.warn('Complete app reset performed');
   }
 }
 

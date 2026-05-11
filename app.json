@@ -1,7 +1,8 @@
 {
   "expo": {
-    "name": "app",
-    "slug": "app",
+    "name": "PeachSpend",
+    "slug": "PeachSpend",
+    "owner": "kingonuoha01",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -46,7 +47,7 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "a69a35ab-d009-47e8-bb2d-314e213bc173"
+        "projectId": "a9eaaa77-1cef-4084-9d19-66190ca73606"
       }
     }
   }

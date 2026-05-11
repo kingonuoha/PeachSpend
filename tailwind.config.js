@@ -27,11 +27,11 @@ module.exports = {
         success:                  '#81C784',
       },
       fontFamily: {
-        'noto-serif-bold': ['NotoSerif-Bold'],
-        'noto-serif-regular': ['NotoSerif-Regular'],
-        'manrope-regular': ['Manrope-Regular'],
-        'manrope-medium': ['Manrope-Medium'],
-        'manrope-semibold': ['Manrope-SemiBold'],
+        'noto-serif-bold': ['NotoSerif_700Bold'],
+        'noto-serif-regular': ['NotoSerif_400Regular'],
+        'manrope-regular': ['Manrope_400Regular'],
+        'manrope-medium': ['Manrope_500Medium'],
+        'manrope-semibold': ['Manrope_600SemiBold'],
       },
       borderRadius: {
         'sm': '8px',
