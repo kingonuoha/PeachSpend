@@ -1,14 +1,12 @@
-import { CategoryKey } from './database';
-export { CategoryKey };
-
 export interface ScannedReceipt {
   merchant: string;
   amount: number;
-  category: CategoryKey;
+  category: string;
   currency: string;
   date?: number;
   confidence: number;
   note?: string; // For item names
+  is_reimbursable?: number; // 0 or 1
 }
 
 export interface GeminiResponse {

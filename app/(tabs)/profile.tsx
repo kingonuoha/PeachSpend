@@ -10,8 +10,10 @@ import { User, ShieldCheck, LogOut, Settings, Bell, HelpCircle, ChevronRight, Ca
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useTheme } from '../../components/ui/ThemeProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
-import Animated, { FadeIn, FadeInDown } from 'react-native-reanimated';
+import Animated, { FadeIn, FadeInDown, useSharedValue, useAnimatedStyle, withTiming, Easing } from 'react-native-reanimated';
 import { useRouter } from 'expo-router';
+import { databaseService } from '../../services/DatabaseService';
+import { BadgeDetailModal } from '../../components/ui/BadgeDetailModal';
 
 const PROFILE_DIR = (documentDirectory || '') + 'profile_pics/';
 
@@ -40,6 +42,72 @@ export default function ProfileScreen() {
       }).catch(() => {});
     }
   }, [settings.profile_picture]);
+
+  const [badgeProgress, setBadgeProgress] = useState<any[]>([]);
+  const [streak, setStreak] = useState(0);
+  const streakScale = useSharedValue(0);
+  const [selectedBadge, setSelectedBadge] = useState<any>(null);
+  const [showBadgeModal, setShowBadgeModal] = useState(false);
+
+  useEffect(() => {
+    const loadBadges = async () => {
+      const [progress, streakCount] = await Promise.all([
+        databaseService.getBadgeProgress(),
+        databaseService.getStreak(),
+      ]);
+      setBadgeProgress(progress);
+      setStreak(streakCount);
+      streakScale.value = withTiming(1, { duration: 600, easing: Easing.out(Easing.cubic) });
+    };
+    loadBadges();
+  }, []);
+
+  const badgeMeta: Record<string, { label: string; description: string; icon: string }> = {
+    first_step: { label: 'First Step', description: 'First expense logged', icon: '🌱' },
+    eagle_eye: { label: 'Eagle Eye', description: 'First receipt scanned', icon: '📸' },
+    on_repeat: { label: 'On Repeat', description: 'First recurring expense', icon: '🔁' },
+    week_warrior: { label: 'Week Warrior', description: '7-day streak', icon: '🔥' },
+    month_master: { label: 'Month Master', description: '30-day streak', icon: '💎' },
+    paper_trail: { label: 'Paper Trail', description: 'First CSV export', icon: '📤' },
+    detail_devil: { label: 'Detail Devil', description: 'First note or tag', icon: '🏷️' },
+    'getting-started': { label: 'Getting Started', description: '5 expenses logged', icon: '🚀' },
+    regular: { label: 'Regular', description: '25 expenses logged', icon: '📊' },
+    century: { label: 'Century', description: '100 expenses logged', icon: '💯' },
+    'sneak-peek': { label: 'Sneak Peek', description: '3 receipts scanned', icon: '👀' },
+    shutterbug: { label: 'Shutterbug', description: '15 receipts scanned', icon: '📷' },
+    'scanner-king': { label: 'Scanner King', description: '50 receipts scanned', icon: '👑' },
+    fortnight: { label: 'Fortnight', description: '14-day streak', icon: '🌙' },
+    season: { label: 'Season', description: '60-day streak', icon: '🍂' },
+    'half-year-hero': { label: 'Half-Year Hero', description: '180-day streak', icon: '⚡' },
+    variety: { label: 'Variety', description: '3 categories used', icon: '🎨' },
+    explorer: { label: 'Explorer', description: '5 categories used', icon: '🗺️' },
+    completionist: { label: 'Completionist', description: 'All 8 categories used', icon: '🏆' },
+    saver: { label: 'Saver', description: 'Single expense ≤ $3', icon: '🐷' },
+    shopper: { label: 'Shopper', description: '$1,000 total spent', icon: '🛍️' },
+    'big-league': { label: 'Big League', description: '$10,000 total spent', icon: '💰' },
+    habit: { label: 'Habit', description: '2 recurring expenses', icon: '♻️' },
+    loyalist: { label: 'Loyalist', description: '5 recurring expenses', icon: '🏅' },
+    novelist: { label: 'Novelist', description: '5 expenses with notes', icon: '📝' },
+    'on-track': { label: 'On Track', description: '7-day budget streak', icon: '📈' },
+    disciplined: { label: 'Disciplined', description: '30-day budget streak', icon: '🧘' },
+  };
+
+  const badgePrerequisites: Record<string, string | null> = {
+    first_step: null, eagle_eye: null, on_repeat: null, paper_trail: null, detail_devil: null,
+    week_warrior: null, month_master: null,
+    'getting-started': 'first_step', regular: 'getting-started', century: 'regular',
+    'sneak-peek': 'eagle_eye', shutterbug: 'sneak-peek', 'scanner-king': 'shutterbug',
+    fortnight: 'week_warrior', season: 'fortnight', 'half-year-hero': 'season',
+    variety: 'first_step', explorer: 'variety', completionist: 'explorer',
+    saver: 'first_step', shopper: 'first_step', 'big-league': 'shopper',
+    habit: 'on_repeat', loyalist: 'habit', novelist: 'detail_devil',
+    'on-track': 'first_step', disciplined: 'on-track',
+  };
+
+  const handleBadgePress = (badge: any) => {
+    setSelectedBadge(badge);
+    setShowBadgeModal(true);
+  };
 
   const totalSpent = expenses.reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
   const scannedCount = expenses.filter(e => e.scanned).length;
@@ -208,6 +276,59 @@ export default function ProfileScreen() {
           </LuminousCard>
         </Animated.View>
 
+        {/* Achievements & Streak */}
+        <Animated.View entering={FadeInDown.delay(500).duration(800).springify()} className="px-6 mb-8">
+          <View className="flex-row items-center mb-5">
+            {streak > 0 && (
+              <Animated.View style={[{ transform: [{ scale: streakScale }] }, { backgroundColor: Colors.primary + '20', borderColor: Colors.primary + '30', borderWidth: 1 }]} className="flex-row items-center px-4 py-2 rounded-full mr-3">
+                <Image source={require('../../assets/images/flameheart-emoji.gif')} style={{ width: 18, height: 18 }} resizeMode="contain" />
+                <Text style={{ color: Colors.primary }} className="font-manrope-bold text-sm ml-1.5">{streak} day streak</Text>
+              </Animated.View>
+            )}
+            <Text className="text-onSurfaceVariant font-manrope-bold text-[10px] uppercase tracking-[2px]">Achievements</Text>
+          </View>
+
+          <View className="flex-row flex-wrap">
+            {(() => {
+              const earnedIds = new Set(badgeProgress.filter(b => b.earned_at).map(b => b.id));
+              const visible = badgeProgress.filter(badge => {
+                const prereq = badgePrerequisites[badge.id];
+                if (!prereq) return true;
+                return earnedIds.has(prereq) || badge.earned_at !== null;
+              });
+              return visible.map((badge) => {
+                const meta = badgeMeta[badge.id];
+                if (!meta) return null;
+                const earned = badge.earned_at !== null;
+                return (
+                  <TouchableOpacity key={badge.id} className="w-1/4 items-center mb-4" activeOpacity={0.6} onPress={() => handleBadgePress(badge)}>
+                    <View
+                      style={{
+                        backgroundColor: earned ? Colors.primary + '20' : 'rgba(255,255,255,0.03)',
+                        borderColor: earned ? Colors.primary + '30' : 'rgba(255,255,255,0.06)',
+                        borderWidth: 1,
+                        width: 56,
+                        height: 56,
+                        borderRadius: 20,
+                      }}
+                      className="items-center justify-center mb-1"
+                    >
+                      <Text style={{ fontSize: 24, opacity: earned ? 1 : 0.3 }}>{meta.icon}</Text>
+                    </View>
+                    <Text
+                      style={{ color: earned ? Colors.primary : styles.text.onSurfaceVariant60 }}
+                      className="font-manrope-bold text-[9px] text-center uppercase tracking-wider"
+                      numberOfLines={1}
+                    >
+                      {meta.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              });
+            })()}
+          </View>
+        </Animated.View>
+
         {/* Menu Sections */}
         <View className="px-6 pb-20">
           <SectionHeader title="Preferences" />
@@ -241,6 +362,11 @@ export default function ProfileScreen() {
           </TouchableOpacity>
         </View>
       </Animated.ScrollView>
+      <BadgeDetailModal
+        visible={showBadgeModal}
+        badge={selectedBadge}
+        onClose={() => setShowBadgeModal(false)}
+      />
     </SafeAreaView>
   );
 }

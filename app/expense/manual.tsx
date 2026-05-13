@@ -9,10 +9,14 @@ import {
   Delete,
   Check,
   Tag,
-  LayoutGrid
+  LayoutGrid,
+  FileText,
+  DollarSign,
+  Repeat
 } from 'lucide-react-native';
 import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
+import { Switch } from 'react-native';
 import { Colors } from '../../constants/tokens';
 import { Strings } from '../../constants/strings';
 import { useTheme } from '../../components/ui/ThemeProvider';
@@ -23,6 +27,9 @@ import { databaseService } from '../../services/DatabaseService';
 import { notificationService } from '../../services/NotificationService';
 import { logger } from '../../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
+import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
+import { useAchievements } from '../../components/ui/AchievementProvider';
+import { Expense } from '../../types/database';
 
 const { width } = Dimensions.get('window');
 const GAP = 12;
@@ -32,11 +39,30 @@ export default function ManualEntryScreen() {
   const router = useRouter();
   const { colors, isDark } = useTheme();
   const { currency, getCurrencySymbol } = useSettings();
+  const { checkForNewAchievements } = useAchievements();
   const [amount, setAmount] = useState('0');
   const [merchant, setMerchant] = useState('');
   const [selectedCategory, setSelectedCategory] = useState({ id: 'other', title: 'Other' });
   const [categories, setCategories] = useState<{ id: string; title: string; icon_name: string; color: string }[]>([]);
   const [isCategoryModalVisible, setIsCategoryModalVisible] = useState(false);
+  const [note, setNote] = useState('');
+  const [isReimbursable, setIsReimbursable] = useState(false);
+  const [duplicateWarning, setDuplicateWarning] = useState<Expense | null>(null);
+  const [pendingSave, setPendingSave] = useState(false);
+  const [isRecurring, setIsRecurring] = useState(false);
+  const [recurrenceInterval, setRecurrenceInterval] = useState<string>('monthly');
+  const [recurrenceDays, setRecurrenceDays] = useState<number[]>([]);
+
+  const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const DAY_LETTERS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+  const toggleDay = (day: number) => {
+    if (recurrenceDays.includes(day)) {
+      setRecurrenceDays(recurrenceDays.filter(d => d !== day));
+    } else {
+      setRecurrenceDays([...recurrenceDays, day]);
+    }
+  };
 
   const fadeAnim = useSharedValue(0);
   const slideAnim = useSharedValue(24);
@@ -81,6 +107,46 @@ export default function ManualEntryScreen() {
     });
   }, [animatePress]);
 
+  const doSave = async () => {
+    const now = Date.now();
+    const expenseId = uuidv4();
+    
+    if (isRecurring) {
+      const nextDue = await databaseService.getNextDueDate(recurrenceInterval, recurrenceDays.length > 0 ? JSON.stringify(recurrenceDays) : undefined);
+      await databaseService.insertRecurringTemplate({
+        id: expenseId,
+        merchant: merchant || 'Manual Entry',
+        amount: parseFloat(amount),
+        currency: currency,
+        category: selectedCategory.id,
+        note: note || '',
+        interval: recurrenceInterval,
+        recurrence_days: recurrenceInterval === 'custom' ? JSON.stringify(recurrenceDays) : undefined,
+        next_due_date: nextDue,
+        type: 'expense',
+        created_at: now,
+      });
+    }
+
+    await databaseService.addExpense({
+      id: expenseId,
+      merchant: merchant || 'Manual Entry',
+      amount: parseFloat(amount),
+      currency: currency,
+      category: selectedCategory.id,
+      note: note,
+      scanned: 0,
+      date: now,
+      created_at: now,
+      is_reimbursable: isReimbursable ? 1 : 0,
+      is_recurring: isRecurring ? 1 : 0,
+      recurrence_parent_id: isRecurring ? expenseId : undefined,
+    });
+    notificationService.scheduleExpenseNotification(merchant || 'Manual Entry', `${getCurrencySymbol()}${parseFloat(amount).toFixed(2)}`);
+    await checkForNewAchievements();
+    router.replace('/(tabs)');
+  };
+
   const handleSave = async () => {
     if (parseFloat(amount) === 0) {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -89,20 +155,12 @@ export default function ManualEntryScreen() {
 
     try {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      const now = Date.now();
-      await databaseService.addExpense({
-        id: uuidv4(),
-        merchant: merchant || 'Manual Entry',
-        amount: parseFloat(amount),
-        currency: currency,
-        category: selectedCategory.id,
-        note: '',
-        scanned: 0,
-        date: now,
-        created_at: now
-      });
-      notificationService.scheduleExpenseNotification(merchant || 'Manual Entry', `${getCurrencySymbol()}${parseFloat(amount).toFixed(2)}`);
-      router.replace('/(tabs)');
+      const existing = await databaseService.isDuplicate(merchant || 'Manual Entry', parseFloat(amount));
+      if (existing) {
+        setDuplicateWarning(existing);
+        return;
+      }
+      await doSave();
     } catch (error) {
       logger.error('Failed to save manual expense', error);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -159,13 +217,13 @@ export default function ManualEntryScreen() {
         <View className="w-10" />
       </View>
 
-      <View className="flex-1 px-5 justify-between py-6">
+      <View className="flex-1 px-5 pt-4 pb-2">
         {/* Amount Display */}
         <Animated.View
           style={mainStyle}
-          className="items-center justify-center pt-4 pb-6"
+          className="items-center justify-center pt-2 pb-4"
         >
-          <View className="w-full mb-8">
+          <View className="w-full mb-6">
             <Text className="text-onSurfaceVariant font-manrope-bold text-[10px] uppercase tracking-[0.2em] mb-2 px-1">
               What did you buy?
             </Text>
@@ -190,47 +248,146 @@ export default function ManualEntryScreen() {
           </View>
         </Animated.View>
 
-        {/* Category & Keypad */}
-        <View>
-          <Animated.View style={fadeStyle}>
-            <TouchableOpacity 
-              onPress={() => setIsCategoryModalVisible(true)}
-              activeOpacity={0.7}
-            >
-              <LuminousCard className="p-4 mb-6 flex-row items-center justify-between">
+        {/* Scrollable controls + keypad */}
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingBottom: 24 }}
+          nestedScrollEnabled
+        >
+          {/* Category & Keypad */}
+          <View>
+            <Animated.View style={fadeStyle}>
+              {/* Note Input */}
+              <View className="mb-4">
+                <TextInput
+                  className="bg-white/5 border border-white/10 rounded-3xl px-5 py-4 text-white font-manrope-medium text-base"
+                  placeholder="Add a note (optional)"
+                  placeholderTextColor="rgba(255,255,255,0.3)"
+                  value={note}
+                  onChangeText={setNote}
+                  selectionColor={Colors.primary}
+                />
+              </View>
+
+              {/* Reimbursable Toggle */}
+              <View style={{ backgroundColor: 'rgba(255,255,255,0.05)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1 }} className="flex-row items-center justify-between px-5 py-4 rounded-3xl mb-4">
                 <View className="flex-row items-center">
                   <View className="bg-primary/10 p-2 rounded-xl mr-3">
-                    <Tag size={18} color={Colors.primary} />
+                    <DollarSign size={18} color={Colors.primary} />
                   </View>
                   <View>
-                    <Text className="text-onSurfaceVariant text-[10px] font-manrope-bold uppercase tracking-widest">Category</Text>
-                    <Text className="text-white font-manrope-bold">{selectedCategory.title}</Text>
+                    <Text className="text-onSurfaceVariant text-[10px] font-manrope-bold uppercase tracking-widest">Reimbursable</Text>
+                    <Text className="text-white/60 font-manrope-medium text-xs mt-0.5">Mark as business expense</Text>
                   </View>
                 </View>
-                <ChevronRight size={20} color={Colors.onSurfaceVariant} />
-              </LuminousCard>
-            </TouchableOpacity>
-          </Animated.View>
+                <Switch
+                  value={isReimbursable}
+                  onValueChange={setIsReimbursable}
+                  trackColor={{ false: 'rgba(255,255,255,0.1)', true: Colors.primary }}
+                  thumbColor={isReimbursable ? 'white' : '#555'}
+                />
+              </View>
 
-          {/* Virtual Keypad */}
-          <Animated.View
-            style={keypadStyle}
-            className="flex-row flex-wrap justify-between"
-          >
-            {['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', 'delete'].map((k) => (
-              <Key key={k} value={k} label={k === 'delete' ? undefined : k} icon={k === 'delete' ? Delete : undefined} />
-            ))}
-          </Animated.View>
+              <TouchableOpacity 
+                onPress={() => setIsCategoryModalVisible(true)}
+                activeOpacity={0.7}
+              >
+                <LuminousCard className="p-4 mb-3 flex-row items-center justify-between">
+                  <View className="flex-row items-center">
+                    <View className="bg-primary/10 p-2 rounded-xl mr-3">
+                      <Tag size={18} color={Colors.primary} />
+                    </View>
+                    <View>
+                      <Text className="text-onSurfaceVariant text-[10px] font-manrope-bold uppercase tracking-widest">Category</Text>
+                      <Text className="text-white font-manrope-bold">{selectedCategory.title}</Text>
+                    </View>
+                  </View>
+                  <ChevronRight size={20} color={Colors.onSurfaceVariant} />
+                </LuminousCard>
+              </TouchableOpacity>
 
-          <Animated.View style={saveButtonStyle}>
-            <PeachButton
-              title={Strings.review.save}
-              onPress={handleSave}
-              icon={<Check size={20} color="black" />}
-              className="h-16"
-            />
-          </Animated.View>
-        </View>
+              {/* Repeats Toggle */}
+              <View style={{ backgroundColor: 'rgba(255,255,255,0.05)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1 }} className="flex-row items-center justify-between px-5 py-4 rounded-3xl mb-3">
+                <View className="flex-row items-center">
+                  <View className="bg-primary/10 p-2 rounded-xl mr-3">
+                    <Repeat size={18} color={Colors.primary} />
+                  </View>
+                  <View>
+                    <Text className="text-onSurfaceVariant text-[10px] font-manrope-bold uppercase tracking-widest">Repeats</Text>
+                    <Text className="text-white/60 font-manrope-medium text-xs mt-0.5">Schedule as recurring</Text>
+                  </View>
+                </View>
+                <Switch
+                  value={isRecurring}
+                  onValueChange={setIsRecurring}
+                  trackColor={{ false: 'rgba(255,255,255,0.1)', true: Colors.primary }}
+                  thumbColor={isRecurring ? 'white' : '#555'}
+                />
+              </View>
+
+              {/* Recurring Interval Picker */}
+              {isRecurring && (
+                <View className="mb-4">
+                  <View className="flex-row gap-2 mb-3">
+                    {['daily', 'weekly', 'monthly', 'custom'].map((interval) => (
+                      <TouchableOpacity
+                        key={interval}
+                        onPress={() => setRecurrenceInterval(interval)}
+                        className={`px-4 py-2.5 rounded-xl flex-1 items-center ${recurrenceInterval === interval ? 'bg-primary' : 'bg-white/5 border border-white/10'}`}
+                      >
+                        <Text className={`font-manrope-bold text-xs uppercase tracking-wider ${recurrenceInterval === interval ? 'text-black' : 'text-white/60'}`}>
+                          {interval === 'custom' ? 'Custom' : interval}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+
+                  {/* Custom Days Picker */}
+                  {recurrenceInterval === 'custom' && (
+                    <View className="flex-row justify-between px-2">
+                      {DAY_LETTERS.map((letter, i) => (
+                        <TouchableOpacity
+                          key={i}
+                          onPress={() => toggleDay(i)}
+                          style={{
+                            backgroundColor: recurrenceDays.includes(i) ? Colors.primary : 'rgba(255,255,255,0.08)',
+                            borderColor: recurrenceDays.includes(i) ? Colors.primary : 'rgba(255,255,255,0.1)',
+                            borderWidth: 1,
+                            width: 40,
+                            height: 40,
+                            borderRadius: 20,
+                          }}
+                          className="items-center justify-center"
+                        >
+                          <Text className={`font-manrope-bold text-sm ${recurrenceDays.includes(i) ? 'text-black' : 'text-white/60'}`}>{letter}</Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  )}
+                </View>
+              )}
+            </Animated.View>
+
+            {/* Virtual Keypad */}
+            <Animated.View
+              style={keypadStyle}
+              className="flex-row flex-wrap justify-between"
+            >
+              {['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', 'delete'].map((k) => (
+                <Key key={k} value={k} label={k === 'delete' ? undefined : k} icon={k === 'delete' ? Delete : undefined} />
+              ))}
+            </Animated.View>
+
+            <Animated.View style={saveButtonStyle}>
+              <PeachButton
+                title={Strings.review.save}
+                onPress={handleSave}
+                icon={<Check size={20} color="black" />}
+                className="h-16"
+              />
+            </Animated.View>
+          </View>
+        </ScrollView>
       </View>
 
       {/* Category Selection Modal */}
@@ -282,6 +439,16 @@ export default function ManualEntryScreen() {
           </View>
         </View>
       </Modal>
+
+      <DuplicateWarningModal
+        visible={duplicateWarning !== null}
+        existingExpense={duplicateWarning}
+        onSaveAnyway={async () => {
+          setDuplicateWarning(null);
+          await doSave();
+        }}
+        onDiscard={() => setDuplicateWarning(null)}
+      />
     </SafeAreaView>
   );
 }

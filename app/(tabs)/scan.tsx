@@ -21,7 +21,10 @@ import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 
 import { useToast } from '../../components/ui/ToastProvider';
+import { useAchievements } from '../../components/ui/AchievementProvider';
 import { notificationService } from '../../services/NotificationService';
+import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
+import { Expense } from '../../types/database';
 
 export default function ScanScreen() {
   const cameraRef = useRef<CameraView>(null);
@@ -29,7 +32,8 @@ export default function ScanScreen() {
   const { showToast } = useToast();
   const [permission, requestPermission] = useCameraPermissions();
   const { colors } = useTheme();
-  const { settings } = useSettings();
+  const { settings, conversionRates } = useSettings();
+  const { checkForNewAchievements } = useAchievements();
   const [isScanning, setIsScanning] = useState(false);
   const [legibleModalVisible, setLegibleModalVisible] = useState(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
@@ -41,6 +45,8 @@ export default function ScanScreen() {
   const [cameraActive, setCameraActive] = useState(true);
   const [isOffline, setIsOffline] = useState(false);
   const [capturedImageUri, setCapturedImageUri] = useState<string | null>(null);
+  const [duplicateWarning, setDuplicateWarning] = useState<Expense | null>(null);
+  const [pendingBatch, setPendingBatch] = useState<any[] | null>(null);
 
   const scanLineY = useSharedValue(0);
 
@@ -70,42 +76,59 @@ export default function ScanScreen() {
     transform: [{ translateY: scanLineY.value }],
   }));
 
+  const executeSave = async (items: any[]) => {
+    const now = Date.now();
+    for (const item of items) {
+      if (!item) continue;
+      notificationService.scheduleExpenseNotification(
+        item.merchant || 'Unknown',
+        `${item.currency || 'USD'} ${typeof item.amount === 'number' ? item.amount.toFixed(2) : item.amount}`
+      );
+      
+      const expenseId = Platform.OS === 'web' ? Math.random().toString(36).substring(2, 11) : uuidv4();
+      
+      await databaseService.addExpense({
+        id: expenseId,
+        merchant: item.merchant || 'Unknown',
+        amount: typeof item.amount === 'number' ? item.amount : (parseFloat(item.amount) || 0),
+        currency: item.currency || 'USD',
+        category: item.category || 'other',
+        note: item.note || '',
+        scanned: 1,
+        date: now,
+        created_at: now,
+        image_uri: capturedImageUri || undefined,
+        is_reimbursable: item.is_reimbursable || 0
+      } as any);
+    }
+    
+    setIsSheetVisible(false);
+    setCapturedImageUri(null);
+    showToast(`Successfully saved ${items.length} expense${items.length > 1 ? 's' : ''}`, 'success');
+    await checkForNewAchievements();
+    router.replace('/(tabs)');
+  };
+
   const handleConfirm = async (finalData: any) => {
     try {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      const now = Date.now();
       
-      // Handle multiple items or single item
-      const expenses = Array.isArray(finalData) ? finalData : [finalData];
-      
-      for (const item of expenses) {
-        if (!item) continue;
-        notificationService.scheduleExpenseNotification(
-          item.merchant || 'Unknown',
-          `${item.currency || 'USD'} ${typeof item.amount === 'number' ? item.amount.toFixed(2) : item.amount}`
-        );
-        
-        // Ensure a valid ID on both native and web
-        const expenseId = Platform.OS === 'web' ? Math.random().toString(36).substring(2, 11) : uuidv4();
-        
-        await databaseService.addExpense({
-          id: expenseId,
-          merchant: item.merchant || 'Unknown',
-          amount: typeof item.amount === 'number' ? item.amount : (parseFloat(item.amount) || 0),
-          currency: item.currency || 'USD',
-          category: item.category || 'other',
-          note: item.note || '',
-          scanned: 1,
-          date: now,
-          created_at: now,
-          image_uri: capturedImageUri || undefined
-        } as any);
+      const items = Array.isArray(finalData) ? finalData : [finalData];
+      const firstItem = items[0];
+      if (!firstItem) return;
+
+      // Check first item for duplicates
+      const existing = await databaseService.isDuplicate(
+        firstItem.merchant || 'Unknown',
+        typeof firstItem.amount === 'number' ? firstItem.amount : (parseFloat(firstItem.amount) || 0)
+      );
+      if (existing) {
+        setDuplicateWarning(existing);
+        setPendingBatch(items);
+        return;
       }
-      
-      setIsSheetVisible(false);
-      setCapturedImageUri(null);
-      showToast(`Successfully saved ${expenses.length} expense${expenses.length > 1 ? 's' : ''}`, 'success');
-      router.replace('/(tabs)');
+
+      await executeSave(items);
     } catch (error) {
       logger.error('Failed to save scanned expense', error);
       showToast('Failed to save expenses', 'error');
@@ -154,12 +177,14 @@ export default function ScanScreen() {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
       const rawItems = await geminiService.scanReceipt(result.assets[0].base64, scanMode);
+      if (!rawItems || !Array.isArray(rawItems)) {
+        throw new Error('Invalid response from scan service');
+      }
 
       const convertedItems = rawItems.map(item => {
         if (item.currency === settings.currency) return item;
-        const rates = settings.conversionRates as any;
-        const rateToUsd = rates[item.currency] || 1;
-        const rateFromUsd = rates[settings.currency] || 1;
+        const rateToUsd = conversionRates[item.currency] || 1;
+        const rateFromUsd = conversionRates[settings.currency] || 1;
         return {
           ...item,
           amount: item.amount * rateToUsd / rateFromUsd,
@@ -206,12 +231,14 @@ export default function ScanScreen() {
         setCapturedImageUri(photo.uri || null);
         // Pass scanMode to service
         const rawItems = await geminiService.scanReceipt(photo.base64, scanMode);
+        if (!rawItems || !Array.isArray(rawItems)) {
+          throw new Error('Invalid response from scan service');
+        }
         
         const convertedItems = rawItems.map(item => {
           if (item.currency === settings.currency) return item;
-          const rates = settings.conversionRates as any;
-          const rateToUsd = rates[item.currency] || 1;
-          const rateFromUsd = rates[settings.currency] || 1;
+          const rateToUsd = conversionRates[item.currency] || 1;
+          const rateFromUsd = conversionRates[settings.currency] || 1;
           return {
             ...item,
             amount: item.amount * rateToUsd / rateFromUsd,
@@ -347,6 +374,24 @@ export default function ScanScreen() {
         onConfirm={handleConfirm}
         onCancel={() => {
           setIsSheetVisible(false);
+          setCameraActive(true);
+        }}
+      />
+
+      <DuplicateWarningModal
+        visible={duplicateWarning !== null}
+        existingExpense={duplicateWarning}
+        onSaveAnyway={async () => {
+          const batch = pendingBatch || [];
+          setDuplicateWarning(null);
+          setPendingBatch(null);
+          await executeSave(batch);
+        }}
+        onDiscard={() => {
+          setDuplicateWarning(null);
+          setPendingBatch(null);
+          setIsSheetVisible(false);
+          setCapturedImageUri(null);
           setCameraActive(true);
         }}
       />

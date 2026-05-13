@@ -8,12 +8,46 @@ import { useTheme } from '../ui/ThemeProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { TouchableOpacity } from 'react-native';
 import { useRouter } from 'expo-router';
+import { Colors } from '../../constants/tokens';
 
 interface ExpenseItemProps {
   expense: Expense;
+  searchQuery?: string;
 }
 
-export const ExpenseItem = React.memo(({ expense }: ExpenseItemProps) => {
+function HighlightedText({ text, query, style, numberOfLines }: { text: string; query?: string; style?: any; numberOfLines?: number }) {
+  const content = (() => {
+    if (!query || !text.toLowerCase().includes(query.toLowerCase())) {
+      return null;
+    }
+
+    const lowerText = text.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+    const startIndex = lowerText.indexOf(lowerQuery);
+    
+    if (startIndex === -1) return null;
+
+    const before = text.slice(0, startIndex);
+    const match = text.slice(startIndex, startIndex + query.length);
+    const after = text.slice(startIndex + query.length);
+
+    return (
+      <>
+        {before}
+        <Text style={{ backgroundColor: Colors.primary + '40', color: 'white' }}>{match}</Text>
+        {after}
+      </>
+    );
+  })();
+
+  return (
+    <Text style={style} numberOfLines={numberOfLines}>
+      {content || text}
+    </Text>
+  );
+}
+
+export const ExpenseItem = React.memo(({ expense, searchQuery }: ExpenseItemProps) => {
   const router = useRouter();
   const { settings, getCurrencySymbol, convertAmount } = useSettings();
   const { colors } = useTheme();
@@ -30,12 +64,24 @@ export const ExpenseItem = React.memo(({ expense }: ExpenseItemProps) => {
     >
       <LuminousCard className="flex-row justify-between items-center mb-4 py-4 px-5" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
         <View className="flex-1 mr-4">
-          <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-base tracking-tight" numberOfLines={1}>
-            {expense.note || expense.merchant}
-          </Text>
-          <Text className="text-onSurfaceVariant font-manrope-medium text-xs uppercase tracking-widest mt-0.5">
-            {expense.note ? expense.merchant : expense.category}
-          </Text>
+          <View className="flex-row items-center gap-2">
+            <HighlightedText 
+              text={expense.note || expense.merchant} 
+              query={searchQuery}
+              style={{ color: styles.text.onSurface, fontFamily: 'Manrope_700Bold', fontSize: 16, letterSpacing: -0.3, flexShrink: 1 }}
+              numberOfLines={1}
+            />
+            {expense.is_reimbursable === 1 && (
+              <View style={{ backgroundColor: Colors.primary + '20', borderColor: Colors.primary + '40', borderWidth: 1 }} className="px-2 py-0.5 rounded-full">
+                <Text style={{ color: Colors.primary }} className="font-manrope-bold text-[9px] uppercase tracking-wider">Reimb.</Text>
+              </View>
+            )}
+          </View>
+          <HighlightedText 
+            text={expense.note ? expense.merchant : expense.category} 
+            query={searchQuery}
+            style={{ color: styles.text.onSurfaceVariant60, fontFamily: 'Manrope_500Medium', fontSize: 12, letterSpacing: 0.5, textTransform: 'uppercase', marginTop: 2 }}
+          />
         </View>
         
         <View className="items-end">

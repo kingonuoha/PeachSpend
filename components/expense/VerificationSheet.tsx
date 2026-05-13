@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, TextInput, StyleSheet, Dimensions, Pressable } from 'react-native';
 import Animated, { useSharedValue, useAnimatedStyle, withTiming, withSpring, Easing } from 'react-native-reanimated';
 import { BlurView } from 'expo-blur';
-import { Check, X, Plus, Trash2, AlertCircle } from 'lucide-react-native';
+import { Check, X, Plus, Trash2, AlertCircle, DollarSign } from 'lucide-react-native';
+import { Switch } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Colors } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
@@ -67,7 +68,8 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
       amount: 0, 
       category: 'other',
       currency: items[0]?.currency || 'USD',
-      confidence: 1.0
+      confidence: 1.0,
+      is_reimbursable: 0
     }]);
   };
 
@@ -148,6 +150,20 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
                       <Text className="text-primary text-xs font-manrope-bold capitalize">{item.category}</Text>
                     </TouchableOpacity>
                   </View>
+                </View>
+
+                {/* Reimbursable Toggle */}
+                <View style={{ borderTopColor: ts.border.subtle, borderTopWidth: 1 }} className="flex-row items-center justify-between pt-3 mt-3">
+                  <View className="flex-row items-center">
+                    <DollarSign size={14} color={Colors.primary} />
+                    <Text style={{ color: ts.text.onSurfaceVariant40 }} className="text-[10px] uppercase font-manrope-bold tracking-widest ml-1.5">Reimbursable</Text>
+                  </View>
+                  <Switch
+                    value={item.is_reimbursable === 1}
+                    onValueChange={(v) => updateItem(index, 'is_reimbursable', v ? 1 : 0)}
+                    trackColor={{ false: 'rgba(255,255,255,0.1)', true: Colors.primary }}
+                    thumbColor={item.is_reimbursable === 1 ? 'white' : '#555'}
+                  />
                 </View>
               </View>
             ))}

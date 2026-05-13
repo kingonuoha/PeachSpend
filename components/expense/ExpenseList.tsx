@@ -7,9 +7,10 @@ import { Strings } from '../../constants/strings';
 interface ExpenseListProps {
   expenses: Expense[];
   isLoading: boolean;
+  searchQuery?: string;
 }
 
-export const ExpenseList: React.FC<ExpenseListProps> = ({ expenses, isLoading }) => {
+export const ExpenseList: React.FC<ExpenseListProps> = ({ expenses, isLoading, searchQuery }) => {
   if (isLoading) {
     return (
       <View className="py-8 items-center">
@@ -43,7 +44,7 @@ export const ExpenseList: React.FC<ExpenseListProps> = ({ expenses, isLoading })
       </Text>
       <View className="px-4">
         {expenses.map((item) => (
-          <ExpenseItem key={item.id} expense={item} />
+          <ExpenseItem key={item.id} expense={item} searchQuery={searchQuery} />
         ))}
       </View>
     </View>

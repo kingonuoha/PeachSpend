@@ -1,11 +1,12 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, FlatList, Dimensions, Image, Platform } from 'react-native';
+import { View, Text, TouchableOpacity, ScrollView, FlatList, Dimensions, Image, Platform, Switch, TextInput, Share } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { X, Calendar, Tag, Store, CreditCard, Share2, Trash2, Edit3 } from 'lucide-react-native';
+import { X, Calendar, Tag, Store, CreditCard, Share2, Trash2, Edit3, Eye, EyeOff, DollarSign } from 'lucide-react-native';
 import { databaseService } from '../../services/DatabaseService';
 import { useTheme } from '../../components/ui/ThemeProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { Colors } from '../../constants/tokens';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useExpenses } from '../../hooks/useExpenses';
 import { Expense } from '../../types/database';
@@ -34,6 +35,23 @@ export default function ExpenseDetailScreen() {
     }
   }, [expenses, id]);
 
+  const handleShare = async () => {
+    if (initialIndex === null || !expenses[initialIndex]) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const e = expenses[initialIndex];
+    const dateStr = format(new Date(e.created_at), 'MMMM dd, yyyy HH:mm');
+    const lines = [
+      `🧾 ${e.merchant}`,
+      `💵 ${e.amount.toFixed(2)} ${e.currency || 'USD'}`,
+      `📂 ${e.category}`,
+      `📅 ${dateStr}`,
+    ];
+    if (e.note) lines.push(`📝 ${e.note}`);
+    if (e.is_reimbursable) lines.push('💰 Marked as reimbursable');
+    if (e.image_uri) lines.push('📎 Receipt image attached');
+    await Share.share({ message: lines.join('\n'), title: 'Expense Details' });
+  };
+
   const handleDelete = async (expenseId: string) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
     await databaseService.deleteExpense(expenseId);
@@ -61,7 +79,7 @@ export default function ExpenseDetailScreen() {
           <X color={styles.icon.default} size={20} />
         </TouchableOpacity>
         <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-lg">Transaction Detail</Text>
-        <TouchableOpacity style={{ backgroundColor: styles.bg.white5 }} className="p-3 rounded-2xl">
+        <TouchableOpacity onPress={handleShare} style={{ backgroundColor: styles.bg.white5 }} className="p-3 rounded-2xl">
           <Share2 color={styles.icon.default} size={20} />
         </TouchableOpacity>
       </View>
@@ -94,12 +112,38 @@ export default function ExpenseDetailScreen() {
 function ExpenseDetailItem({ expense, onDelete }: { expense: Expense, onDelete: () => void }) {
   const { colors } = useTheme();
   const styles = useThemeStyles();
-  const { settings, getCurrencySymbol, convertAmount } = useSettings();
+  const { settings, getCurrencySymbol, convertAmount, updateSetting } = useSettings();
   const pricesVisible = settings.prices_visible !== 'false';
+  const [editNote, setEditNote] = useState(expense.note || '');
+  const [isReimbursable, setIsReimbursable] = useState(expense.is_reimbursable === 1);
+  const { refreshExpenses } = useExpenses();
 
   const dateStr = format(new Date(expense.created_at), 'MMMM dd, yyyy');
   const timeStr = format(new Date(expense.created_at), 'HH:mm');
   const displayValue = convertAmount(expense.amount, expense.currency || 'USD');
+
+  const handleUpdateNote = async () => {
+    if (editNote !== (expense.note || '')) {
+      await databaseService.runAsync(
+        'UPDATE expenses SET note = ? WHERE id = ?',
+        [editNote, expense.id]
+      );
+      await refreshExpenses();
+    }
+  };
+
+  const handleToggleReimbursable = async (value: boolean) => {
+    setIsReimbursable(value);
+    await databaseService.runAsync(
+      'UPDATE expenses SET is_reimbursable = ? WHERE id = ?',
+      [value ? 1 : 0, expense.id]
+    );
+    await refreshExpenses();
+  };
+
+  const handleTogglePrices = () => {
+    updateSetting('prices_visible', pricesVisible ? 'false' : 'true');
+  };
 
   return (
     <ScrollView 
@@ -110,8 +154,18 @@ function ExpenseDetailItem({ expense, onDelete }: { expense: Expense, onDelete: 
       <Animated.View entering={FadeIn.duration(400)}>
         {/* Main Amount Card */}
         <View className="items-center mb-10">
-          <View className="bg-primary/10 px-4 py-2 rounded-full mb-4 border border-primary/20">
-            <Text className="text-primary font-manrope-bold text-xs uppercase tracking-widest">{expense.category}</Text>
+          <View className="flex-row items-center gap-3 mb-4">
+            <View className="bg-primary/10 px-4 py-2 rounded-full border border-primary/20">
+              <Text className="text-primary font-manrope-bold text-xs uppercase tracking-widest">{expense.category}</Text>
+            </View>
+            <TouchableOpacity
+              onPress={handleTogglePrices}
+              style={{ backgroundColor: 'rgba(255,255,255,0.05)' }}
+              className="p-2 rounded-full border border-white/10"
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              {pricesVisible ? <Eye size={16} color={colors.onSurfaceVariant} /> : <EyeOff size={16} color={colors.onSurfaceVariant} />}
+            </TouchableOpacity>
           </View>
           <View className="flex-row items-baseline">
             {pricesVisible && <Text className="text-primary font-noto-serif-bold text-3xl mr-2">{displayValue.symbol}</Text>}
@@ -158,14 +212,42 @@ function ExpenseDetailItem({ expense, onDelete }: { expense: Expense, onDelete: 
             label="Original Value" 
             value={`${expense.amount.toFixed(2)} ${expense.currency || 'USD'}`} 
           />
-          {expense.note && (
-            <DetailRow 
-              icon={<Edit3 size={20} color={colors.onSurfaceVariant} />} 
-              label="Item Name" 
-              value={expense.note} 
-              isLast
+          {/* Note Field */}
+          <View style={{ borderBottomWidth: 1, borderBottomColor: styles.border.subtle }} className="flex-row items-center py-4">
+            <View style={{ backgroundColor: styles.bg.white5 }} className="p-3 rounded-xl mr-4">
+              <Edit3 size={20} color={colors.onSurfaceVariant} />
+            </View>
+            <View className="flex-1">
+              <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-medium text-xs uppercase tracking-widest">Note</Text>
+              <TextInput
+                value={editNote}
+                onChangeText={setEditNote}
+                onBlur={handleUpdateNote}
+                style={{ color: styles.text.onSurface }}
+                className="font-manrope-bold text-base mt-0.5 -ml-1 px-1 py-0.5"
+                placeholder="Add a note..."
+                placeholderTextColor={styles.text.onSurfaceVariant40}
+              />
+            </View>
+          </View>
+          {/* Reimbursable Toggle */}
+          <View className="flex-row items-center py-3">
+            <View style={{ backgroundColor: styles.bg.white5 }} className="p-3 rounded-xl mr-4">
+              <DollarSign size={20} color={colors.onSurfaceVariant} />
+            </View>
+            <View className="flex-1">
+              <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-medium text-xs uppercase tracking-widest">Reimbursable</Text>
+              <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-base mt-0.5">
+                {isReimbursable ? 'Yes' : 'No'}
+              </Text>
+            </View>
+            <Switch
+              value={isReimbursable}
+              onValueChange={handleToggleReimbursable}
+              trackColor={{ false: 'rgba(255,255,255,0.1)', true: Colors.primary }}
+              thumbColor={isReimbursable ? 'white' : '#555'}
             />
-          )}
+          </View>
         </LuminousCard>
 
         {/* Actions */}
