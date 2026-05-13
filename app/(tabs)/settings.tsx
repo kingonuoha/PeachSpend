@@ -16,7 +16,8 @@ import {
   User,
   Check,
   Sun,
-  Fingerprint
+  Fingerprint,
+  LayoutGrid
 } from 'lucide-react-native';
 import { databaseService } from '../../services/DatabaseService';
 import { Strings } from '../../constants/strings';
@@ -28,17 +29,29 @@ import { useExpenses } from '../../hooks/useExpenses';
 import { useTheme } from '../../components/ui/ThemeProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { notificationService } from '../../services/NotificationService';
+import { cacheDirectory, writeAsStringAsync, EncodingType } from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import { logger } from '../../utils/logger';
 import * as Haptics from 'expo-haptics';
+import { useAchievements } from '../../components/ui/AchievementProvider';
+import { format } from 'date-fns';
 import { CurrencyConversionModal } from '../../components/settings/CurrencyConversionModal';
+import { DateRangePicker } from '../../components/ui/DateRangePicker';
+import { useRouter } from 'expo-router';
 import Animated, { FadeInDown, FadeInUp } from 'react-native-reanimated';
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'NGN', 'CAD', 'AUD'];
 
 export default function SettingsScreen() {
+  const router = useRouter();
   const { colors, isDark } = useTheme();
   const styles = useThemeStyles();
+  const [showExportPicker, setShowExportPicker] = useState(false);
+  const [exportStartDate, setExportStartDate] = useState(new Date(new Date().getFullYear(), 0, 1));
+  const [exportEndDate, setExportEndDate] = useState(new Date());
+  const [isExporting, setIsExporting] = useState(false);
   const { settings, updateSetting, isLoading, conversionRates, getCurrencySymbol } = useSettings();
+  const { checkForNewAchievements } = useAchievements();
   const { expenses, refreshExpenses } = useExpenses();
   const [localApiKey, setLocalApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
@@ -143,6 +156,33 @@ export default function SettingsScreen() {
         }
       ]
     );
+  };
+
+  const handleExport = async (start: Date, end: Date) => {
+    setIsExporting(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    try {
+      const csv = await databaseService.exportToCSV(start.getTime(), end.getTime());
+      const dateStr = `${format(start, 'yyyy-MM-dd')}_to_${format(end, 'yyyy-MM-dd')}`;
+      const fileName = `peachspend_export_${dateStr}.csv`;
+      const filePath = cacheDirectory + fileName;
+      await writeAsStringAsync(filePath, csv, { encoding: EncodingType.UTF8 });
+      const isAvailable = await Sharing.isAvailableAsync();
+      if (isAvailable) {
+        await Sharing.shareAsync(filePath, {
+          mimeType: 'text/csv',
+          dialogTitle: 'Export PeachSpend Data',
+        });
+      }
+      const count = parseInt(settings.export_count || '0') + 1;
+      await updateSetting('export_count', count.toString());
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      await checkForNewAchievements();
+    } catch (error) {
+      logger.error('Export failed', error);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   const handleResetApp = () => {
@@ -312,6 +352,28 @@ export default function SettingsScreen() {
           </LuminousCard>
         </View>
 
+        {/* Manage Categories */}
+        <Text className="text-onSurfaceVariant font-manrope-bold text-[10px] uppercase tracking-[0.2em] mb-4 ml-1">
+          Categories
+        </Text>
+        <TouchableOpacity
+          onPress={() => router.push('/settings/categories' as any)}
+          className="mb-8"
+        >
+          <LuminousCard className="p-5 flex-row items-center justify-between">
+            <View className="flex-row items-center">
+              <View style={{ backgroundColor: Colors.primary + '20' }} className="p-3 rounded-xl mr-4">
+                <LayoutGrid size={20} color={Colors.primary} />
+              </View>
+              <View>
+                <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-base">Manage Categories</Text>
+                <Text className="text-onSurfaceVariant text-xs font-manrope-medium mt-0.5">Add, rename, or customise</Text>
+              </View>
+            </View>
+            <ChevronRight size={18} color={styles.icon.muted} />
+          </LuminousCard>
+        </TouchableOpacity>
+
         {/* Monthly Budget */}
         <Text className="text-onSurfaceVariant font-manrope-bold text-[10px] uppercase tracking-[0.2em] mb-4 ml-1">
           Monthly Limit
@@ -397,6 +459,21 @@ export default function SettingsScreen() {
           </Pressable>
 
           <Pressable 
+            onPress={() => setShowExportPicker(true)}
+            className="flex-row items-center justify-between p-5 border-b border-error/10"
+            android_ripple={{ color: styles.bg.white5 }}
+          >
+            <View className="flex-row items-center">
+              <Info size={20} color={Colors.primary} />
+              <View className="ml-4">
+                <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold">Export Expenses</Text>
+                <Text className="text-error/60 text-xs text-xs">CSV format with date range</Text>
+              </View>
+            </View>
+            <ChevronRight size={20} color={styles.icon.muted} />
+          </Pressable>
+
+          <Pressable 
             onPress={handleResetApp}
             className="flex-row items-center justify-between p-5"
             android_ripple={{ color: styles.bg.white5 }}
@@ -412,8 +489,21 @@ export default function SettingsScreen() {
           </Pressable>
         </LuminousCard>
 
+        <DateRangePicker
+          visible={showExportPicker}
+          startDate={exportStartDate}
+          endDate={exportEndDate}
+          onApply={(start, end) => {
+            setShowExportPicker(false);
+            setExportStartDate(start);
+            setExportEndDate(end);
+            handleExport(start, end);
+          }}
+          onClose={() => setShowExportPicker(false)}
+        />
+
         <View className="items-center mt-4 mb-20" style={{ opacity: 0.3 }}>
-          <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-xs tracking-tighter uppercase">PEACHSPEND v1.1.0-LUMINOUS</Text>
+          <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-xs tracking-tighter uppercase">PEACHSPEND v2.0.0</Text>
           <Text style={{ color: styles.text.onSurface }} className="font-manrope-medium text-[10px] mt-1 italic">"Crafted for the discerning minimalist"</Text>
         </View>
 

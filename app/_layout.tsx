@@ -24,6 +24,8 @@ import { ThemeProvider } from '../components/ui/ThemeProvider';
 import { SettingsProvider } from '../components/ui/SettingsProvider';
 import { useSettings } from '../components/ui/SettingsProvider';
 import AnimatedSplashScreen from '../components/ui/AnimatedSplashScreen';
+import StreakGate from '../components/ui/StreakGate';
+import { AchievementProvider } from '../components/ui/AchievementProvider';
 import { notificationService } from '../services/NotificationService';
 
 SplashScreen.preventAutoHideAsync();
@@ -134,16 +136,16 @@ export default function RootLayout() {
   }
 
   return (
-    <SettingsProvider>
-      <ThemeProvider>
-        <ToastProvider>
-          <View style={{ flex: 1, backgroundColor: Colors.background }}>
-            {showSplash && (
-              <AnimatedSplashScreen onFinish={() => setShowSplash(false)} />
-            )}
-            {!showSplash && (
-              <BiometricGate>
-                <Stack
+      <SettingsProvider>
+        <ThemeProvider>
+          <ToastProvider>
+            <AchievementProvider>
+            <View style={{ flex: 1, backgroundColor: Colors.background }}>
+              {showSplash && <AnimatedSplashScreen onFinish={() => setShowSplash(false)} />}
+              {!showSplash && (
+                <BiometricGate>
+                  <StreakGate>
+                  <Stack
                   screenOptions={{
                     headerShown: false,
                     contentStyle: { backgroundColor: Colors.background },
@@ -157,11 +159,16 @@ export default function RootLayout() {
                   <Stack.Screen name="expense/[id]" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
                   <Stack.Screen name="privacy-policy" options={{ animation: 'slide_from_right' }} />
                   <Stack.Screen name="support-center" options={{ animation: 'slide_from_right' }} />
+                  <Stack.Screen name="settings/categories" options={{ animation: 'slide_from_right' }} />
+                  <Stack.Screen name="recurring/index" options={{ animation: 'slide_from_right' }} />
+                  <Stack.Screen name="income/manual" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
                 </Stack>
+                </StreakGate>
               </BiometricGate>
             )}
             <StatusBar style={showSplash ? 'dark' : 'light'} />
           </View>
+            </AchievementProvider>
         </ToastProvider>
       </ThemeProvider>
     </SettingsProvider>

@@ -6,6 +6,7 @@ import { Strings } from '../../constants/strings';
 import { SpendingDonut } from '../../components/analytics/SpendingDonut';
 import { CategoryBreakdown } from '../../components/analytics/CategoryBreakdown';
 import { DateRangePicker } from '../../components/ui/DateRangePicker';
+import { ExpenseItem } from '../../components/expense/ExpenseItem';
 import { startOfWeek, startOfMonth, subDays, isAfter, format } from 'date-fns';
 import { Colors } from '../../constants/tokens';
 import { useSettings } from '../../components/ui/SettingsProvider';
@@ -133,6 +134,16 @@ export default function AnalyticsScreen() {
           <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-2xl mb-6 px-1">Flow Breakdown</Text>
           <CategoryBreakdown distribution={distribution} pricesVisible={pricesVisible} />
         </View>
+
+        {/* Transactions List */}
+        {filteredExpenses.length > 0 && (
+          <View className="mt-2 mb-8">
+            <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-2xl mb-6 px-1">Transactions</Text>
+            {[...filteredExpenses].sort((a, b) => b.created_at - a.created_at).map((expense) => (
+              <ExpenseItem key={expense.id} expense={expense} />
+            ))}
+          </View>
+        )}
       </Animated.ScrollView>
 
       <DateRangePicker

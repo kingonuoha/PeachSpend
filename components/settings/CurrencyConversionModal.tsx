@@ -27,7 +27,7 @@ export function CurrencyConversionModal({
   const deriveRate = () => {
     const fromRate = conversionRates[fromCurrency] || 1;
     const toRate = conversionRates[toCurrency] || 1;
-    return (fromRate / toRate).toFixed(4);
+    return (toRate / fromRate).toFixed(4);
   };
 
   const [rate, setRate] = useState('1.0');

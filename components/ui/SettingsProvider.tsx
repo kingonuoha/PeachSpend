@@ -39,6 +39,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         prices_visible: 'true',
         monthly_budget: '0',
         budget_currency: 'USD',
+        last_opened_date: '',
+        last_streak: '0',
         ...allSettings
       };
 
