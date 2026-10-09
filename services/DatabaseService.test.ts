@@ -11,10 +11,18 @@ const secureStore = vi.hoisted(() => ({
   deleteItemAsync: vi.fn(),
 }));
 
+const fileSystemLegacy = vi.hoisted(() => ({
+  cacheDirectory: null as string | null,
+  documentDirectory: null as string | null,
+  getInfoAsync: vi.fn(),
+  deleteAsync: vi.fn(),
+  readDirectoryAsync: vi.fn(),
+}));
+
 vi.mock('expo-secure-store', () => secureStore);
 vi.mock('expo-sqlite', () => ({ openDatabaseAsync: vi.fn() }));
 vi.mock('expo-file-system', () => ({ getInfoAsync: vi.fn(), deleteAsync: vi.fn() }));
-vi.mock('expo-file-system/legacy', () => ({ cacheDirectory: null, getInfoAsync: vi.fn(), deleteAsync: vi.fn() }));
+vi.mock('expo-file-system/legacy', () => fileSystemLegacy);
 vi.mock('../data/migrations', () => ({ runMigrations: vi.fn() }));
 
 type MockDatabase = {
@@ -33,6 +41,8 @@ const database: MockDatabase = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  fileSystemLegacy.cacheDirectory = null;
+  fileSystemLegacy.documentDirectory = null;
   (databaseService as unknown as { db: MockDatabase }).db = database;
   database.getAllAsync.mockResolvedValue([
     { key: 'currency', value: 'USD' },
@@ -344,5 +354,49 @@ describe('DatabaseService Clear All Data scope (D8)', () => {
     expect(database.execAsync).toHaveBeenCalledWith('BEGIN');
     expect(database.execAsync).toHaveBeenCalledWith('ROLLBACK');
     expect(database.execAsync).not.toHaveBeenCalledWith('COMMIT');
+  });
+});
+
+describe('DatabaseService media erasure (D9, S-06R-01, S-06R-02)', () => {
+  it('Clear All Data deletes the owned receipt images its rows referenced, before COMMIT', async () => {
+    fileSystemLegacy.cacheDirectory = 'cache/';
+    database.getAllAsync.mockResolvedValue([
+      { image_uri: 'cache/peachspend-receipt-a.jpg' },
+      { image_uri: null },
+    ]);
+
+    await databaseService.clearAllData();
+
+    expect(fileSystemLegacy.deleteAsync).toHaveBeenCalledTimes(1);
+    expect(fileSystemLegacy.deleteAsync).toHaveBeenCalledWith('cache/peachspend-receipt-a.jpg', { idempotent: true });
+
+    const commitIndex = database.execAsync.mock.calls.findIndex(call => call[0] === 'COMMIT');
+    const deleteOrder = fileSystemLegacy.deleteAsync.mock.invocationCallOrder[0];
+    const commitOrder = database.execAsync.mock.invocationCallOrder[commitIndex];
+    expect(deleteOrder).toBeLessThan(commitOrder);
+  });
+
+  it('Clear All Data never deletes a foreign image path', async () => {
+    fileSystemLegacy.cacheDirectory = 'cache/';
+    database.getAllAsync.mockResolvedValue([{ image_uri: '/sdcard/foreign.jpg' }]);
+
+    await databaseService.clearAllData();
+
+    expect(fileSystemLegacy.deleteAsync).not.toHaveBeenCalled();
+  });
+
+  it('Reset App sweeps owned receipts and exports and skips foreign files', async () => {
+    fileSystemLegacy.cacheDirectory = 'cache/';
+    fileSystemLegacy.readDirectoryAsync.mockResolvedValue([
+      'peachspend-receipt-a.jpg',
+      'peachspend_private_export_1_2.csv',
+      'report.csv',
+    ]);
+
+    await databaseService.resetApp();
+
+    expect(fileSystemLegacy.deleteAsync).toHaveBeenCalledWith('cache/peachspend-receipt-a.jpg', { idempotent: true });
+    expect(fileSystemLegacy.deleteAsync).toHaveBeenCalledWith('cache/peachspend_private_export_1_2.csv', { idempotent: true });
+    expect(fileSystemLegacy.deleteAsync).not.toHaveBeenCalledWith('cache/report.csv', { idempotent: true });
   });
 });

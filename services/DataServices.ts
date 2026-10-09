@@ -52,6 +52,7 @@ export {
   buildConversionOptions,
   buildCurrencyConversionPreview,
   executeBulkCurrencyConversion,
+  CLEAR_ALL_DATA_SCOPE,
 } from '../data/SettingsContracts';
 export type {
   SettingsSnapshot,
@@ -66,6 +67,19 @@ export type {
   CurrencyConversionOption,
   BulkConversionOutcome,
 } from '../data/SettingsContracts';
+
+// D9 media erasure facts re-exported from the single wiring point so the S-06
+// dialogs render honest Clear and Reset copy from one source instead of a
+// hardcoded sentence. Execution stays in DatabaseService; a screen never erases.
+export {
+  MEDIA_ERASURE_SCOPES,
+  CLEAR_ALL_DATA_MEDIA_SCOPE,
+  RESET_APP_MEDIA_SCOPE,
+} from '../data/MediaErasure';
+export type {
+  MediaErasureScope,
+  MediaErasureScopeSpec,
+} from '../data/MediaErasure';
 
 // S-16 category ownership boundaries re-exported from the same single wiring
 // point so the Manage Categories screen consumes the declared contract rather
