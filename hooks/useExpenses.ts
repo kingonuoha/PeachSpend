@@ -12,8 +12,8 @@ export function useExpenses() {
       setIsLoading(true);
       const data = await databaseService.getExpenses();
       setExpenses(data);
-    } catch (error) {
-      logger.error('useExpenses fetch error:', error);
+    } catch {
+      logger.error('useExpenses fetch error', 'expenses_fetch_failed');
     } finally {
       setIsLoading(false);
     }
@@ -24,13 +24,15 @@ export function useExpenses() {
       await databaseService.saveExpense(expense);
       await fetchExpenses();
     } catch (error) {
-      logger.error('useExpenses add error:', error);
+      logger.error('useExpenses add error', 'expense_add_failed');
       throw error;
     }
   };
 
   useEffect(() => {
-    fetchExpenses();
+    // Defer to a microtask so the effect body does not call setState synchronously.
+    // fetchExpenses sets isLoading synchronously, and on mount it is already true.
+    void Promise.resolve().then(fetchExpenses);
   }, [fetchExpenses]);
 
   return {

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, Modal, ScrollView, Dimensions } from 'react-native';
+import { View, Text, TouchableOpacity, Modal, Dimensions } from 'react-native';
 import { ChevronLeft, ChevronRight } from 'lucide-react-native';
 import { format, addMonths, subMonths, startOfMonth, endOfMonth, startOfWeek, endOfWeek, eachDayOfInterval, isSameMonth, isSameDay, isBefore, isAfter } from 'date-fns';
 import { useThemeStyles } from '../../hooks/useThemeStyles';

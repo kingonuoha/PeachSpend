@@ -1,22 +1,30 @@
 import { logger } from '../utils/logger';
+import { cacheDirectory, deleteAsync, readDirectoryAsync } from 'expo-file-system/legacy';
+
+export const PEACHSPEND_EXPORT_PREFIX = 'peachspend_private_export_';
+
+function isStaleExportFile(fileName: string): boolean {
+  return fileName.startsWith(PEACHSPEND_EXPORT_PREFIX) && fileName.endsWith('.csv');
+}
 
 class CleanupService {
-  /**
-   * Performs routine cleanup of old or redundant data.
-   * Can be expanded to remove temporary local files or old logs.
-   */
   async performRoutineCleanup() {
     try {
-      // Logic for cleanup (e.g., deleting expenses older than X years if requested)
-      logger.info('Performing routine cleanup...');
-      
-      // Placeholder for future cleanup logic
-      // e.g., await databaseService.deleteOldExpenses(timestamp);
-      
+      await this.removeStaleExports();
       logger.info('Cleanup completed.');
-    } catch (error) {
-      logger.error('Cleanup Service Error:', error);
+    } catch {
+      logger.error('Cleanup Service Error', 'cleanup_failed');
     }
+  }
+
+  private async removeStaleExports(): Promise<void> {
+    if (!cacheDirectory) return;
+
+    const fileNames = await readDirectoryAsync(cacheDirectory);
+    const staleExports = fileNames.filter(isStaleExportFile);
+    await Promise.all(
+      staleExports.map(fileName => deleteAsync(`${cacheDirectory}${fileName}`, { idempotent: true }))
+    );
   }
 }
 

@@ -54,7 +54,7 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
     }, 8000);
 
     return () => clearTimeout(timer);
-  }, []);
+  }, [logoScale, logoTranslateY, circleScale, circleOpacity, textOpacity, textTranslateY, onFinish]);
 
   const logoAnimatedStyle = useAnimatedStyle(() => ({
     transform: [
@@ -101,14 +101,14 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
 
 const styles = StyleSheet.create({
   container: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 100,
   },
   background: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     backgroundColor: '#FFFFFF',
   },
   circle: {

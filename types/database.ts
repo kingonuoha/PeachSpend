@@ -15,6 +15,12 @@ export interface Expense {
   recurrence_days?: string; // JSON array e.g. [1,2,3,4,5]
   next_due_date?: number; // Unix timestamp
   recurrence_parent_id?: string; // UUID of recurring template
+  unit_price?: number;
+  units?: number;
+  // Capture source the record was written from (see CaptureSource). NULL for
+  // rows created before v6 or by a legacy path; the detail read then infers the
+  // origin from `scanned` rather than fabricating one.
+  source?: string;
 }
 
 export interface Category {
@@ -29,6 +35,30 @@ export interface Setting {
   value: string;
 }
 
+export interface Notification {
+  id: string;
+  title: string;
+  body: string;
+  type: string;
+  data: string | null;
+  read: number;
+  created_at: number;
+}
+
+export interface Income {
+  id: string;
+  source: string;
+  amount: number;
+  currency: string;
+  category: string;
+  note?: string;
+  is_recurring?: number;
+  recurrence_interval?: string;
+  next_due_date?: number;
+  date: number;
+  created_at: number;
+}
+
 export interface RecurringTemplate {
   id: string;
   merchant: string;
@@ -41,6 +71,17 @@ export interface RecurringTemplate {
   next_due_date: number;
   type: string; // 'expense' | 'income'
   created_at: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: string;
+  content: string;
+  message_type: string;
+  image_uri?: string;
+  created_at: number;
+  intent?: string;
+  model?: string;
 }
 
 export type CategoryKey = 

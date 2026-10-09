@@ -3,14 +3,14 @@
     "name": "PeachSpend",
     "slug": "PeachSpend",
     "owner": "kingonuoha01",
-    "version": "2.0.0",
+    "version": "2.3.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "app",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.kingonuoha01.app"
     },
     "android": {
       "adaptiveIcon": {
@@ -19,10 +19,17 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "package": "com.kingonuoha01.app"
+      "package": "com.kingonuoha01.app",
+      "allowBackup": false,
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
-      "output": "static",
+      "output": "single",
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
@@ -39,7 +46,34 @@
           }
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "PeachSpend uses your camera to scan receipts. Scanned images are sent only to the AI provider you configure.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "PeachSpend uses your photo library to select receipt images. Selected images are sent only to the AI provider you configure.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-share-intent",
+        {
+          "iosActivationRules": {
+            "NSExtensionActivationSupportsImageWithMaxCount": 1
+          },
+          "androidIntentFilters": ["image/*"],
+           "androidMultiIntentFilters": []
+        }
+      ],
+      "expo-background-task"
+      ,"./plugins/withAutoCapture"
     ],
     "experiments": {
       "typedRoutes": true

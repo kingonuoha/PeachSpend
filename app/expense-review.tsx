@@ -10,39 +10,83 @@ import { Colors } from '../constants/tokens';
 import { LuminousCard } from '../components/ui/LuminousCard';
 import { PeachButton } from '../components/ui/PeachButton';
 import { logger } from '../utils/logger';
-import { v4 as uuidv4 } from 'uuid';
 import { useThemeStyles } from '../hooks/useThemeStyles';
+import { ScannedReceipt } from '../types/gemini';
+
+type ReviewData = Partial<Pick<ScannedReceipt, 'merchant' | 'currency' | 'category' | 'note'>> & {
+  amount?: number | string;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null
+);
+
+const parseReviewData = (value: string | undefined): ReviewData | null => {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!isRecord(parsed)) return null;
+    return {
+      merchant: typeof parsed.merchant === 'string' ? parsed.merchant : undefined,
+      amount: typeof parsed.amount === 'number' || typeof parsed.amount === 'string' ? parsed.amount : undefined,
+      currency: typeof parsed.currency === 'string' ? parsed.currency : undefined,
+      category: typeof parsed.category === 'string' ? parsed.category : undefined,
+      note: typeof parsed.note === 'string' ? parsed.note : undefined,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const getMissingFields = (value: ReviewData | null): string[] => {
+  if (!value) return ['receipt data'];
+  const missing: string[] = [];
+  if (!value.merchant?.trim()) missing.push('merchant');
+  if (value.amount === undefined || value.amount === '' || !Number.isFinite(Number(value.amount)) || Number(value.amount) <= 0) missing.push('amount');
+  if (!value.currency?.trim()) missing.push('currency');
+  if (!value.category?.trim()) missing.push('category');
+  return missing;
+};
 
 export default function ExpenseReviewScreen() {
   const ts = useThemeStyles();
   const { data } = useLocalSearchParams<{ data: string }>();
   const router = useRouter();
-  const parsedData = data ? JSON.parse(data) : {};
+  const parsedData = parseReviewData(data);
+  const missingFields = getMissingFields(parsedData);
 
-  const [merchant, setMerchant] = useState(parsedData.merchant || '');
-  const [amount, setAmount] = useState(parsedData.amount?.toString() || '');
-  const [category, setCategory] = useState(parsedData.category || 'other');
-  const [currency] = useState(parsedData.currency || 'USD');
-  const [note] = useState(parsedData.note || '');
+  const [merchant, setMerchant] = useState(parsedData?.merchant || '');
+  const [amount, setAmount] = useState(parsedData?.amount?.toString() || '');
+  const [category, setCategory] = useState(parsedData?.category || '');
+  const [currency] = useState(parsedData?.currency || '');
+  const [note] = useState(parsedData?.note || '');
+  const [validationError, setValidationError] = useState<string | null>(
+    missingFields.length > 0 ? `Missing required receipt data: ${missingFields.join(', ')}` : null
+  );
 
   const handleSave = async () => {
+    const numericAmount = Number(amount);
+    if (!merchant.trim() || !currency.trim() || !category.trim() || !Number.isFinite(numericAmount) || numericAmount <= 0) {
+      setValidationError('Enter merchant, amount, currency, and category before saving.');
+      return;
+    }
     try {
       const now = Date.now();
-      await databaseService.addExpense({
-        id: uuidv4(),
+      const repository = await databaseService.getCaptureRepository();
+      await repository.save({
         merchant,
-        amount: parseFloat(amount) || 0,
+        amount: numericAmount,
         currency,
         category,
         note,
-        scanned: 1,
+        scanned: true,
         date: now,
-        created_at: now
+        source: 'ocr',
       });
       router.dismissAll();
       router.replace('/(tabs)');
-    } catch (error) {
-      logger.error('Failed to save expense', error);
+    } catch {
+      logger.error('Failed to save expense', 'expense_review_save_failed');
     }
   };
 
@@ -72,6 +116,9 @@ export default function ExpenseReviewScreen() {
           </View>
 
           <LuminousCard className="mb-6 p-6">
+            {validationError && (
+              <Text className="text-red-400 font-manrope-medium mb-5">{validationError}</Text>
+            )}
             {/* Merchant Input */}
             <View className="mb-6">
               <View className="flex-row items-center mb-2">
@@ -102,7 +149,7 @@ export default function ExpenseReviewScreen() {
                 value={amount}
                 onChangeText={setAmount}
                 keyboardType="numeric"
-                placeholder="0.00"
+                placeholder="Enter amount"
                 placeholderTextColor={Colors.textTertiary}
                 className="text-white text-3xl font-manrope-bold border-b border-surfaceContainerHigh pb-2"
               />
@@ -137,4 +184,3 @@ export default function ExpenseReviewScreen() {
     </SafeAreaView>
   );
 }
-

@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
-import { View, Text, StyleSheet, Dimensions } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
 import { AlertCircle, CheckCircle2, Info } from 'lucide-react-native';
-import Animated, { useSharedValue, useAnimatedStyle, withTiming, withSpring, runOnJS } from 'react-native-reanimated';
+import Animated, { useSharedValue, withTiming, withSpring, runOnJS, SharedValue } from 'react-native-reanimated';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 
 type ToastType = 'success' | 'error' | 'info';
@@ -21,7 +21,11 @@ export const useToast = () => {
 };
 
 const TOAST_HEIGHT = 80;
-const { width } = Dimensions.get('window');
+
+function animateToastIn(translateY: SharedValue<number>, opacity: SharedValue<number>) {
+  translateY.value = withSpring(60, { damping: 15, stiffness: 150 });
+  opacity.value = withTiming(1, { duration: 200 });
+}
 
 export const ToastProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const ts = useThemeStyles();
@@ -37,6 +41,9 @@ export const ToastProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         runOnJS(setToast)(null);
       }
     });
+    // translateY and opacity are stable Reanimated shared values; adding them to deps
+    // triggers react-hooks/immutability because .value is written inside the callback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const showToast = useCallback((message: string, type: ToastType = 'info') => {
@@ -46,10 +53,11 @@ export const ToastProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     
     setToast({ message, type });
     
-    translateY.value = withSpring(60, { damping: 15, stiffness: 150 });
-    opacity.value = withTiming(1, { duration: 200 });
+    animateToastIn(translateY, opacity);
 
     timerRef.current = setTimeout(hideToast, 4000);
+    // Animated shared values are stable refs and showToast only depends on hideToast.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hideToast]);
 
   const getIcon = () => {

@@ -63,5 +63,6 @@ export function useThemeStyles() {
     },
 
     raw: colors,
+    isDark,
   }), [colors, isDark, surfaceContainerLowest, surfaceContainerLow, surfaceContainerHigh, surfaceContainerHighest]);
 }

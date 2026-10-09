@@ -1,18 +1,21 @@
 import React from 'react';
-import { View, Text } from 'react-native';
+import { View, Text, TouchableOpacity } from 'react-native';
 import { Expense } from '../../types/database';
 import { LuminousCard } from '../ui/LuminousCard';
-import { format } from 'date-fns';
+import { formatRelativeDate } from '../../utils/dateFormat';
 import { useSettings } from '../ui/SettingsProvider';
-import { useTheme } from '../ui/ThemeProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
-import { TouchableOpacity } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Colors } from '../../constants/tokens';
 
 interface ExpenseItemProps {
   expense: Expense;
   searchQuery?: string;
+  // Optional arrival context for S-08 (FR-08.4). When present, the push carries
+  // the row's origin and the caller's visible order so swipe paging matches the
+  // list the user is looking at. Absent means the default S-08 order.
+  detailOrigin?: string;
+  detailOrderIds?: string[];
 }
 
 function HighlightedText({ text, query, style, numberOfLines }: { text: string; query?: string; style?: any; numberOfLines?: number }) {
@@ -47,20 +50,30 @@ function HighlightedText({ text, query, style, numberOfLines }: { text: string; 
   );
 }
 
-export const ExpenseItem = React.memo(({ expense, searchQuery }: ExpenseItemProps) => {
+const ExpenseItemComponent = ({ expense, searchQuery, detailOrigin, detailOrderIds }: ExpenseItemProps) => {
   const router = useRouter();
-  const { settings, getCurrencySymbol, convertAmount } = useSettings();
-  const { colors } = useTheme();
+  const { settings, currency, convertAmount } = useSettings();
   const styles = useThemeStyles();
   const pricesVisible = settings.prices_visible !== 'false';
-  const dateStr = format(new Date(expense.created_at), 'MMM dd, HH:mm');
+  const dateStr = formatRelativeDate(expense.date);
   
-  const displayValue = convertAmount(expense.amount, expense.currency || 'USD');
+  const displayValue = convertAmount(expense.amount, expense.currency || currency);
+
+  const openDetail = () => {
+    if (detailOrigin && detailOrderIds && detailOrderIds.length > 0) {
+      router.push({
+        pathname: '/expense/[id]',
+        params: { id: expense.id, origin: detailOrigin, ids: detailOrderIds.join(',') },
+      } as never);
+      return;
+    }
+    router.push(`/expense/${expense.id}` as any);
+  };
 
   return (
     <TouchableOpacity 
       activeOpacity={0.7} 
-      onPress={() => router.push(`/expense/${expense.id}` as any)}
+      onPress={openDetail}
     >
       <LuminousCard className="flex-row justify-between items-center mb-4 py-4 px-5" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
         <View className="flex-1 mr-4">
@@ -98,4 +111,7 @@ export const ExpenseItem = React.memo(({ expense, searchQuery }: ExpenseItemProp
       </LuminousCard>
     </TouchableOpacity>
   );
-});
+};
+
+ExpenseItemComponent.displayName = 'ExpenseItem';
+export const ExpenseItem = React.memo(ExpenseItemComponent);

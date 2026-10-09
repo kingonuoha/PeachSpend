@@ -1,16 +1,20 @@
 import { useState, useEffect, useCallback } from 'react';
 import { databaseService } from '../services/DatabaseService';
 import { logger } from '../utils/logger';
+import { resolveUserCurrency } from '../utils/currency';
+import { isSecretSettingKey } from '../data/secrets';
+import { omitSecretSettings } from './settingsBoundary';
 
 export function useSettings() {
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [isLoading, setIsLoading] = useState(true);
 
   const getSetting = useCallback(async (key: string) => {
+    if (isSecretSettingKey(key)) return null;
     try {
       return await databaseService.getSetting(key);
-    } catch (error) {
-      logger.error(`useSettings get error for ${key}:`, error);
+    } catch {
+      logger.error(`useSettings get error for ${key}`, 'settings_read_failed');
       return null;
     }
   }, []);
@@ -18,9 +22,9 @@ export function useSettings() {
   const updateSetting = async (key: string, value: string) => {
     try {
       await databaseService.updateSetting(key, value);
-      setSettings(prev => ({ ...prev, [key]: value }));
+      if (!isSecretSettingKey(key)) setSettings(prev => ({ ...prev, [key]: value }));
     } catch (error) {
-      logger.error(`useSettings update error for ${key}:`, error);
+      logger.error(`useSettings update error for ${key}`, 'settings_update_failed');
       throw error;
     }
   };
@@ -29,19 +33,17 @@ export function useSettings() {
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const apiKey = await databaseService.getSetting('gemini_api_key');
         const onboarding = await databaseService.getSetting('onboarding_complete');
         const currency = await databaseService.getSetting('currency');
         const theme = await databaseService.getSetting('theme');
         
-        setSettings({
-          gemini_api_key: apiKey || '',
+        setSettings(omitSecretSettings({
           onboarding_complete: onboarding || 'false',
-          currency: currency || 'USD',
+          currency: resolveUserCurrency(currency),
           theme: theme || 'dark',
-        });
-      } catch (error) {
-        logger.error('useSettings load error:', error);
+        }));
+      } catch {
+        logger.error('useSettings load error', 'settings_load_failed');
       } finally {
         setIsLoading(false);
       }
@@ -55,7 +57,7 @@ export function useSettings() {
     isLoading,
     getSetting,
     updateSetting,
-    currency: settings.currency || 'USD',
+    currency: resolveUserCurrency(settings.currency),
     theme: settings.theme || 'dark',
   };
 }
