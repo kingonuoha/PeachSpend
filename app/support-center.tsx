@@ -66,7 +66,7 @@ const FAQS: FaqEntry[] = [
     id: 2,
     question: 'Is my data stored online?',
     answer:
-      'No. All your expense data is stored locally on your device. Receipt images are sent to the AI provider you configure for processing only when you scan.',
+      'No. All your expense data is stored locally on your device. Receipt images are sent to the AI provider you configure for processing when you scan a receipt or attach an image in AI chat. Nothing is stored on a PeachSpend server.',
   },
   {
     id: 3,
