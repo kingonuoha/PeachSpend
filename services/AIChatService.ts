@@ -1,5 +1,5 @@
 import { databaseService } from './DatabaseService';
-import { ChatMessage } from '../types/database';
+import { ChatMessage, Expense } from '../types/database';
 import { StaticSummary, DynamicContext, IntentClass, ChatAction, OPENROUTER_MODELS } from '../types/chat';
 import { logger } from '../utils/logger';
 import { AiError, normalizeAiError, type AiProvider, type ChatProviderMessage } from '../ai/contracts';
@@ -7,6 +7,7 @@ import { chatWithProvider, listProviderModels } from '../ai/providerClients';
 import * as FileSystem from 'expo-file-system';
 import { CaptureValidationError, type BatchSaveDecision, type CaptureCandidate, type CaptureSideEffectHooks, type SaveDecision } from '../data/contracts';
 import { resolveExpenseBatchSave, resolveExpenseSave, runCaptureSideEffects } from '../data/CaptureService';
+import { EXTERNAL_IMPORT_PROMPT } from '../data/ImportContracts';
 import {
   chatActionTier, describeTier2Approval, TIER3_DEEP_LINK,
   type ChatActionKind, type ChatActionOutcome, type ChatActionResult, type ChatActionRequest, type ChatApprovalDecision,
@@ -77,6 +78,82 @@ class AIChatService {
       logger.error('AI chat request failed', normalized.code);
       throw normalized;
     }
+  }
+
+  // FR-12.1 / FR-12.6: S-07 import-context producer. Turns raw pasted or attached
+  // transaction data into a structured batch for S-12's shared preview. This is
+  // the producer half only: it writes nothing and persists nothing, so the Tier 2
+  // blocking approval and the single import commit stay in the screen and S-12.
+  async extractImportBatch(input: { text: string; imageUri?: string }): Promise<Partial<Expense>[]> {
+    const provider = (await databaseService.getSetting('chat_provider') || 'gemini') as AiProvider;
+    const apiKey = provider === 'openrouter'
+      ? await databaseService.getSecret('chat_openrouter_api_key')
+      : await databaseService.getSecret('gemini_api_key');
+
+    if (!apiKey) throw new AiError('missing_key', provider, 'AI provider key is not configured');
+
+    const model = provider === 'openrouter'
+      ? await databaseService.getSetting('chat_openrouter_model') || OPENROUTER_MODELS[0].modelString
+      : await databaseService.getSetting('chat_gemini_model') || 'gemini-2.5-flash';
+
+    const prompt = `${EXTERNAL_IMPORT_PROMPT}\n\n${input.text}`.trim();
+    let userContent: ChatProviderMessage['content'] = prompt;
+    if (input.imageUri) {
+      try {
+        const base64 = await FileSystem.readAsStringAsync(input.imageUri, { encoding: FileSystem.EncodingType.Base64 });
+        userContent = [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+        ];
+      } catch {
+        logger.warn('Failed to read image for import parse', 'image_read_failed');
+      }
+    }
+
+    try {
+      const response = await chatWithProvider(provider, { feature: 'chat', model, messages: [{ role: 'user', content: userContent }] }, apiKey);
+      return this.parseImportBatch(response.text, provider);
+    } catch (error) {
+      const normalized = normalizeAiError(error, provider);
+      logger.error('AI import parse failed', normalized.code);
+      throw normalized;
+    }
+  }
+
+  // Parses the array the import prompt asks for. A row that is not an object is
+  // dropped rather than filled with defaults; S-12's buildImportCandidate still
+  // validates every field before a row can reach the commit boundary.
+  private parseImportBatch(text: string, provider: AiProvider): Partial<Expense>[] {
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start < 0 || end <= start) throw new AiError('invalid_response', provider, 'AI response did not contain an import array');
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text.slice(start, end + 1));
+    } catch {
+      throw new AiError('invalid_response', provider, 'AI response contained malformed import JSON');
+    }
+    if (!Array.isArray(parsed)) throw new AiError('invalid_response', provider, 'AI import response was not an array');
+
+    // An empty array is a valid "found no transactions" answer, not a malformed
+    // one, so the screen can ask for a checkable format instead of showing an
+    // error. Malformed JSON or a reply with no array still throws invalid_response.
+    const rows = parsed.filter((row): row is Record<string, unknown> => row !== null && typeof row === 'object' && !Array.isArray(row));
+
+    return rows.map((row) => {
+      const rawAmount = typeof row.amount === 'number' ? row.amount : typeof row.amount === 'string' ? Number(row.amount.replace(/[^0-9.-]/g, '')) : NaN;
+      const rawDate = typeof row.date === 'string' ? new Date(row.date).getTime() : NaN;
+      return {
+        merchant: typeof row.merchant === 'string' ? row.merchant : undefined,
+        amount: Number.isFinite(rawAmount) ? rawAmount : undefined,
+        currency: typeof row.currency === 'string' ? row.currency : undefined,
+        category: typeof row.category === 'string' ? row.category : undefined,
+        note: typeof row.note === 'string' ? row.note : undefined,
+        date: Number.isFinite(rawDate) ? rawDate : undefined,
+        scanned: row.scanned === 1 ? 1 : 0,
+      };
+    });
   }
 
   private async sendViaGemini(
