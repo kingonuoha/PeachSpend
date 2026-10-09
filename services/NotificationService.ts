@@ -1,13 +1,16 @@
 import { Platform } from 'react-native';
-import Constants from 'expo-constants';
+import { databaseService } from './DatabaseService';
+import { buildExpenseNotificationBody, resolveAmountVisibility } from './notificationContent';
 import { logger } from '../utils/logger';
+import { canUseNativeRuntime, isExpoGoRuntime } from '../utils/runtimeEnvironment';
 
-const isExpoGo = Constants.executionEnvironment === 'storeClient';
-
-let Notifications: any = null;
-if (!isExpoGo) {
-  Notifications = require('expo-notifications');
-  Notifications.setNotificationHandler({
+let Notifications: typeof import('expo-notifications') | null = null;
+if (!isExpoGoRuntime()) {
+  // Keep native module lazy, Expo Go cannot load it.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const loadedNotifications = require('expo-notifications') as typeof import('expo-notifications');
+  Notifications = loadedNotifications;
+  loadedNotifications.setNotificationHandler({
     handleNotification: async () => ({
       shouldShowAlert: true,
       shouldShowBanner: true,
@@ -19,13 +22,13 @@ if (!isExpoGo) {
 }
 
 class NotificationService {
-  private notificationQueue: { merchant: string; amount: string }[] = [];
+  private notificationQueue: { merchant: string; amount: string; transactionId?: string }[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly BATCH_WINDOW = 3000;
   private readonly GROUP_ID = 'expense-group';
 
   async requestPermissions(): Promise<boolean> {
-    if (isExpoGo || !Notifications) return true;
+    if (!canUseNativeRuntime('expo-notifications') || !Notifications) return false;
     try {
       const { status: existingStatus } = await Notifications.getPermissionsAsync();
       let finalStatus = existingStatus;
@@ -50,14 +53,15 @@ class NotificationService {
       }
 
       return true;
-    } catch (error) {
-      logger.error('Failed to request notification permissions', error);
+    } catch {
+      logger.error('Failed to request notification permissions', 'notification_permission_failed');
       return false;
     }
   }
 
-  scheduleExpenseNotification(merchant: string, amount: string): void {
-    this.notificationQueue.push({ merchant, amount });
+  scheduleExpenseNotification(merchant: string, amount: string, transactionId?: string): void {
+    if (!canUseNativeRuntime('expo-notifications')) return;
+    this.notificationQueue.push({ merchant, amount, transactionId });
     this.scheduleBatch();
   }
 
@@ -71,8 +75,16 @@ class NotificationService {
     }, this.BATCH_WINDOW);
   }
 
+  // Central visibility gate for every expense notification surface. Callers
+  // pass the formatted amount, but only this boundary decides whether it is
+  // allowed into an OS notification or the persisted notifications row. This
+  // keeps the prices_visible rule in one place instead of one copy per caller.
+  private areAmountsVisible(): Promise<boolean> {
+    return resolveAmountVisibility(() => databaseService.getSetting('prices_visible'));
+  }
+
   private async flushBatch(): Promise<void> {
-    if (isExpoGo || !Notifications) return;
+    if (!Notifications) return;
     const batch = [...this.notificationQueue];
     this.notificationQueue = [];
     this.batchTimer = null;
@@ -80,20 +92,21 @@ class NotificationService {
     if (batch.length === 0) return;
 
     try {
-      let title: string;
-      let body: string;
+      const amountsVisible = await this.areAmountsVisible();
+      const title = batch.length === 1 ? 'Expense Recorded' : `${batch.length} Expenses Recorded`;
+      const body = buildExpenseNotificationBody(batch, amountsVisible);
 
-      if (batch.length === 1) {
-        const item = batch[0];
-        title = 'Expense Recorded';
-        body = `${item.merchant} — ${item.amount}`;
-      } else {
-        const total = batch.reduce((sum, item) => {
-          const num = parseFloat(item.amount.replace(/[^0-9.-]/g, ''));
-          return sum + (isNaN(num) ? 0 : num);
-        }, 0);
-        title = `${batch.length} Expenses Recorded`;
-        body = batch.map(i => `${i.merchant} — ${i.amount}`).join('\n');
+      // Persist to database
+      try {
+        await databaseService.insertNotification({
+          id: `notif_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+          title,
+          body,
+          type: 'expense',
+          data: JSON.stringify({ count: batch.length, transactionId: batch[0]?.transactionId ?? null }),
+        });
+      } catch {
+        logger.warn('Failed to persist notification', 'notification_persist_failed');
       }
 
       await Notifications.scheduleNotificationAsync({
@@ -106,8 +119,8 @@ class NotificationService {
         },
         trigger: null,
       });
-    } catch (error) {
-      logger.error('Failed to schedule notification', error);
+    } catch {
+      logger.error('Failed to schedule notification', 'notification_schedule_failed');
     }
   }
 }

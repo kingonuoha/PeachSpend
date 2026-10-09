@@ -1,708 +1,824 @@
-import { View, Text, ScrollView, TouchableOpacity, RefreshControl, Platform, Image, TextInput } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
-import { useRouter, useFocusEffect } from 'expo-router';
-import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
-import { documentDirectory, getInfoAsync } from 'expo-file-system/legacy';
-import Animated, { useSharedValue, useAnimatedStyle, withTiming, withSpring, useAnimatedReaction, Easing } from 'react-native-reanimated';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Plus,
-  ArrowUpRight,
-  ArrowDownLeft,
-  Maximize2,
-  Scan,
-  Edit3,
+  ActivityIndicator,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
+import { useRouter } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { LinearGradient } from 'expo-linear-gradient';
+import {
+  ArrowDown,
+  Bell,
+  ChevronRight,
   Eye,
   EyeOff,
+  Flame,
+  Leaf,
+  RotateCcw,
+  Sparkles,
   User,
-  DollarSign,
-  Search,
-  X
+  Zap,
 } from 'lucide-react-native';
 
-import { Strings } from '../../constants/strings';
-import { Colors } from '../../constants/tokens';
-import { useTheme } from '../../components/ui/ThemeProvider';
+import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useSettings } from '../../components/ui/SettingsProvider';
-import { useExpenses } from '../../hooks/useExpenses';
-import { ExpenseList } from '../../components/expense/ExpenseList';
-import { LuminousCard } from '../../components/ui/LuminousCard';
-import { DateRangePicker } from '../../components/ui/DateRangePicker';
+import { useToast } from '../../components/ui/ToastProvider';
+import { PeachButton } from '../../components/ui/PeachButton';
+import { ScalePressable } from '../../components/ui/ScalePressable';
+import StreakSplash, { selectNextStreakBadge } from '../../components/ui/StreakSplash';
+import { BadgeDetailModal } from '../../components/ui/BadgeDetailModal';
+import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
+import { homeDataService } from '../../data/homeDataRepository';
 import { databaseService } from '../../services/DatabaseService';
-import { geminiService } from '../../services/GeminiService';
-import { logger } from '../../utils/logger';
+import { profileDataService } from '../../services/DataServices';
+import { formatAmount } from '../../utils/format';
+import { formatRelativeDateWithTime } from '../../utils/dateFormat';
+import type { Expense } from '../../types/database';
+import type { HomeSnapshot } from '../../data/HomeContracts';
+import type { AchievementState } from '../../data/ProfileContracts';
+
+const MASK = '••••••';
+const MAX_CATEGORIES = 4;
+const RECENT_LIMIT = 5;
+
+interface CategoryInfo {
+  title: string;
+  icon_name: string;
+}
+
+interface HomeLoad {
+  snapshot: HomeSnapshot;
+  categories: Record<string, CategoryInfo>;
+}
+
+const GRADIENT_START = { x: 0.33, y: 0 };
+const GRADIENT_END = { x: 0.67, y: 1 };
+const GRADIENT_LOCATIONS: [number, number, number] = [0, 0.45, 1];
+
+// Canonical S-02 avatar ring, code.html line 159: bg-gradient-to-tr from-amber-300
+// to-rose-400 with purple-950 initials. Sourced from the locked pair, not a new palette.
+const AVATAR_GRADIENT = ['#FCD34D', '#FB7185'] as const;
+const AVATAR_INITIAL_COLOR = '#1E0B3D';
+
+function monthLabel(timestamp: number): string {
+  return new Date(timestamp).toLocaleDateString(undefined, { month: 'long' });
+}
+
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '';
+  return parts.slice(0, 2).map(part => part[0]).join('').toUpperCase();
+}
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { colors, isDark } = useTheme();
-  const styles = useThemeStyles();
-  const { settings, getCurrencySymbol, convertAmount, updateSetting } = useSettings();
-  const { expenses, isLoading, refreshExpenses } = useExpenses();
+  const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
-  const TAB_BAR_HEIGHT = 56 + insets.bottom;
-  const [fabOpen, setFabOpen] = useState(false);
-  const fabRotation = useSharedValue(0);
-  const fabScale1 = useSharedValue(0);
-  const fabScale2 = useSharedValue(0);
-  const fabScale3 = useSharedValue(0);
+  const toast = useToast();
+  const { settings, currency, getCurrencySymbol, convertAmount, updateSetting } = useSettings();
 
-  // Net balance
-  const [netBalance, setNetBalance] = useState(0);
-  const [incomeTotal, setIncomeTotal] = useState(0);
-  const [incomeEntries, setIncomeEntries] = useState<any[]>([]);
-  const [showIncome, setShowIncome] = useState(false);
-  const [digestText, setDigestText] = useState('');
-  const [digestLoading, setDigestLoading] = useState(false);
-  const [streak, setStreak] = useState(0);
-  const streakScale = useSharedValue(0);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [showSearch, setShowSearch] = useState(false);
-  const searchAnim = useSharedValue(0);
-  const searchInputRef = useRef<TextInput>(null);
+  const [load, setLoad] = useState<HomeLoad | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState(false);
+  const [streakSplash, setStreakSplash] = useState<{ streak: number; badge: AchievementState | null } | null>(null);
+  const [selectedBadge, setSelectedBadge] = useState<AchievementState | null>(null);
 
-  const filteredExpenses = useMemo(() => {
-    if (!searchQuery.trim()) return expenses.slice(0, 10);
-    const q = searchQuery.toLowerCase();
-    return expenses.filter(e =>
-      e.merchant.toLowerCase().includes(q) ||
-      (e.note && e.note.toLowerCase().includes(q)) ||
-      e.category.toLowerCase().includes(q)
-    ).slice(0, 10);
-  }, [expenses, searchQuery]);
-
-  const toggleSearch = () => {
-    if (showSearch) {
-      searchAnim.value = withTiming(0, { duration: 200 });
-      setSearchQuery('');
-      setTimeout(() => setShowSearch(false), 200);
-    } else {
-      setShowSearch(true);
-      searchAnim.value = withTiming(1, { duration: 300 });
-      setTimeout(() => searchInputRef.current?.focus(), 350);
+  // Income total and every other hero value come from the single typed snapshot.
+  // The screen no longer issues a separate income query.
+  const fetchHome = useCallback(async (): Promise<HomeLoad> => {
+    const snapshot = await homeDataService.getSnapshot();
+    const list = await databaseService.getCategories();
+    const categories: Record<string, CategoryInfo> = {};
+    for (const category of list) {
+      categories[category.id] = { title: category.title, icon_name: category.icon_name };
     }
-  };
+    return { snapshot, categories };
+  }, []);
 
-  const searchBarStyle = useAnimatedStyle(() => ({
-    height: searchAnim.value * 56,
-    opacity: searchAnim.value,
-    overflow: 'hidden',
-  }));
-
-  type BudgetTimeframe = 'monthly' | 'lifetime' | 'custom';
-  const [budgetTimeframe, setBudgetTimeframe] = useState<BudgetTimeframe>(
-    (settings.budget_timeframe as BudgetTimeframe) || 'monthly'
-  );
-  const [profileImageUri, setProfileImageUri] = useState<string | null>(null);
-  const [showDatePicker, setShowDatePicker] = useState(false);
-  const [budgetCustomStart, setBudgetCustomStart] = useState<Date>(
-    settings.budget_custom_start ? new Date(parseInt(settings.budget_custom_start)) : new Date(new Date().getFullYear(), 0, 1)
-  );
-  const [budgetCustomEnd, setBudgetCustomEnd] = useState<Date>(
-    settings.budget_custom_end ? new Date(parseInt(settings.budget_custom_end)) : new Date()
-  );
+  const applyLoad = useCallback((next: HomeLoad) => {
+    setLoad(next);
+    setRefreshError(next.snapshot.state === 'offline' || next.snapshot.state === 'failure');
+  }, []);
 
   useEffect(() => {
-    const pic = settings.profile_picture;
-    if (pic) {
-      const path = (documentDirectory || '') + 'profile_pics/' + pic;
-      getInfoAsync(path).then((info) => {
-        if (info.exists) setProfileImageUri(path);
-      }).catch(() => {});
-    } else {
-      setProfileImageUri(null);
-    }
-  }, [settings.profile_picture]);
-
-  // Load income data
-  const loadIncome = useCallback(async () => {
-    try {
-      const income = await databaseService.getIncome();
-      setIncomeEntries(income);
-      const iTotal = income.reduce((sum: number, inc: any) => sum + convertAmount(inc.amount, inc.currency || 'USD').amount, 0);
-      setIncomeTotal(iTotal);
-      const eTotal = expenses.reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
-      setNetBalance(iTotal - eTotal);
-    } catch {}
-  }, [expenses, convertAmount]);
-
-  useEffect(() => {
-    loadIncome();
-  }, [expenses]);
-
-  // Load weekly digest
-  useEffect(() => {
-    const loadDigest = async () => {
-      const text = await databaseService.getSetting('weekly_digest_text');
-      const generatedAt = await databaseService.getSetting('weekly_digest_generated_at');
-      const dismissed = await databaseService.getSetting('weekly_digest_dismissed');
-      if (text && generatedAt && dismissed !== 'true') {
-        const oneWeekAgo = Date.now() - 7 * 86400000;
-        if (parseInt(generatedAt) > oneWeekAgo) {
-          setDigestText(text);
-        }
+    let active = true;
+    void (async () => {
+      try {
+        const next = await fetchHome();
+        if (active) applyLoad(next);
+      } finally {
+        if (active) setLoading(false);
       }
-    };
-    loadDigest();
-  }, []);
-
-  // Load streak
-  useEffect(() => {
-    (async () => {
-      const s = await databaseService.getStreak();
-      setStreak(s);
-      streakScale.value = withTiming(1, { duration: 600, easing: Easing.out(Easing.cubic) });
     })();
-  }, [expenses]);
+    return () => {
+      active = false;
+    };
+  }, [fetchHome, applyLoad]);
 
-  const handleGenerateDigest = async () => {
-    setDigestLoading(true);
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
     try {
-      const text = await geminiService.generateWeeklyDigest();
-      setDigestText(text);
-      const now = Date.now();
-      await databaseService.updateSetting('weekly_digest_text', text);
-      await databaseService.updateSetting('weekly_digest_generated_at', now.toString());
-      await databaseService.updateSetting('weekly_digest_dismissed', 'false');
-    } catch (error) {
-      logger.error('Failed to generate digest', error);
+      applyLoad(await fetchHome());
+    } catch {
+      setRefreshError(true);
     } finally {
-      setDigestLoading(false);
+      setRefreshing(false);
     }
-  };
+  }, [fetchHome, applyLoad]);
 
-  const dismissDigest = async () => {
-    setDigestText('');
-    await databaseService.updateSetting('weekly_digest_dismissed', 'true');
-  };
+  const retry = useCallback(() => {
+    setRefreshError(false);
+    void onRefresh();
+  }, [onRefresh]);
 
-  // Refresh on focus
-  useFocusEffect(
-    useCallback(() => {
-      refreshExpenses();
-    }, [refreshExpenses])
-  );
+  const snapshot = load?.snapshot;
+  const visible = settings.prices_visible !== 'false';
+  const symbol = getCurrencySymbol();
+  const currencyCode = snapshot?.hero.currency ?? currency;
+  const spend = snapshot?.hero.totalSpent ?? 0;
+  const incomeTotal = snapshot?.hero.incomeTotal ?? 0;
 
-  // FAB animation
-  const toggleFab = () => {
-    if (fabOpen) {
-      fabRotation.value = withSpring(0);
-      fabScale1.value = withSpring(0);
-      fabScale2.value = withSpring(0);
-      fabScale3.value = withSpring(0);
-    } else {
-      fabRotation.value = withSpring(45);
-      fabScale1.value = withSpring(1);
-      fabScale2.value = withSpring(1);
-      fabScale3.value = withSpring(1);
+  const budget = useMemo(() => {
+    const raw = parseFloat(settings.monthly_budget) || 0;
+    if (raw <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
+    const cap = convertAmount(raw, settings.budget_currency || currency).amount;
+    if (cap <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
+    const progress = spend / cap;
+    const state = progress > 1 ? 'over' as const : progress >= 0.8 ? 'near' as const : 'on' as const;
+    return { state, progress, percent: Math.round(progress * 100) };
+  }, [settings.monthly_budget, settings.budget_currency, currency, convertAmount, spend]);
+
+  const insight = snapshot?.comparativeInsight;
+  const month = snapshot ? monthLabel(snapshot.period.start) : '';
+  const profileName = settings.profile_name?.trim() || '';
+  const streakDays = snapshot?.streak.days ?? 0;
+  const unread = snapshot?.unreadNotificationCount ?? 0;
+
+  const recent = snapshot?.recentTransactions ?? [];
+  const visibleRecent = recent.slice(0, RECENT_LIMIT);
+  const categories = (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES);
+
+  const money = useCallback((value: number) => `${symbol}${formatAmount(value)}`, [symbol]);
+
+  const toggleVisibility = useCallback(() => {
+    const next = visible ? 'false' : 'true';
+    void updateSetting('prices_visible', next);
+    toast.showToast(next === 'false' ? 'Amounts hidden' : 'Amounts visible');
+  }, [visible, updateSetting, toast]);
+
+  // FR-02.6: the quiet Home streak badge opens SH-02a. The cross-link badge
+  // comes from the real ProfileSnapshot achievements; a failed read falls back
+  // to the live Home streak with no badge bridge rather than a fake claim.
+  const openStreakSplash = useCallback(async () => {
+    let streak = streakDays;
+    let badge: AchievementState | null = null;
+    try {
+      const next = await profileDataService.getSnapshot();
+      streak = next.stats.streak || streakDays;
+      badge = selectNextStreakBadge(next.achievements);
+    } catch {
+      badge = null;
     }
-    setFabOpen(!fabOpen);
-  };
+    setStreakSplash({ streak, badge });
+  }, [streakDays]);
 
-  const fabRotateStyle = useAnimatedStyle(() => ({
-    transform: [{ rotate: `${fabRotation.value}deg` }],
-  }));
+  // TEMPORARY dev-only control (H6). Writes onboarding_complete through the
+  // settings provider typed path, then routes to onboarding so the guard at
+  // (onboarding)/index.tsx sees the fresh value. Remove before release.
+  const resetOnboarding = useCallback(async () => {
+    await updateSetting('onboarding_complete', 'false');
+    router.push('/(onboarding)');
+  }, [updateSetting, router]);
 
-  const fabOption1Style = useAnimatedStyle(() => ({
-    opacity: fabScale1.value,
-    transform: [{ scale: fabScale1.value }, { translateY: -80 }],
-  }));
-
-  const fabOption2Style = useAnimatedStyle(() => ({
-    opacity: fabScale2.value,
-    transform: [{ scale: fabScale2.value }, { translateY: -150 }],
-  }));
-
-  const fabOption3Style = useAnimatedStyle(() => ({
-    opacity: fabScale3.value,
-    transform: [{ scale: fabScale3.value }, { translateY: -220 }],
-  }));
-
-  // Entrance animation
-  const fadeAnim = useSharedValue(0);
-  const slideAnim = useSharedValue(24);
-
-  useEffect(() => {
-    fadeAnim.value = withTiming(1, { duration: 500 });
-    slideAnim.value = withTiming(0, { duration: 500 });
-  }, []);
-
-  const fadeSlideStyle = useAnimatedStyle(() => ({
-    opacity: fadeAnim.value,
-    transform: [{ translateY: slideAnim.value }],
-  }));
-
-  const fadeStyle = useAnimatedStyle(() => ({
-    opacity: fadeAnim.value,
-  }));
-
-  const greeting = useMemo(() => {
-    const hour = new Date().getHours();
-    if (hour < 12) return Strings.home.greeting_morning;
-    if (hour < 18) return Strings.home.greeting_afternoon;
-    return Strings.home.greeting_evening;
-  }, []);
-
-  const totalSpending = useMemo(() => {
-    return expenses.reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
-  }, [expenses, convertAmount]);
-
-  const todaySpending = useMemo(() => {
-    const today = new Date().setHours(0, 0, 0, 0);
-    return expenses
-      .filter(exp => new Date(exp.created_at).setHours(0, 0, 0, 0) === today)
-      .reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
-  }, [expenses, convertAmount]);
-
-  const budgetCap = useMemo(() => {
-    return parseFloat(settings.monthly_budget) || 0;
-  }, [settings.monthly_budget]);
-
-  const budgetSpending = useMemo(() => {
-    const now = new Date();
-    let threshold: number | null = null;
-
-    if (budgetTimeframe === 'monthly') {
-      threshold = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-    } else if (budgetTimeframe === 'custom') {
-      return expenses
-        .filter(exp => exp.created_at >= budgetCustomStart.getTime() && exp.created_at <= budgetCustomEnd.getTime())
-        .reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
-    }
-
-    return expenses
-      .filter(exp => threshold === null || exp.created_at >= threshold)
-      .reduce((sum, exp) => sum + convertAmount(exp.amount, exp.currency || 'USD').amount, 0);
-  }, [expenses, convertAmount, budgetTimeframe, budgetCustomStart, budgetCustomEnd]);
-
-  const budgetProgress = budgetCap > 0 ? Math.min(budgetSpending / budgetCap, 1) : 0;
-  const budgetRemaining = budgetCap - budgetSpending;
-
-  const budgetLabel = budgetTimeframe === 'monthly' ? 'Monthly Budget'
-    : budgetTimeframe === 'lifetime' ? 'Lifetime Budget'
-    : 'Budget Range';
+  if (loading) {
+    return (
+      <View style={[styles.loading, { backgroundColor: ts.bg.screen, paddingTop: insets.top }]}>
+        <ActivityIndicator color={ts.raw.primary} />
+      </View>
+    );
+  }
 
   return (
-    <SafeAreaView className="flex-1" style={{ backgroundColor: colors.background }}>
+    <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
       <ScrollView
-        className="flex-1"
-        contentContainerStyle={{ paddingBottom: 140 }}
         showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: 90 + insets.bottom + Spacing.s6 }}
         refreshControl={
           <RefreshControl
-            refreshing={isLoading}
-            onRefresh={refreshExpenses}
-            tintColor={colors.primary}
-            colors={[colors.primary]}
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor={ts.raw.primary}
+            colors={[ts.raw.primary]}
           />
         }
       >
-        {/* Header */}
-        <Animated.View style={fadeSlideStyle} className="px-6 pt-10 mb-8 flex-row justify-between items-center">
-          <View>
-            <Text className="text-onSurfaceVariant/60 font-manrope-medium text-base tracking-tight">
-              {greeting},
-            </Text>
-            <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-4xl mt-1">
-              {settings.profile_name || 'Peach User'}
-            </Text>
+        <LinearGradient
+          colors={ts.isDark ? Gradients.dark : Gradients.light}
+          locations={GRADIENT_LOCATIONS}
+          start={GRADIENT_START}
+          end={GRADIENT_END}
+          style={[styles.hero, { paddingTop: insets.top + Spacing.s2 }]}
+        >
+          <View style={styles.heroHeader}>
+            <ScalePressable
+              accessibilityRole="button"
+              accessibilityLabel="Open profile"
+              hitSlop={{ top: 4, bottom: 4, left: 4, right: 4 }}
+              onPress={() => router.push('/(tabs)/profile')}
+              style={styles.identity}
+            >
+              <LinearGradient
+                colors={AVATAR_GRADIENT}
+                start={{ x: 0, y: 1 }}
+                end={{ x: 1, y: 0 }}
+                style={styles.avatar}
+              >
+                {profileName ? (
+                  <Text style={styles.avatarText}>{initialsOf(profileName)}</Text>
+                ) : (
+                  <User size={18} color={AVATAR_INITIAL_COLOR} />
+                )}
+              </LinearGradient>
+              <View style={styles.identityText}>
+                <View style={styles.cycleRow}>
+                  <Text style={styles.cycleLabel}>{month} Cycle</Text>
+                  <View style={styles.cycleDot} />
+                  <Text style={styles.cycleYear}>{new Date().getFullYear()}</Text>
+                </View>
+                <Text style={styles.profileName} numberOfLines={1}>
+                  {profileName || 'PeachSpend'}
+                </Text>
+              </View>
+            </ScalePressable>
+
+            <View style={styles.heroActions}>
+              <ScalePressable
+                accessibilityRole="button"
+                accessibilityLabel={visible ? 'Hide amounts' : 'Show amounts'}
+                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                onPress={toggleVisibility}
+                style={styles.glassButton}
+              >
+                {visible ? (
+                  <Eye size={16} color={Colors.white} />
+                ) : (
+                  <EyeOff size={16} color={Colors.white} />
+                )}
+              </ScalePressable>
+
+              {streakDays > 0 ? (
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Daily logging streak, ${streakDays} days`}
+                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                  onPress={() => void openStreakSplash()}
+                  style={[styles.glassButton, styles.streakPill]}
+                >
+                  <Flame size={14} color="#FCD34D" />
+                  <Text style={styles.streakText}>{streakDays}d</Text>
+                </ScalePressable>
+              ) : null}
+
+              <ScalePressable
+                accessibilityRole="button"
+                accessibilityLabel={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
+                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                onPress={() => router.push('/notifications')}
+                style={styles.glassButton}
+              >
+                <Bell size={16} color={Colors.white} />
+                {unread > 0 ? (
+                  <View style={styles.bellBadge}>
+                    <Text style={styles.bellBadgeText}>{unread > 99 ? '99+' : unread}</Text>
+                  </View>
+                ) : null}
+              </ScalePressable>
+            </View>
           </View>
-          <View className="items-center">
-            <View className="w-12 h-12 rounded-2xl items-center justify-center overflow-hidden" style={{ backgroundColor: styles.bg.card, borderColor: styles.border.subtle, borderWidth: 1 }}>
-              {profileImageUri ? (
-                <Image source={{ uri: profileImageUri }} className="w-full h-full" resizeMode="cover" />
+
+          <View style={styles.outflowRow}>
+            <Text style={styles.outflowLabel}>TOTAL OUTFLOW ({month.toUpperCase()})</Text>
+            {budget.state !== 'none' ? <BudgetPill state={budget.state} percent={budget.percent} /> : null}
+          </View>
+
+          <View style={styles.amountRow}>
+            <Text style={styles.amount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
+              {visible ? money(spend) : MASK}
+            </Text>
+            <Text style={styles.currencyCode}>{currencyCode}</Text>
+          </View>
+
+          <View style={styles.summaryRow}>
+            <View style={styles.summaryItem}>
+              <View style={styles.incomeIcon}>
+                <ArrowDown size={12} color={Colors.success} />
+              </View>
+              <Text style={styles.summaryLabel}>Income Inflow:</Text>
+              <Text style={styles.summaryValue} numberOfLines={1}>
+                {visible ? money(incomeTotal) : MASK}
+              </Text>
+            </View>
+          </View>
+
+          {budget.state !== 'none' ? (
+            <View style={styles.budgetTrack}>
+              {budget.state === 'on' ? (
+                <LinearGradient
+                  colors={[Colors.success, ts.raw.primary]}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 0 }}
+                  style={[styles.budgetFill, { width: `${Math.min(budget.progress, 1) * 100}%` }]}
+                />
               ) : (
-                <User size={20} color={styles.icon.muted} />
+                <View
+                  style={[
+                    styles.budgetFill,
+                    {
+                      width: `${Math.min(budget.progress, 1) * 100}%`,
+                      backgroundColor: budget.state === 'over' ? ts.raw.danger : ts.raw.warning,
+                    },
+                  ]}
+                />
               )}
             </View>
-            {streak > 0 && (
-              <Animated.View style={[{ transform: [{ scale: streakScale }] }, { backgroundColor: Colors.primary + '20', borderColor: Colors.primary + '30', borderWidth: 1, borderRadius: 12, paddingHorizontal: 8, paddingVertical: 2 }]} className="flex-row items-center mt-1.5">
-                <Image source={require('../../assets/images/flameheart-emoji.gif')} style={{ width: 14, height: 14 }} resizeMode="contain" />
-                <Text style={{ color: Colors.primary, fontSize: 10, fontFamily: 'Manrope_700Bold', marginLeft: 2 }}>{streak}</Text>
-              </Animated.View>
-            )}
-          </View>
-        </Animated.View>
+          ) : null}
 
-        {/* Balance Card */}
-        <Animated.View style={fadeSlideStyle} className="px-5 mb-10">
-          <LuminousCard variant="highest" className="p-8 shadow-2xl" style={{ borderColor: styles.border.card, borderWidth: 1 }}>
-            <View className="flex-row justify-between items-start">
-              <View className="flex-1">
-                <View className="flex-row items-center mb-3">
-                  <Text className="text-onSurfaceVariant font-manrope-bold text-xs uppercase tracking-[0.2em]">
-                    {Strings.home.total_spending}
-                  </Text>
-                  <TouchableOpacity
-                    onPress={() => updateSetting('prices_visible', settings.prices_visible === 'false' ? 'true' : 'false')}
-                    className="ml-2 p-1"
-                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                  >
-                    {settings.prices_visible === 'false' ? (
-                      <EyeOff size={16} color={Colors.onSurfaceVariant} />
-                    ) : (
-                      <Eye size={16} color={Colors.primary} />
-                    )}
-                  </TouchableOpacity>
-                </View>
-                {settings.prices_visible !== 'false' ? (
-                  <View className="flex-row items-baseline">
-                    <Text style={{ color: colors.primary }} className="font-noto-serif-bold text-2xl mr-1">{getCurrencySymbol()}</Text>
-                    <Text style={{ color: colors.onSurface }} className="font-noto-serif-bold text-5xl tracking-tighter">
-                      {totalSpending.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </Text>
-                  </View>
-                ) : (
-                  <View className="flex-row items-baseline">
-                    <Text style={{ color: colors.primary }} className="font-noto-serif-bold text-2xl mr-1">{getCurrencySymbol()}</Text>
-                    <Text style={{ color: colors.onSurface }} className="font-noto-serif-bold text-5xl tracking-tighter">
-                      ••••
-                    </Text>
-                  </View>
-                )}
-              </View>
-              <View className="bg-primary/10 p-4 rounded-3xl border border-primary/20">
-                <Maximize2 size={24} color={Colors.primary} />
-              </View>
-            </View>
-
-            <View className="flex-row mt-10 gap-4">
-              <TouchableOpacity
-                onPress={() => router.push('/scan')}
-                className="flex-1 bg-primary h-[60px] rounded-3xl flex-row items-center justify-center shadow-lg"
-              >
-                <Scan size={20} color="black" />
-                <Text className="text-black font-manrope-bold ml-2 text-base">Neural Scan</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                onPress={() => router.push('/expense/manual')}
-                style={{ backgroundColor: styles.bg.white5, borderColor: styles.border.card, borderWidth: 1 }}
-                className="flex-1 h-[60px] rounded-3xl flex-row items-center justify-center"
-              >
-                <Edit3 size={20} color={styles.icon.default} />
-                <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold ml-2 text-base">Manual</Text>
-              </TouchableOpacity>
-            </View>
-          </LuminousCard>
-        </Animated.View>
-
-        {/* Bento Stats */}
-        <View className="px-5 mb-10 flex-row gap-4">
-          <LuminousCard className="flex-1 p-6" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
-            <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-bold text-[10px] uppercase tracking-widest mb-2">Today</Text>
-            {settings.prices_visible !== 'false' ? (
-              <View className="flex-row items-baseline">
-                <Text style={{ color: colors.primary }} className="font-noto-serif-bold text-sm mr-0.5">{getCurrencySymbol()}</Text>
-                <Text style={{ color: colors.onSurface }} className="font-noto-serif-bold text-2xl tracking-tighter">
-                  {todaySpending.toLocaleString(undefined, { maximumFractionDigits: 2 })}
-                </Text>
-              </View>
-            ) : (
-              <Text style={{ color: colors.onSurface }} className="font-noto-serif-bold text-2xl tracking-tighter">••••</Text>
-            )}
-          </LuminousCard>
-          <LuminousCard className="flex-1 p-6" style={{ backgroundColor: styles.bg.primary5, borderColor: styles.border.subtle, borderWidth: 1 }}>
-            <Text style={{ color: styles.text.primary60 }} className="font-manrope-bold text-[10px] uppercase tracking-widest mb-2">Flow Velocity</Text>
-            <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-2xl tracking-tighter">Smooth</Text>
-          </LuminousCard>
-        </View>
-
-        {/* Net Balance */}
-        <Animated.View style={fadeSlideStyle} className="px-5 mb-8">
-          <LuminousCard className="p-5" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
-            <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-bold text-[10px] uppercase tracking-widest mb-3">Net Balance</Text>
-            <View className="flex-row items-center justify-between">
-              <View className="flex-row items-center">
-                <View className="bg-green-500/10 p-2 rounded-xl mr-3">
-                  <ArrowDownLeft size={16} color="#4ADE80" />
-                </View>
-                <View>
-                  <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-medium text-[10px] uppercase tracking-widest">Income</Text>
-                  <Text style={{ color: '#4ADE80' }} className="font-manrope-bold text-sm">
-                    {settings.prices_visible !== 'false' ? `${getCurrencySymbol()}${incomeTotal.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '••••'}
-                  </Text>
-                </View>
-              </View>
-              <View className="flex-row items-center">
-                <View className="bg-primary/10 p-2 rounded-xl mr-3">
-                  <ArrowUpRight size={16} color={Colors.primary} />
-                </View>
-                <View>
-                  <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-medium text-[10px] uppercase tracking-widest">Expenses</Text>
-                  <Text style={{ color: Colors.primary }} className="font-manrope-bold text-sm">
-                    {settings.prices_visible !== 'false' ? `${getCurrencySymbol()}${totalSpending.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '••••'}
-                  </Text>
-                </View>
-              </View>
-              <View className="items-end">
-                <Text style={{ color: styles.text.onSurfaceVariant40 }} className="font-manrope-medium text-[10px] uppercase tracking-widest">Net</Text>
-                <Text style={{ color: netBalance >= 0 ? '#4ADE80' : '#FF8A80' }} className="font-noto-serif-bold text-xl">
-                  {settings.prices_visible !== 'false' ? `${getCurrencySymbol()}${netBalance.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '••••'}
-                </Text>
-              </View>
-            </View>
-          </LuminousCard>
-        </Animated.View>
-
-        {/* Weekly Digest Card */}
-        {digestText ? (
-          <Animated.View style={fadeSlideStyle} className="px-5 mb-8">
-            <LuminousCard className="p-6" style={{ borderColor: Colors.primary + '20', borderWidth: 1, backgroundColor: Colors.primary + '08' }}>
-              <View className="flex-row justify-between items-start mb-3">
-                <View className="flex-row items-center">
-                  <View className="bg-primary/20 p-2 rounded-xl mr-3">
-                    <Edit3 size={16} color={Colors.primary} />
-                  </View>
-                  <Text style={{ color: Colors.primary }} className="font-noto-serif-bold text-lg">Weekly Digest</Text>
-                </View>
-                <TouchableOpacity onPress={dismissDigest} className="p-1" hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-                  <X size={16} color={styles.icon.muted} />
-                </TouchableOpacity>
-              </View>
-              <Text style={{ color: styles.text.onSurface }} className="font-manrope-medium text-sm leading-6">
-                {digestText}
-              </Text>
-            </LuminousCard>
-          </Animated.View>
-        ) : !digestLoading ? (
-          <Animated.View style={fadeSlideStyle} className="px-5 mb-8">
-            <TouchableOpacity
-              onPress={handleGenerateDigest}
-              style={{ borderColor: styles.border.subtle, borderWidth: 1, borderStyle: 'dashed' }}
-              className="p-5 rounded-3xl flex-row items-center justify-center"
+          {/* F-03R-02: the insight is derived from real period totals, so it is
+              hidden with the amounts to avoid leaking direction or percent. */}
+          {visible && insight?.localText ? (
+            <ScalePressable
+              accessibilityRole="button"
+              accessibilityLabel="Open insights"
+              onPress={() => router.push('/(tabs)/analytics')}
+              style={[styles.insight, ts.isDark ? styles.insightDark : null]}
             >
-              <Edit3 size={18} color={Colors.primary} />
-              <Text style={{ color: Colors.primary }} className="font-manrope-semibold text-sm ml-2">Generate Weekly Digest</Text>
-            </TouchableOpacity>
-          </Animated.View>
+              <View style={styles.insightLeft}>
+                <Sparkles size={16} color={Colors.white} />
+                <Text style={styles.insightText}>{insight.localText}</Text>
+              </View>
+              <ChevronRight size={16} color="rgba(255,255,255,0.7)" />
+            </ScalePressable>
+          ) : null}
+        </LinearGradient>
+
+        {refreshError ? (
+          <View style={[styles.errorBanner, { backgroundColor: ts.raw.dangerSoft, borderColor: ts.raw.danger }]}>
+            <View style={styles.errorLeft}>
+              <RotateCcw size={14} color={ts.raw.danger} />
+              <Text style={[styles.errorText, { color: ts.raw.danger }]}>
+                {snapshot?.refresh.errorCode === 'offline'
+                  ? 'Sync offline. Retaining local cache.'
+                  : 'Could not load your ledger. Showing what is available.'}
+              </Text>
+            </View>
+            <PeachButton title="Retry" variant="destructive" size="xs" onPress={retry} />
+          </View>
         ) : null}
 
-        {/* Budget Progress Bar */}
-        {budgetCap > 0 && (
-          <Animated.View style={fadeSlideStyle} className="px-5 mb-8">
-            <LuminousCard className="p-6" style={{ borderColor: styles.border.subtle, borderWidth: 1 }}>
-              <View className="flex-row justify-between items-center mb-3">
-                <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-bold text-[10px] uppercase tracking-widest">
-                  {budgetLabel}
-                </Text>
-                <Text style={{ color: styles.text.onSurfaceVariant }} className="font-manrope-medium text-xs">
-                  {settings.prices_visible !== 'false'
-                    ? `${getCurrencySymbol()}${budgetSpending.toLocaleString(undefined, { maximumFractionDigits: 0 })} / ${getCurrencySymbol()}${budgetCap.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
-                    : '•••• / ••••'}
-                </Text>
+        {categories.length > 0 ? (
+          <View style={styles.section}>
+            <View style={styles.sectionHeader}>
+              <View style={styles.sectionTitleRow}>
+                <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Top Categories</Text>
+                <Text style={[styles.sectionMeta, { color: ts.raw.onSurfaceVariant }]}>{month}</Text>
               </View>
-
-              <View style={{ backgroundColor: styles.bg.white5 }} className="w-full h-2 rounded-full overflow-hidden">
-                <View
-                  style={{
-                    width: `${budgetProgress * 100}%`,
-                    backgroundColor: budgetProgress > 0.8 ? '#ef4444' : budgetProgress > 0.5 ? Colors.primary : '#22c55e',
-                  }}
-                  className="h-full rounded-full"
-                />
-              </View>
-
-              {budgetRemaining > 0 ? (
-                <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-medium text-xs mt-2">
-                  {settings.prices_visible !== 'false'
-                    ? `${getCurrencySymbol()}${budgetRemaining.toLocaleString(undefined, { maximumFractionDigits: 0 })} remaining`
-                    : '•••• remaining'}
-                </Text>
-              ) : (
-                <Text style={{ color: styles.text.error }} className="font-manrope-medium text-xs mt-2">Budget exceeded</Text>
-              )}
-
-              {/* Timeframe Toggle */}
-              <View style={{ backgroundColor: styles.bg.white5, borderColor: styles.border.subtle, borderWidth: 1 }} className="flex-row rounded-xl p-1 mt-4">
-                {(['monthly', 'lifetime', 'custom'] as const).map((tf) => (
-                  <TouchableOpacity
-                    key={tf}
-                    onPress={() => {
-                      setBudgetTimeframe(tf);
-                      updateSetting('budget_timeframe', tf);
-                      if (tf === 'custom') setShowDatePicker(true);
-                    }}
-                    className={`flex-1 py-2 rounded-lg ${budgetTimeframe === tf ? 'bg-primary' : ''}`}
-                  >
-                    <Text className={`text-center font-manrope-bold text-[10px] uppercase tracking-widest ${budgetTimeframe === tf ? 'text-black' : ''}`}
-                      style={budgetTimeframe !== tf ? { color: styles.text.onSurfaceVariant } : {}}>
-                      {tf === 'monthly' ? 'Month' : tf === 'lifetime' ? 'All' : 'Custom'}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </LuminousCard>
-          </Animated.View>
-        )}
-
-        {/* Date Range Picker Modal */}
-        <DateRangePicker
-          visible={showDatePicker}
-          startDate={budgetCustomStart}
-          endDate={budgetCustomEnd}
-          onApply={(start, end) => {
-            setBudgetCustomStart(start);
-            setBudgetCustomEnd(end);
-            updateSetting('budget_custom_start', start.getTime().toString());
-            updateSetting('budget_custom_end', end.getTime().toString());
-            setShowDatePicker(false);
-          }}
-          onClose={() => setShowDatePicker(false)}
-        />
-
-        {/* Income Section */}
-        {incomeEntries.length > 0 && (
-          <Animated.View style={fadeStyle} className="mb-8">
-            <TouchableOpacity
-              onPress={() => setShowIncome(!showIncome)}
-              className="px-6 mb-4 flex-row justify-between items-center"
-            >
-              <View className="flex-row items-center">
-                <ArrowDownLeft size={16} color="#4ADE80" className="mr-2" />
-                <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-2xl tracking-tight ml-2">Income</Text>
-                <Text className="text-green-400 font-manrope-bold text-sm ml-3">{getCurrencySymbol()}{incomeTotal.toLocaleString(undefined, { maximumFractionDigits: 2 })}</Text>
-              </View>
-            </TouchableOpacity>
-            {showIncome && incomeEntries.slice(0, 5).map((inc: any) => {
-              const incValue = convertAmount(inc.amount, inc.currency || 'USD');
-              return (
-                <View key={inc.id} style={{ backgroundColor: 'rgba(74,222,128,0.05)', borderColor: 'rgba(74,222,128,0.1)', borderWidth: 1 }} className="mx-6 mb-3 py-4 px-5 rounded-3xl flex-row justify-between items-center">
-                  <View className="flex-1 mr-4">
-                    <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-base" numberOfLines={1}>{inc.source}</Text>
-                    {inc.note && <Text className="text-onSurfaceVariant font-manrope-medium text-xs mt-0.5">{inc.note}</Text>}
-                  </View>
-                  <Text style={{ color: '#4ADE80' }} className="font-noto-serif-bold text-xl">
-                    {settings.prices_visible !== 'false' ? `+${getCurrencySymbol()}${incValue.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '••••'}
-                  </Text>
-                </View>
-              );
-            })}
-          </Animated.View>
-        )}
-
-        {/* Recent Expenses List */}
-        <Animated.View style={fadeStyle}>
-          <View className="px-6 mb-6 flex-row justify-between items-center">
-            <View className="flex-row items-center">
-              <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-2xl tracking-tight">Recent Flow</Text>
-              <TouchableOpacity
-                onPress={toggleSearch}
-                className="ml-3 p-2"
-                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              >
-                <Search size={18} color={showSearch ? Colors.primary : styles.icon.muted} />
-              </TouchableOpacity>
+              <PeachButton
+                title="Recap"
+                variant="secondary"
+                size="xs"
+                icon={<Zap size={14} color={ts.raw.primary} />}
+                onPress={() => router.push({ pathname: '/spending-recap', params: { origin: 'home' } } as never)}
+              />
             </View>
-            <TouchableOpacity onPress={() => router.push('/(tabs)/analytics')}>
-              <View style={{ backgroundColor: styles.bg.white5, borderColor: styles.border.subtle, borderWidth: 1 }} className="px-4 py-2 rounded-xl">
-                <Text className="text-primary font-manrope-bold text-xs uppercase tracking-widest">See all</Text>
+
+            <View style={styles.categoryRow}>
+              {categories.map(category => {
+                const info = load?.categories[category.category];
+                const tint = CategoryTints[category.category as keyof typeof CategoryTints] ?? CategoryTints.other;
+                const chip = ts.isDark ? tint.dark : tint.light;
+                return (
+                  <ScalePressable
+                    key={category.category}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${info?.title ?? category.category}, open insights`}
+                    onPress={() => router.push(`/(tabs)/analytics?category=${encodeURIComponent(category.category)}` as never)}
+                    style={[
+                      styles.categoryChip,
+                      { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline },
+                    ]}
+                  >
+                    <View style={[styles.categoryIcon, { backgroundColor: chip[0] }]}>
+                      <CategoryGlyph iconName={info?.icon_name} size={18} color={chip[1]} />
+                    </View>
+                    <Text style={[styles.categoryName, { color: ts.raw.onSurface }]} numberOfLines={1}>
+                      {info?.title ?? category.category}
+                    </Text>
+                    <Text style={[styles.categoryAmount, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+                      {visible ? money(category.total) : MASK}
+                    </Text>
+                  </ScalePressable>
+                );
+              })}
+            </View>
+          </View>
+        ) : null}
+
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionTitleRow}>
+              <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Recent Flow</Text>
+              <View style={[styles.countBadge, { backgroundColor: ts.bg.elevated }]}>
+                <Text style={[styles.countBadgeText, { color: ts.raw.onSurfaceVariant }]}>
+                  {visibleRecent.length} {visibleRecent.length === 1 ? 'item' : 'items'}
+                </Text>
               </View>
-            </TouchableOpacity>
+            </View>
+            <ScalePressable
+              accessibilityRole="button"
+              accessibilityLabel="See all transactions in Insights"
+              hitSlop={{ top: 12, bottom: 12, left: 8, right: 8 }}
+              onPress={() => router.push('/(tabs)/analytics')}
+              style={styles.seeAll}
+            >
+              <Text style={[styles.seeAllText, { color: ts.raw.primary }]}>See all</Text>
+              <ChevronRight size={14} color={ts.raw.primary} />
+            </ScalePressable>
           </View>
 
-          {/* Search Bar */}
-          {showSearch && (
-            <Animated.View style={searchBarStyle} className="px-6 mb-4">
-              <View style={{ backgroundColor: styles.bg.white5, borderColor: styles.border.subtle, borderWidth: 1 }} className="flex-row items-center rounded-2xl px-4 py-2">
-                <Search size={16} color={styles.icon.muted} />
-                <TextInput
-                  ref={searchInputRef}
-                  value={searchQuery}
-                  onChangeText={setSearchQuery}
-                  placeholder="Search expenses..."
-                  placeholderTextColor={styles.text.onSurfaceVariant60}
-                  style={{ color: styles.text.onSurface, flex: 1 }}
-                  className="font-manrope-medium text-base ml-2"
-                  selectionColor={Colors.primary}
-                />
-                {searchQuery.length > 0 && (
-                  <TouchableOpacity onPress={() => setSearchQuery('')} className="ml-2">
-                    <X size={16} color={styles.icon.muted} />
-                  </TouchableOpacity>
-                )}
+          {recent.length === 0 ? (
+            <View style={[styles.empty, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }]}>
+              <View style={[styles.emptyIcon, { backgroundColor: ts.bg.primary10 }]}>
+                <Leaf size={20} color={ts.raw.primary} />
               </View>
-            </Animated.View>
-          )}
-
-          {searchQuery.trim() && filteredExpenses.length === 0 ? (
-            <View className="px-6 py-10 items-center">
-              <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-medium text-sm text-center">
-                No expenses found for "{searchQuery}"
+              <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>No transactions recorded yet</Text>
+              <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
+                Use the plus button to log your first expense, scan a receipt, or log income.
               </Text>
             </View>
           ) : (
-            <ExpenseList expenses={filteredExpenses} isLoading={isLoading} searchQuery={searchQuery} />
+            <View style={styles.transactionList}>
+              {visibleRecent.map(expense => (
+                <TransactionRow
+                  key={expense.id}
+                  expense={expense}
+                  info={load?.categories[expense.category]}
+                  visible={visible}
+                  symbol={symbol}
+                  onPress={() => router.push({
+                    pathname: '/expense/[id]',
+                    params: { id: expense.id, origin: 'home', ids: visibleRecent.map(item => item.id).join(',') },
+                  } as never)}
+                />
+              ))}
+            </View>
           )}
-        </Animated.View>
+        </View>
+
+        {__DEV__ ? (
+          <View style={styles.devResetSection}>
+            <View style={[styles.devResetDivider, { backgroundColor: ts.raw.outline }]} />
+            <Text style={[styles.devResetNote, { color: ts.raw.onSurfaceVariant }]}>
+              Temporary development control. Remove before release.
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Dev: Reset onboarding"
+              onPress={resetOnboarding}
+              style={({ pressed }) => [
+                styles.devResetButton,
+                { borderColor: ts.raw.outline },
+                pressed ? styles.devResetButtonPressed : null,
+              ]}
+            >
+              <Text style={[styles.devResetButtonText, { color: ts.raw.onSurfaceVariant }]}>
+                Dev: Reset onboarding
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
       </ScrollView>
 
-      {/* FAB Speed Dial */}
-      <View
-        style={{
-          position: 'absolute',
-          bottom: TAB_BAR_HEIGHT + 20,
-          right: 20,
-          alignItems: 'center',
-        }}
-      >
-        {/* Speed Dial Options */}
-        <Animated.View style={fabOption3Style} className="items-center mb-2">
-          <TouchableOpacity
-            onPress={() => { toggleFab(); router.push('/income/manual' as any); }}
-            style={{ backgroundColor: '#4ADE80' }}
-            className="w-12 h-12 rounded-full items-center justify-center shadow-lg"
-          >
-            <ArrowDownLeft size={20} color="black" />
-          </TouchableOpacity>
-          <Text className="text-white/60 font-manrope-medium text-[10px] mt-1">Income</Text>
-        </Animated.View>
+      {streakSplash ? (
+        <StreakSplash
+          currentStreak={streakSplash.streak}
+          streakStartDate={settings.streak_start_date ?? null}
+          nextBadge={streakSplash.badge}
+          onDismiss={() => setStreakSplash(null)}
+          onViewDetails={(badge) => setSelectedBadge(badge)}
+        />
+      ) : null}
 
-        <Animated.View style={fabOption2Style} className="items-center mb-2">
-          <TouchableOpacity
-            onPress={() => { toggleFab(); router.push('/expense/manual'); }}
-            className="w-12 h-12 rounded-full items-center justify-center shadow-lg"
-            style={{ backgroundColor: Colors.primary }}
-          >
-            <Edit3 size={20} color="black" />
-          </TouchableOpacity>
-          <Text className="text-white/60 font-manrope-medium text-[10px] mt-1">Expense</Text>
-        </Animated.View>
-
-        <Animated.View style={fabOption1Style} className="items-center mb-2">
-          <TouchableOpacity
-            onPress={() => { toggleFab(); router.push('/scan'); }}
-            style={{ backgroundColor: '#A78BFA' }}
-            className="w-12 h-12 rounded-full items-center justify-center shadow-lg"
-          >
-            <Scan size={20} color="black" />
-          </TouchableOpacity>
-          <Text className="text-white/60 font-manrope-medium text-[10px] mt-1">Scan</Text>
-        </Animated.View>
-
-        {/* Main FAB */}
-        <TouchableOpacity
-          onPress={toggleFab}
-          activeOpacity={0.8}
-          style={{
-            width: 60,
-            height: 60,
-            borderRadius: 30,
-            backgroundColor: Colors.primary,
-            alignItems: 'center',
-            justifyContent: 'center',
-            shadowColor: Colors.primary,
-            shadowOffset: { width: 0, height: 6 },
-            shadowOpacity: 0.5,
-            shadowRadius: 16,
-            elevation: 10,
-          }}
-        >
-          <Animated.View style={fabRotateStyle}>
-            <Plus color="black" size={28} />
-          </Animated.View>
-        </TouchableOpacity>
-      </View>
-    </SafeAreaView>
+      <BadgeDetailModal
+        visible={selectedBadge !== null}
+        badge={selectedBadge}
+        currentStreak={streakSplash?.streak ?? streakDays}
+        onClose={() => setSelectedBadge(null)}
+      />
+    </View>
   );
 }
+
+function BudgetPill({ state, percent }: { state: 'on' | 'near' | 'over'; percent: number }) {
+  const label = state === 'over' ? `Exceeded (+${Math.max(percent - 100, 1)}%)` : state === 'near' ? `Near Limit (${percent}%)` : 'On Pace';
+  const color = state === 'over' ? '#FCA5A5' : state === 'near' ? '#FCD34D' : '#DDD6FE';
+  const background = state === 'over' ? 'rgba(244,63,94,0.25)' : state === 'near' ? 'rgba(245,158,11,0.25)' : 'rgba(255,255,255,0.15)';
+  return (
+    <View style={[styles.budgetPill, { backgroundColor: background }]}>
+      <Text style={[styles.budgetPillText, { color }]} numberOfLines={1}>
+        {label}
+      </Text>
+    </View>
+  );
+}
+
+function TransactionRow({
+  expense,
+  info,
+  visible,
+  symbol,
+  onPress,
+}: {
+  expense: Expense;
+  info?: CategoryInfo;
+  visible: boolean;
+  symbol: string;
+  onPress: () => void;
+}) {
+  const ts = useThemeStyles();
+  const { currency, convertAmount } = useSettings();
+  const tint = CategoryTints[expense.category as keyof typeof CategoryTints] ?? CategoryTints.other;
+  const chip = ts.isDark ? tint.dark : tint.light;
+  const converted = convertAmount(expense.amount, expense.currency || currency).amount;
+
+  return (
+    <ScalePressable
+      accessibilityRole="button"
+      accessibilityLabel={`${expense.merchant}, ${info?.title ?? expense.category}`}
+      onPress={onPress}
+      style={[styles.transaction, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }]}
+    >
+      <View style={styles.transactionLeft}>
+        <View style={[styles.transactionIcon, { backgroundColor: chip[0] }]}>
+          <CategoryGlyph iconName={info?.icon_name} size={18} color={chip[1]} />
+        </View>
+        <View style={styles.transactionText}>
+          <View style={styles.transactionTitleRow}>
+            <Text style={[styles.transactionTitle, { color: ts.raw.onSurface }]} numberOfLines={1}>
+              {expense.merchant}
+            </Text>
+            {expense.scanned === 1 ? (
+              <View style={[styles.ocrBadge, { backgroundColor: ts.bg.primary10 }]}>
+                <Text style={[styles.ocrBadgeText, { color: ts.raw.primary }]}>OCR</Text>
+              </View>
+            ) : null}
+          </View>
+          <Text style={[styles.transactionMeta, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+            {info?.title ?? expense.category} • {formatRelativeDateWithTime(expense.date)}
+          </Text>
+        </View>
+      </View>
+      <Text style={[styles.transactionAmount, { color: ts.raw.onSurface }]} numberOfLines={1}>
+        {visible ? `-${symbol}${formatAmount(converted)}` : MASK}
+      </Text>
+    </ScalePressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  hero: {
+    paddingHorizontal: Spacing.s5,
+    paddingBottom: Spacing.s6,
+    borderBottomLeftRadius: Radii.xxl,
+    borderBottomRightRadius: Radii.xxl,
+  },
+  heroHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: Spacing.s4,
+  },
+  identity: { flexDirection: 'row', alignItems: 'center', flexShrink: 1, minWidth: 0 },
+  avatar: {
+    width: 40,
+    height: 40,
+    borderRadius: Radii.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarText: { color: AVATAR_INITIAL_COLOR, fontFamily: 'Manrope_700Bold', fontSize: 14 },
+  identityText: { marginLeft: Spacing.s3, flexShrink: 1, minWidth: 0 },
+  cycleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 },
+  cycleLabel: {
+    ...Typography.micro,
+    fontFamily: 'Manrope_600SemiBold',
+    color: 'rgba(233,213,255,0.9)',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+  },
+  cycleDot: { width: 5, height: 5, borderRadius: Radii.full, backgroundColor: 'rgba(233,213,255,0.7)' },
+  cycleYear: { ...Typography.micro, color: 'rgba(233,213,255,0.7)' },
+  profileName: { ...Typography.headlineMd, color: Colors.white },
+  heroActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
+  glassButton: {
+    minWidth: 36,
+    minHeight: 36,
+    paddingHorizontal: Spacing.s2,
+    borderRadius: Radii.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  streakPill: { flexDirection: 'row', gap: Spacing.s1 },
+  streakText: { ...Typography.micro, color: '#FCD34D', fontFamily: 'Manrope_700Bold' },
+  bellBadge: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    minWidth: 16,
+    height: 16,
+    paddingHorizontal: 3,
+    borderRadius: Radii.full,
+    backgroundColor: '#F43F5E',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bellBadgeText: { color: Colors.white, fontFamily: 'Manrope_700Bold', fontSize: 9, lineHeight: 12 },
+  outflowRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+  },
+  outflowLabel: { ...Typography.labelMd, color: 'rgba(255,255,255,0.7)', flexShrink: 1 },
+  budgetPill: {
+    maxWidth: '55%',
+    paddingHorizontal: Spacing.s2,
+    paddingVertical: 2,
+    borderRadius: Radii.full,
+  },
+  budgetPillText: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold' },
+  amountRow: { flexDirection: 'row', alignItems: 'baseline', gap: Spacing.s2, marginTop: Spacing.s1 },
+  amount: { ...Typography.displayLg, color: Colors.white, letterSpacing: -0.5, flexShrink: 1 },
+  currencyCode: { ...Typography.labelMd, color: 'rgba(233,213,255,0.9)', fontFamily: 'Manrope_500Medium' },
+  summaryRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: Spacing.s4,
+    marginTop: Spacing.s3,
+    paddingTop: Spacing.s3,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.15)',
+  },
+  summaryItem: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, flexShrink: 1 },
+  incomeIcon: {
+    width: 20,
+    height: 20,
+    borderRadius: Radii.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(16,185,129,0.2)',
+  },
+  summaryLabel: { ...Typography.labelMd, color: 'rgba(255,255,255,0.7)' },
+  summaryValue: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', color: Colors.white },
+  budgetTrack: {
+    height: 6,
+    borderRadius: Radii.full,
+    overflow: 'hidden',
+    marginTop: Spacing.s4,
+    backgroundColor: 'rgba(0,0,0,0.25)',
+  },
+  budgetFill: { height: '100%', borderRadius: Radii.full },
+  insight: {
+    marginTop: Spacing.s4,
+    padding: Spacing.s3,
+    minHeight: 44,
+    borderRadius: Radii.md,
+    backgroundColor: 'rgba(255,255,255,0.10)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.15)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+  },
+  insightLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 },
+  insightDark: { backgroundColor: 'rgba(255,255,255,0.05)' },
+  insightText: { ...Typography.labelMd, fontFamily: 'Manrope_600SemiBold', color: Colors.white, flex: 1 },
+  errorBanner: {
+    marginHorizontal: Spacing.s5,
+    marginTop: Spacing.s3,
+    padding: Spacing.s3,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+  },
+  errorLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 },
+  errorText: { ...Typography.micro, flex: 1 },
+  section: { marginTop: Spacing.s6, paddingHorizontal: Spacing.s5 },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: Spacing.s3,
+    gap: Spacing.s2,
+  },
+  sectionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
+  sectionTitle: { ...Typography.labelBold },
+  sectionMeta: { ...Typography.micro },
+  categoryRow: { flexDirection: 'row', gap: Spacing.s2 },
+  categoryChip: {
+    flex: 1,
+    minWidth: 0,
+    padding: Spacing.s2,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  categoryIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: Radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: Spacing.s1,
+  },
+  categoryName: { ...Typography.labelMd, fontFamily: 'Manrope_600SemiBold' },
+  categoryAmount: { ...Typography.micro, fontFamily: 'Manrope_700Bold', marginTop: 2 },
+  countBadge: { paddingHorizontal: Spacing.s2, paddingVertical: 2, borderRadius: Radii.full },
+  countBadgeText: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold' },
+  seeAll: { flexDirection: 'row', alignItems: 'center', gap: 2, minHeight: 44 },
+  seeAllText: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold' },
+  transactionList: { gap: Spacing.s2 },
+  transaction: {
+    padding: Spacing.s3,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+  },
+  transactionLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
+  transactionIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: Radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  transactionText: { flex: 1, minWidth: 0 },
+  transactionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 },
+  transactionTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', flexShrink: 1 },
+  ocrBadge: { paddingHorizontal: Spacing.s1, borderRadius: 4 },
+  ocrBadgeText: { ...Typography.micro, fontFamily: 'Manrope_700Bold', fontSize: 10, lineHeight: 12 },
+  transactionMeta: { ...Typography.micro },
+  transactionAmount: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', flexShrink: 0 },
+  empty: {
+    padding: Spacing.s5,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    alignItems: 'center',
+  },
+  emptyIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: Radii.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: Spacing.s2,
+  },
+  emptyTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold' },
+  emptyBody: { ...Typography.micro, textAlign: 'center', marginTop: Spacing.s1, maxWidth: 240 },
+  // TEMPORARY H6 dev-only control. Subdued, separated from canonical sections.
+  devResetSection: {
+    marginTop: Spacing.s8,
+    paddingHorizontal: Spacing.s5,
+    alignItems: 'center',
+  },
+  devResetDivider: { width: '100%', height: 1, marginBottom: Spacing.s3 },
+  devResetNote: { ...Typography.micro, textAlign: 'center', marginBottom: Spacing.s2 },
+  devResetButton: {
+    minHeight: 44,
+    paddingHorizontal: Spacing.s4,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderRadius: Radii.md,
+  },
+  devResetButtonPressed: { opacity: 0.6 },
+  devResetButtonText: { ...Typography.labelMd, fontFamily: 'Manrope_600SemiBold' },
+});

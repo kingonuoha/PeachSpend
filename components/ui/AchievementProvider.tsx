@@ -1,43 +1,15 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
 import { View } from 'react-native';
 import { databaseService } from '../../services/DatabaseService';
+import { buildAchievementState } from '../../data/ProfileDataService';
+import type { AchievementState } from '../../data/ProfileContracts';
 import AchievementCelebration from './AchievementCelebration';
 
-interface CelebrationBadge {
-  id: string;
-  label: string;
-  icon: string;
-}
-
-const BADGE_META: Record<string, { label: string; icon: string }> = {
-  first_step: { label: 'First Step', icon: '🌱' },
-  eagle_eye: { label: 'Eagle Eye', icon: '📸' },
-  on_repeat: { label: 'On Repeat', icon: '🔁' },
-  week_warrior: { label: 'Week Warrior', icon: '🔥' },
-  month_master: { label: 'Month Master', icon: '💎' },
-  paper_trail: { label: 'Paper Trail', icon: '📤' },
-  detail_devil: { label: 'Detail Devil', icon: '🏷️' },
-  'getting-started': { label: 'Getting Started', icon: '🚀' },
-  regular: { label: 'Regular', icon: '📊' },
-  century: { label: 'Century', icon: '💯' },
-  'sneak-peek': { label: 'Sneak Peek', icon: '👀' },
-  shutterbug: { label: 'Shutterbug', icon: '📷' },
-  'scanner-king': { label: 'Scanner King', icon: '👑' },
-  fortnight: { label: 'Fortnight', icon: '🌙' },
-  season: { label: 'Season', icon: '🍂' },
-  'half-year-hero': { label: 'Half-Year Hero', icon: '⚡' },
-  variety: { label: 'Variety', icon: '🎨' },
-  explorer: { label: 'Explorer', icon: '🗺️' },
-  completionist: { label: 'Completionist', icon: '🏆' },
-  saver: { label: 'Saver', icon: '🐷' },
-  shopper: { label: 'Shopper', icon: '🛍️' },
-  'big-league': { label: 'Big League', icon: '💰' },
-  habit: { label: 'Habit', icon: '♻️' },
-  loyalist: { label: 'Loyalist', icon: '🏅' },
-  novelist: { label: 'Novelist', icon: '📝' },
-  'on-track': { label: 'On Track', icon: '📈' },
-  disciplined: { label: 'Disciplined', icon: '🧘' },
-};
+// Global host for passive badge celebrations (S-02/S-04/S-07/S-09/S-13 saves).
+// It maps the newly earned ids against the one real badge catalogue
+// (DatabaseService.getBadgeProgress through the shared buildAchievementState
+// mapper) instead of keeping a second local metadata table, then queues each
+// earned badge through the single canonical SH-05b surface.
 
 interface AchievementContextType {
   checkForNewAchievements: () => Promise<void>;
@@ -46,28 +18,19 @@ interface AchievementContextType {
 const AchievementContext = createContext<AchievementContextType>({ checkForNewAchievements: async () => {} });
 
 export function AchievementProvider({ children }: { children: React.ReactNode }) {
-  const [currentSingle, setCurrentSingle] = useState<CelebrationBadge | null>(null);
-  const [summaryBadges, setSummaryBadges] = useState<CelebrationBadge[] | null>(null);
-  const pendingRef = useRef<CelebrationBadge[]>([]);
-  const allEarnedRef = useRef<CelebrationBadge[]>([]);
+  const [current, setCurrent] = useState<AchievementState | null>(null);
+  const [streak, setStreak] = useState(0);
+  const pendingRef = useRef<AchievementState[]>([]);
 
-  const handleSingleDismiss = useCallback(() => {
+  const handleDismiss = useCallback(() => {
     const pending = pendingRef.current;
     if (pending.length > 0) {
       const [next, ...rest] = pending;
       pendingRef.current = rest;
-      setCurrentSingle(next);
+      setCurrent(next);
     } else {
-      setCurrentSingle(null);
-      if (allEarnedRef.current.length > 1) {
-        setSummaryBadges(allEarnedRef.current);
-      }
-      allEarnedRef.current = [];
+      setCurrent(null);
     }
-  }, []);
-
-  const handleSummaryDismiss = useCallback(() => {
-    setSummaryBadges(null);
   }, []);
 
   const checkForNewAchievements = useCallback(async () => {
@@ -75,21 +38,26 @@ export function AchievementProvider({ children }: { children: React.ReactNode })
       const newBadgeIds = await databaseService.checkAchievements();
       if (newBadgeIds.length === 0) return;
 
+      const [rows, currentStreak] = await Promise.all([
+        databaseService.getBadgeProgress(),
+        databaseService.getStreak(),
+      ]);
+      const byId = new Map(rows.map((row) => [row.id, row]));
       const badges = newBadgeIds
-        .map(id => BADGE_META[id] ? { id, label: BADGE_META[id].label, icon: BADGE_META[id].icon } : null)
-        .filter(Boolean) as CelebrationBadge[];
+        .map((id) => {
+          const row = byId.get(id);
+          return row ? buildAchievementState(row) : null;
+        })
+        .filter((badge): badge is AchievementState => badge !== null);
 
-      allEarnedRef.current = badges;
+      if (badges.length === 0) return;
 
-      if (badges.length === 1) {
-        pendingRef.current = [];
-        setCurrentSingle(badges[0]);
-      } else {
-        pendingRef.current = badges.slice(1);
-        setCurrentSingle(badges[0]);
-      }
+      setStreak(currentStreak);
+      pendingRef.current = badges.slice(1);
+      setCurrent(badges[0]);
     } catch {
-      // silently fail
+      // Silence matches the previous provider contract: a failed achievement
+      // check must never interrupt the save that triggered it.
     }
   }, []);
 
@@ -97,24 +65,14 @@ export function AchievementProvider({ children }: { children: React.ReactNode })
     <AchievementContext.Provider value={{ checkForNewAchievements }}>
       <View style={{ flex: 1 }}>
         {children}
-        {currentSingle && (
+        {current ? (
           <AchievementCelebration
-            key={currentSingle.id}
-            badgeId={currentSingle.id}
-            badgeLabel={currentSingle.label}
-            badgeIcon={currentSingle.icon}
-            onDismiss={handleSingleDismiss}
-            duration={allEarnedRef.current.length > 1 ? 1800 : 3500}
+            key={current.id}
+            achievement={current}
+            currentStreak={streak}
+            onDismiss={handleDismiss}
           />
-        )}
-        {summaryBadges && (
-          <AchievementCelebration
-            key="summary"
-            summaryBadges={summaryBadges}
-            onDismiss={handleSummaryDismiss}
-            duration={3000}
-          />
-        )}
+        ) : null}
       </View>
     </AchievementContext.Provider>
   );
