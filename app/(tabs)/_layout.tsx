@@ -45,6 +45,8 @@ export default function TabLayout() {
   }), [currentIndex, router]);
 
   const navigate = (href: string) => {
+    // Tapping the tab you are already on must not push a duplicate route.
+    if (href === TABS[currentIndex].key) return;
     router.push(href as never);
   };
   const toggleFab = () => setFabOpen(value => !value);

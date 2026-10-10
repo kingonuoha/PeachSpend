@@ -7,6 +7,7 @@ import Svg, { Circle, Defs, Path, RadialGradient, Stop } from 'react-native-svg'
 import { Colors, DarkTheme, Gradients, LightTheme, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { computeTabRowLayout, TAB_TARGET } from './tabBarGeometry';
 
 type TabIcon = React.ComponentType<{ size?: number; color?: string }>;
 type Tone = 'auto' | 'light' | 'dark';
@@ -50,20 +51,10 @@ const FAB_BOTTOM = 24;
 // tabs row 2, FAB 3, speed dial 4. The FAB must sit above the scoop SVG on both
 // platforms regardless of sibling paint order.
 const FAB_Z_INDEX = 3;
-const TAB_TARGET = 44;
 const TAB_ICON_SIZE = 24;
-// Canonical bar geometry from code.html: the bar is 350 wide (viewBox line 66),
-// each outer icon center is 28 from the bar edge (px-4 16 plus the 12 half icon,
-// line 85), and the two icons in a pair are 52 apart (24 icon plus gap-7 28,
-// lines 87 and 99). The app bar is the full window width, so those design
-// distances are scaled by width / 350 and clamped, then converted from icon
-// centers to the 44pt frame: subtract half the target for the edge gutter, the
-// full target for the pair gap. At scale 1 this reduces to gutter 6, gap 8.
-const DESIGN_BAR_WIDTH = 350;
-const DESIGN_OUTER_CENTER = 28;
-const DESIGN_PAIR_CENTER = 52;
-const LAYOUT_SCALE_MIN = 0.85;
-const LAYOUT_SCALE_MAX = 1.35;
+// Canonical tab-bar geometry (spec_8 px-4 gutter, gap-7 pair spacing, icon
+// centers 28 from the edge and 52 apart) lives in tabBarGeometry.ts, which owns
+// the 44pt touch target and the responsive clamp and is unit tested directly.
 // The canonical `pb-3` (12) is measured to the icon. A 44pt box adds 10 below
 // the 24 icon, so the box bottom sits at 12 - 10 = 2.
 const TAB_ROW_PAD_BOTTOM = 2;
@@ -122,18 +113,10 @@ export function PeachTabBar({
   const height = BAR_HEIGHT + bottomInset;
   const path = useMemo(() => (width > 0 ? scoopPath(width, height) : ''), [width, height]);
   // Scale the design icon-center distances to the measured bar width once per
-  // layout, not per frame. The gutter and gap are frame values for the 44pt
-  // targets, so the 24pt icons land on the design fractions 0.080, 0.229,
-  // 0.771, 0.920 across phone widths. Floored at 0 so targets cannot overlap.
-  const rowLayout = useMemo(() => {
-    const scale = width > 0
-      ? Math.min(LAYOUT_SCALE_MAX, Math.max(LAYOUT_SCALE_MIN, width / DESIGN_BAR_WIDTH))
-      : 1;
-    return {
-      gutter: Math.max(0, DESIGN_OUTER_CENTER * scale - TAB_TARGET / 2),
-      gap: Math.max(0, DESIGN_PAIR_CENTER * scale - TAB_TARGET),
-    };
-  }, [width]);
+  // layout, not per frame. The 24pt icons land on the design fractions 0.080,
+  // 0.229, 0.771, 0.920 across phone widths; gutter and gap are floored at 0 so
+  // the 44pt targets cannot overlap. See tabBarGeometry.ts for the tests.
+  const rowLayout = useMemo(() => computeTabRowLayout(width), [width]);
   const dialVisible = fabOpen && !!actions?.length;
 
   const handleLayout = (event: LayoutChangeEvent) => {
@@ -251,37 +234,43 @@ export function PeachTabBar({
           void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
           onFabPress();
         }}
-        style={({ pressed }) => [
-          tabStyles.fab,
-          {
-            left: width / 2 - FAB_SIZE / 2,
-            bottom: bottomInset + FAB_BOTTOM,
-            // Solid locked-token fallback painted directly on the FAB so the
-            // button is visible even if the gradient layer fails to lay out.
-            backgroundColor: raw.primary,
-            shadowColor: isDark ? 'transparent' : raw.primary,
-            shadowOffset: { width: 0, height: isDark ? 0 : 10 },
-            shadowOpacity: isDark ? 0 : 0.35,
-            shadowRadius: 24,
-            // Dark keeps a small elevation so the FAB stays on its own Android
-            // layer above the scoop SVG; the purple glow comes from the radial
-            // layer, so the elevation shadow is transparent.
-            elevation: isDark ? 2 : 10,
-          },
-          pressed && !reduceMotion && tabStyles.fabPressed,
-        ]}
+        style={({ pressed }) => {
+          const pressScale = pressed && !reduceMotion ? FAB_PRESSED_SCALE : 1;
+          return [
+            tabStyles.fab,
+            {
+              left: width / 2 - FAB_SIZE / 2,
+              bottom: bottomInset + FAB_BOTTOM,
+              // The opaque locked token is the FAB's base, so the button stays
+              // fully visible even if the decorative gradient never lays out.
+              backgroundColor: raw.primary,
+              shadowColor: isDark ? 'transparent' : raw.primary,
+              shadowOffset: { width: 0, height: isDark ? 0 : 10 },
+              shadowOpacity: isDark ? 0 : 0.35,
+              shadowRadius: 24,
+              // Keeps the FAB on its own Android layer above the scoop SVG. The
+              // dark purple glow comes from the radial layer, so the elevation
+              // shadow stays transparent in dark mode.
+              elevation: isDark ? 2 : 10,
+              transform: [{ rotate: fabOpen ? '45deg' : '0deg' }, { scale: pressScale }],
+            },
+          ];
+        }}
       >
+        {/*
+          The gradient is a decorative overlay drawn before the icon, never its
+          parent. The 24pt Plus is a direct child of the FAB, centered by the
+          Pressable, so no gradient or SVG layout failure can hide the icon.
+        */}
         <LinearGradient
+          pointerEvents="none"
           colors={gradient}
           locations={GRADIENT_LOCATIONS}
           start={GRADIENT_START}
           end={GRADIENT_END}
           style={tabStyles.fabGradient}
-        >
-          <View style={{ transform: [{ rotate: fabOpen ? '45deg' : '0deg' }] }}>
-            <Plus size={24} color={Colors.white} strokeWidth={2.6} />
-          </View>
-        </LinearGradient>
+        />
+        <Plus size={24} color={Colors.white} strokeWidth={2.6} />
       </Pressable>
     </View>
   );
@@ -336,28 +325,27 @@ const tabStyles = StyleSheet.create({
   pressed: {
     transform: [{ scale: PRESSED_SCALE }],
   },
+  // The FAB is a plain absolutely-positioned square with an opaque token fill.
+  // alignItems/justifyContent center the direct-child Plus, and it carries the
+  // top zIndex so the scoop chassis and glow can never paint over it.
   fab: {
     position: 'absolute',
     width: FAB_SIZE,
     height: FAB_SIZE,
     borderRadius: FAB_RADIUS,
+    alignItems: 'center',
+    justifyContent: 'center',
     zIndex: FAB_Z_INDEX,
   },
-  fabPressed: {
-    transform: [{ scale: FAB_PRESSED_SCALE }],
-  },
-  // The gradient is the FAB's painted circle. It gets an explicit fill
-  // (absoluteFill over the 56x56 FAB) instead of flex sizing, so the native
-  // gradient view can never collapse to zero size, and it owns the radius clip
-  // so the circle stays round while the plus icon is centered inside it.
+  // The gradient is a decorative overlay drawn under the icon. An explicit
+  // absolute fill keeps the native gradient view from collapsing to zero size,
+  // and it owns the radius clip so the overlay stays a circle.
   fabGradient: {
     position: 'absolute',
     top: 0,
     left: 0,
     right: 0,
     bottom: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
     borderRadius: FAB_RADIUS,
     overflow: 'hidden',
   },
