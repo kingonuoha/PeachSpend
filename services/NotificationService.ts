@@ -12,7 +12,6 @@ if (!isExpoGoRuntime()) {
   Notifications = loadedNotifications;
   loadedNotifications.setNotificationHandler({
     handleNotification: async () => ({
-      shouldShowAlert: true,
       shouldShowBanner: true,
       shouldShowList: true,
       shouldPlaySound: true,
