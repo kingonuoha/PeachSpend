@@ -2,6 +2,9 @@ import * as SQLite from 'expo-sqlite';
 import { Expense, Income, Notification, RecurringTemplate, Setting, ChatMessage } from '../types/database';
 import { logger, registerSensitiveValue } from '../utils/logger';
 import { runMigrations } from '../data/migrations';
+import { parseCsvLine } from '../data/csv';
+import { CURRENT_SCHEMA_VERSION, readContinuitySchema, runV1ExportMigration } from '../data/ContinuityService';
+import type { ContinuityContract, ContinuityDetection, ContinuityFileInput, ContinuityImportPort, ContinuityMigrationResult, ContinuityRowMatch, ContinuitySchemaPort, ContinuitySchemaState } from '../data/ContinuityContracts';
 import { deleteSecret, getSecret, isSecretSettingKey, migrateLegacySecrets, setSecret, SECRET_SETTING_KEYS, type SecretSettingKey } from '../data/secrets';
 import { SqliteCaptureRepository } from '../data/CaptureRepository';
 import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSettings, type CaptureCandidate, type CaptureRepository, type OnboardingSettings, type OnboardingSettingsStore } from '../data/contracts';
@@ -48,8 +51,13 @@ function escapeCsv(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-class DatabaseService implements OnboardingSettingsStore {
+class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   private db: SQLite.SQLiteDatabase | null = null;
+  // Schema state captured before the migration runner advances the file. A v1
+  // file reports 'v1' here even though user_version is 6 by the time any reader
+  // sees it.
+  private startupSchema: ContinuitySchemaState | null = null;
+  private startupUserVersion = 0;
 
   async getCaptureRepository(): Promise<CaptureRepository> {
     return new SqliteCaptureRepository(await this.getDb());
@@ -67,6 +75,12 @@ class DatabaseService implements OnboardingSettingsStore {
 
     try {
       this.db = await SQLite.openDatabaseAsync(DATABASE_NAME);
+      // DEC-32 detection runs against the file as opened, before the runner
+      // touches it, so a v1 file is classified as v1 rather than as its
+      // post-migration version.
+      const startup = await readContinuitySchema(this.continuitySchemaPort(this.db));
+      this.startupSchema = startup.schema;
+      this.startupUserVersion = startup.userVersion;
       await this.createTables();
       await migrateLegacySecrets(key => this.getStoredSetting(key), key => this.deleteStoredSetting(key));
       await this.seedCategories();
@@ -80,6 +94,71 @@ class DatabaseService implements OnboardingSettingsStore {
   private async createTables() {
     if (!this.db) return;
     await runMigrations(this.db);
+  }
+
+  // DEC-32 continuity. Detection reports the on-device schema and whether the
+  // account already holds records, so a surface can render a new empty user or an
+  // existing account without guessing. Migration moves a supplied v1 export into
+  // the v2 schema; a v2-present file is never re-migrated, only read.
+  async detectContinuity(): Promise<ContinuityDetection> {
+    const db = await this.getDb();
+    if (this.startupSchema === null) {
+      const startup = await readContinuitySchema(this.continuitySchemaPort(db));
+      this.startupSchema = startup.schema;
+      this.startupUserVersion = startup.userVersion;
+    }
+    const row = await db.getFirstAsync<{ count: number }>(
+      'SELECT (SELECT COUNT(*) FROM expenses) + (SELECT COUNT(*) FROM income) as count'
+    );
+    return {
+      schema: this.startupSchema,
+      userVersion: this.startupUserVersion,
+      currentVersion: CURRENT_SCHEMA_VERSION,
+      hasRecords: (row?.count ?? 0) > 0,
+    };
+  }
+
+  async migrateV1Export(input: ContinuityFileInput): Promise<ContinuityMigrationResult> {
+    return runV1ExportMigration(await this.getContinuityImportPort(), input);
+  }
+
+  private continuitySchemaPort(db: SQLite.SQLiteDatabase): ContinuitySchemaPort {
+    return {
+      getFirstAsync: <T>(source: string) => db.getFirstAsync<T>(source),
+      getAllAsync: <T>(source: string) => db.getAllAsync<T>(source),
+    };
+  }
+
+  // The single writer the continuity migration drives. Rows go through the shared
+  // capture save boundary (so merchant memory and the capture audit log stay in
+  // one place), and the whole batch shares one transaction so a failure rolls
+  // back rather than half-importing.
+  async getContinuityImportPort(): Promise<ContinuityImportPort> {
+    const db = await this.getDb();
+    const repository = await this.getCaptureRepository();
+    return {
+      ensureCategories: async names => { await new CategoryService(this).ensure(names); },
+      countExisting: async (match: ContinuityRowMatch) => {
+        const row = await db.getFirstAsync<{ count: number }>(
+          "SELECT COUNT(*) as count FROM expenses WHERE source = 'import' AND merchant = ? AND amount = ? AND currency = ? AND category = ? AND scanned = ? AND date = ? AND COALESCE(note, '') = ?",
+          [match.merchant, match.amount, match.currency, match.category, match.scanned, match.date, match.note],
+        );
+        return row?.count ?? 0;
+      },
+      saveRow: async (match: ContinuityRowMatch) => {
+        await repository.save({
+          merchant: match.merchant,
+          amount: match.amount,
+          currency: match.currency,
+          category: match.category,
+          date: match.date,
+          note: match.note,
+          source: 'import',
+          scanned: match.scanned === 1,
+        }, true);
+      },
+      withTransaction: operation => repository.withTransaction(operation),
+    };
   }
 
   private async getStoredSetting(key: string): Promise<string | null> {
@@ -658,7 +737,7 @@ class DatabaseService implements OnboardingSettingsStore {
 
     const expenses: Partial<Expense>[] = [];
     for (let i = 1; i < lines.length; i++) {
-      const cols = this.parseCSVLine(lines[i]);
+      const cols = parseCsvLine(lines[i]);
       const merchant = (cols[merchantIdx] || '').trim();
        const amountValue = cols[amountIdx]?.trim() || '';
        const amount = parseFloat(amountValue);
@@ -687,26 +766,6 @@ class DatabaseService implements OnboardingSettingsStore {
     }
 
     return { expenses, errors };
-  }
-
-  private parseCSVLine(line: string): string[] {
-    const result: string[] = [];
-    let current = '';
-    let inQuotes = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-        else inQuotes = !inQuotes;
-      } else if (ch === ',' && !inQuotes) {
-        result.push(current);
-        current = '';
-      } else {
-        current += ch;
-      }
-    }
-    result.push(current);
-    return result;
   }
 
   async importExpenses(expenses: Partial<Expense>[]): Promise<{ imported: number; errors: string[] }> {

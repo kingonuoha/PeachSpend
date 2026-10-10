@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { migrations, runMigrations } from './migrations';
+import { CURRENT_SCHEMA_VERSION } from './ContinuityService';
 
 class MigrationDatabase {
   userVersion = 0;
@@ -62,5 +63,20 @@ describe('SQLite migration upgrades', () => {
     expect(db.userVersion).toBe(6);
     expect(db.tables.get('capture_queue')).toEqual(new Set(['id', 'payload', 'created_at', 'expires_at']));
     expect(db.tables.get('expenses')).toEqual(new Set(['id', 'source']));
+  });
+
+  it('leaves an already-current v2 file untouched (v2-present is not re-migrated)', async () => {
+    const db = new MigrationDatabase();
+    db.userVersion = migrations.length > 0 ? Math.max(...migrations.map(migration => migration.version)) : 0;
+    const before = db.userVersion;
+    const ups = migrations.map(migration => vi.fn());
+    const watched = migrations.map((migration, index) => ({ ...migration, up: ups[index] }));
+    await runMigrations(db as never, watched);
+    expect(db.userVersion).toBe(before);
+    ups.forEach(up => expect(up).not.toHaveBeenCalled());
+  });
+
+  it('keeps CURRENT_SCHEMA_VERSION aligned with the migration list', () => {
+    expect(CURRENT_SCHEMA_VERSION).toBe(Math.max(...migrations.map(migration => migration.version)));
   });
 });
