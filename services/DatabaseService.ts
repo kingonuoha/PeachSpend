@@ -53,6 +53,14 @@ function escapeCsv(value: string): string {
 
 class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   private db: SQLite.SQLiteDatabase | null = null;
+  // Single-flight handle for the first open. The open is async, so several
+  // startup callers (SettingsProvider, ContinuityGate, the Home snapshot, the
+  // auto-capture host) can all pass an `if (this.db)` guard before this.db is
+  // assigned and each start their own SQLite.openDatabaseAsync on the same
+  // file. A duplicate wrapper freeing the shared native handle is what left the
+  // next prepareAsync null on device. Every path that touches the database goes
+  // through init(), so they all await this one promise instead.
+  private initPromise: Promise<void> | null = null;
   // Schema state captured before the migration runner advances the file. A v1
   // file reports 'v1' here even though user_version is 6 by the time any reader
   // sees it.
@@ -63,6 +71,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     return new SqliteCaptureRepository(await this.getDb());
   }
 
+  // The single accessor for the open handle. The init() call inside is
+  // single-flight, so concurrent callers share one open and this.db is set when
+  // it resolves.
   private async getDb(): Promise<SQLite.SQLiteDatabase> {
     if (!this.db) {
       await this.init();
@@ -70,9 +81,23 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     return this.db!;
   }
 
-  async init() {
+  async init(): Promise<void> {
     if (this.db) return;
+    if (this.initPromise) return this.initPromise;
 
+    const initPromise = this.openAndPrepare();
+    this.initPromise = initPromise;
+    try {
+      await initPromise;
+    } finally {
+      // Clear the in-flight handle once it settles. A success leaves this.db set
+      // so later callers return early; a failure leaves this.db null so a
+      // genuine retry can open again rather than reusing a discarded promise.
+      this.initPromise = null;
+    }
+  }
+
+  private async openAndPrepare(): Promise<void> {
     try {
       this.db = await SQLite.openDatabaseAsync(DATABASE_NAME);
       // DEC-32 detection runs against the file as opened, before the runner
@@ -86,8 +111,26 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       await this.seedCategories();
       logger.info('Database initialized successfully');
     } catch (error) {
+      await this.discardPartialOpen();
       logger.error('Failed to initialize database', 'database_init_failed');
       throw error;
+    }
+  }
+
+  // A failed start must not leave a half-opened or stale handle behind: detach it
+  // from the service and close it, so a retry opens a fresh connection instead of
+  // reusing a partially initialized one. The close failure is swallowed so it can
+  // never mask the original initialization error.
+  private async discardPartialOpen(): Promise<void> {
+    const db = this.db;
+    this.db = null;
+    this.startupSchema = null;
+    this.startupUserVersion = 0;
+    if (!db) return;
+    try {
+      await db.closeAsync();
+    } catch {
+      logger.warn('Discarded database handle could not be closed', 'database_discard_close_failed');
     }
   }
 
@@ -204,7 +247,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async saveExpense(expense: Expense) {
-    if (!this.db) await this.init();
+    const db = await this.getDb();
     if (!expense.merchant?.trim()) throw new CaptureValidationError('merchant');
     if (!Number.isFinite(expense.amount) || expense.amount <= 0) throw new CaptureValidationError('amount');
     const currency = resolveCurrency(expense.currency, await this.getSetting('currency'));
@@ -228,7 +271,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     ];
 
     try {
-      await this.db!.runAsync(
+      await db.runAsync(
         'INSERT OR REPLACE INTO expenses (id, merchant, amount, currency, category, note, scanned, date, created_at, image_uri, is_reimbursable, unit_price, units, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         params
       );
@@ -244,9 +287,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async deleteExpense(id: string) {
-    if (!this.db) await this.init();
+    const db = await this.getDb();
 
-    const expense = await this.db!.getFirstAsync<Expense>('SELECT * FROM expenses WHERE id = ?', [id]);
+    const expense = await db.getFirstAsync<Expense>('SELECT * FROM expenses WHERE id = ?', [id]);
     if (expense?.image_uri && isOwnedReceiptImage(expense.image_uri)) {
       try {
         await deleteOwnedReceiptImage(expense.image_uri);
@@ -255,7 +298,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       }
     }
 
-    await this.db!.runAsync('DELETE FROM expenses WHERE id = ?', [id]);
+    await db.runAsync('DELETE FROM expenses WHERE id = ?', [id]);
     logger.info(`Expense deleted: ${id}`);
   }
 
@@ -320,16 +363,16 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
 
   // Categories
   async getCategories(): Promise<{ id: string; title: string; icon_name: string; color: string; is_default?: number }[]> {
-    if (!this.db) await this.init();
-    return await this.db!.getAllAsync<{ id: string; title: string; icon_name: string; color: string }>(
+    const db = await this.getDb();
+    return await db.getAllAsync<{ id: string; title: string; icon_name: string; color: string }>(
       'SELECT * FROM categories'
     );
   }
 
   async addCategory(title: string, icon: string, color: string) {
-    if (!this.db) await this.init();
+    const db = await this.getDb();
     const id = title.toLowerCase().replace(/\s+/g, '-');
-    await this.db!.runAsync(
+    await db.runAsync(
       'INSERT INTO categories (id, title, icon_name, color, is_default) VALUES (?, ?, ?, ?, 0)',
       [id, title, icon, color]
     );
@@ -337,8 +380,8 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async renameCategory(id: string, newTitle: string) {
-    if (!this.db) await this.init();
-    await this.db!.runAsync(
+    const db = await this.getDb();
+    await db.runAsync(
       'UPDATE categories SET title = ? WHERE id = ?',
       [newTitle, id]
     );
@@ -356,15 +399,15 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
 
   // Settings
   async getSetting(key: string): Promise<string | null> {
-    if (!this.db) await this.init();
+    const db = await this.getDb();
     if (isSecretSettingKey(key)) return null;
-    const result = await this.db!.getFirstAsync<Setting>('SELECT value FROM settings WHERE key = ?', [key]);
+    const result = await db.getFirstAsync<Setting>('SELECT value FROM settings WHERE key = ?', [key]);
     return result ? result.value : null;
   }
   
   async getAllSettings(): Promise<Record<string, string>> {
-    if (!this.db) await this.init();
-    const results = await this.db!.getAllAsync<Setting>('SELECT * FROM settings');
+    const db = await this.getDb();
+    const results = await db.getAllAsync<Setting>('SELECT * FROM settings');
     const settings: Record<string, string> = {};
     results.forEach(s => {
       if (isSecretSettingKey(s.key)) return;
@@ -390,9 +433,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async updateSetting(key: string, value: string) {
-    if (!this.db) await this.init();
+    const db = await this.getDb();
     if (isSecretSettingKey(key)) { await setSecret(key, value); return; }
-    await this.writePublicSetting(this.db!, key, value);
+    await this.writePublicSetting(db, key, value);
   }
 
   async isOnboardingComplete(): Promise<boolean> {
@@ -406,8 +449,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // the currency they chose during setup. The join date is written here so S-05
   // has a real install date; existing installs fall back to their earliest record.
   async completeOnboarding(settings: OnboardingSettings): Promise<void> {
-    if (!this.db) await this.init();
-    const db = this.db!;
+    const db = await this.getDb();
     const profileName = settings.profileName?.trim();
     const monthlyBudget = settings.monthlyBudget?.trim();
 
@@ -1161,8 +1203,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // and merchant-category memory are deliberately kept (see CLEAR_ALL_DATA_SCOPE).
   // Reset App is a separate, wider boundary.
   async clearAllData() {
-    if (!this.db) await this.init();
-    const db = this.db!;
+    const db = await this.getDb();
     await db.execAsync('BEGIN');
     try {
       const rows = await db.getAllAsync<{ image_uri: string | null }>('SELECT image_uri FROM expenses');
@@ -1186,8 +1227,8 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async resetApp() {
-    if (!this.db) await this.init();
-    await this.db!.execAsync(`
+    const db = await this.getDb();
+    await db.execAsync(`
       DELETE FROM expenses;
       DELETE FROM categories;
       DELETE FROM recurring_templates;

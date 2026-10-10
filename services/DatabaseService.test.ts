@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { databaseService } from './DatabaseService';
+import * as SQLite from 'expo-sqlite';
 import { logger } from '../utils/logger';
 import { CurrencyConversionError } from '../data/SettingsContracts';
 
@@ -473,5 +474,91 @@ describe('DatabaseService media erasure (D9, S-06R-01, S-06R-02)', () => {
     expect(fileSystemLegacy.deleteAsync).toHaveBeenCalledWith('cache/peachspend-receipt-a.jpg', { idempotent: true });
     expect(fileSystemLegacy.deleteAsync).toHaveBeenCalledWith('cache/peachspend_private_export_1_2.csv', { idempotent: true });
     expect(fileSystemLegacy.deleteAsync).not.toHaveBeenCalledWith('cache/report.csv', { idempotent: true });
+  });
+});
+
+// Regression for the concurrent-open race: two startup callers that both pass the
+// `if (this.db)` guard must share one SQLite.openDatabaseAsync, and a failed open
+// must be retryable rather than cached as a rejected promise.
+describe('DatabaseService single-flight initialization', () => {
+  const openDatabaseAsync = SQLite.openDatabaseAsync as unknown as ReturnType<typeof vi.fn>;
+  type InitState = { db: unknown; initPromise: unknown; startupSchema: unknown };
+
+  // init() only runs when this.db is null, so each test detaches the shared
+  // singleton's handle (and clears any queued open mock) and restores it after.
+  const detachSharedHandle = (): (() => void) => {
+    const service = databaseService as unknown as InitState;
+    const previous: InitState = { db: service.db, initPromise: service.initPromise, startupSchema: service.startupSchema };
+    service.db = null;
+    service.initPromise = null;
+    service.startupSchema = null;
+    openDatabaseAsync.mockReset();
+    return () => { Object.assign(service, previous); };
+  };
+
+  it('opens the database exactly once when two public callers race on first access', async () => {
+    const restore = detachSharedHandle();
+    let releaseOpen: (handle: unknown) => void = () => {};
+    openDatabaseAsync.mockReturnValueOnce(new Promise(resolve => { releaseOpen = resolve; }));
+
+    const first = databaseService.getSetting('currency');
+    const second = databaseService.getSetting('currency');
+
+    expect(openDatabaseAsync).toHaveBeenCalledTimes(1);
+    releaseOpen(database);
+    await Promise.all([first, second]);
+
+    expect(openDatabaseAsync).toHaveBeenCalledTimes(1);
+    restore();
+  });
+
+  it('opens the database exactly once when init is called concurrently', async () => {
+    const restore = detachSharedHandle();
+    let releaseOpen: (handle: unknown) => void = () => {};
+    openDatabaseAsync.mockReturnValueOnce(new Promise(resolve => { releaseOpen = resolve; }));
+
+    const first = databaseService.init();
+    const second = databaseService.init();
+
+    expect(openDatabaseAsync).toHaveBeenCalledTimes(1);
+    releaseOpen(database);
+    await Promise.all([first, second]);
+
+    expect(openDatabaseAsync).toHaveBeenCalledTimes(1);
+    restore();
+  });
+
+  it('allows a retry after a failed open instead of caching the rejection', async () => {
+    const restore = detachSharedHandle();
+    openDatabaseAsync
+      .mockRejectedValueOnce(new Error('native open failed'))
+      .mockResolvedValueOnce(database);
+
+    await expect(databaseService.init()).rejects.toThrow('native open failed');
+    await expect(databaseService.init()).resolves.toBeUndefined();
+    expect(openDatabaseAsync).toHaveBeenCalledTimes(2);
+    restore();
+  });
+
+  it('closes and discards a half-opened handle when preparation fails so a retry opens fresh', async () => {
+    const restore = detachSharedHandle();
+    const broken = {
+      getAllAsync: vi.fn(),
+      getFirstAsync: vi.fn().mockRejectedValueOnce(new Error('pragma read failed')),
+      runAsync: vi.fn(),
+      execAsync: vi.fn(),
+      closeAsync: vi.fn().mockResolvedValue(undefined),
+    };
+    openDatabaseAsync
+      .mockResolvedValueOnce(broken)
+      .mockResolvedValueOnce(database);
+
+    await expect(databaseService.init()).rejects.toThrow('pragma read failed');
+    expect(broken.closeAsync).toHaveBeenCalledTimes(1);
+    expect((databaseService as unknown as { db: unknown }).db).toBeNull();
+
+    await expect(databaseService.init()).resolves.toBeUndefined();
+    expect(openDatabaseAsync).toHaveBeenCalledTimes(2);
+    restore();
   });
 });
