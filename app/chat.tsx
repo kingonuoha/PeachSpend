@@ -11,7 +11,7 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
 import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
@@ -61,7 +61,7 @@ import {
 } from '../ai/chatActions';
 import type { ProviderKeyState } from '../data/ProviderSettings';
 import type { ChatAction } from '../types/chat';
-import type { ChatMessage } from '../types/database';
+import type { ChatMessage, Expense } from '../types/database';
 import type { DuplicateMatch, CaptureSideEffectHooks } from '../data/contracts';
 import { formatCurrency } from '../utils/currency';
 import { formatRelativeDateWithTime } from '../utils/dateFormat';
@@ -83,6 +83,7 @@ type EntryKind =
   | 'blocked'
   | 'chart'
   | 'search'
+  | 'import_approval'
   | 'error';
 
 interface ConfirmationPayload {
@@ -105,6 +106,14 @@ interface ApprovalPayload {
   approval: ChatTier2Approval;
 }
 
+// FR-12.1/FR-12.6: the import batch confirmation. It carries the Tier 2 approval
+// descriptor and the parsed rows, but no writable request, so the import confirm
+// path can never reach the chat batch-write boundary. Confirm hands the batch to
+// S-12's single shared preview, which owns the only import commit.
+interface ImportApprovalPayload {
+  approval: ChatTier2Approval;
+}
+
 // S-05R-03: a model-emitted logging action that did not come from a user logging
 // request is held here until the user explicitly confirms or discards it.
 interface UnauthorizedActionPayload {
@@ -122,6 +131,8 @@ interface ChatEntry {
   confirmation?: ConfirmationPayload;
   duplicate?: DuplicatePayload;
   approval?: ApprovalPayload;
+  importApproval?: ImportApprovalPayload;
+  importBatch?: Partial<Expense>[];
   unauthorizedAction?: UnauthorizedActionPayload;
   deepLink?: ChatDeepLink;
   chart?: ChatChartSpec;
@@ -146,6 +157,8 @@ const TIER3_REFUSAL_TEXT =
   'I cannot run destructive actions like clearing data or resetting your account from chat. Open Data Stewardship in Settings to do that yourself.';
 const TIER2_UNSUPPORTED_TEXT =
   'That change does not have a supported action boundary from chat yet, so nothing was changed.';
+const IMPORT_EMPTY_TEXT =
+  'I could not find any transactions to import. Paste one transaction per line with a merchant and an amount, or attach a receipt image.';
 const SUGGESTED_PROMPTS = [
   'How much did I spend this month?',
   'Am I on track with my budget?',
@@ -162,6 +175,22 @@ function humanizeCategory(id: string): string {
     .replace(/[-_]+/g, ' ')
     .trim()
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+// FR-12.6: the batch is gated by the existing Tier 2 `log_expenses_bulk`
+// approval. The executor's `request` branch reads only the item count to describe
+// the approval, and the import confirm path never reaches its write branch (it
+// routes to S-12), so the parsed values are carried for the request shape only
+// and no default value can be written or rendered.
+function toApprovalActions(batch: Partial<Expense>[]): ChatAction[] {
+  return batch.map((row) => ({
+    action: 'log_expense',
+    merchant: row.merchant,
+    amount: row.amount,
+    category: row.category,
+    note: row.note,
+    date: typeof row.date === 'number' ? new Date(row.date).toISOString().slice(0, 10) : undefined,
+  } as ChatAction));
 }
 
 function formatFileSize(size?: number): string | null {
@@ -469,8 +498,8 @@ function DuplicateCard({ payload, incomingCurrency, busy, onSaveAnyway, onDiscar
   );
 }
 
-function ApprovalCard({ payload, busy, onApprove, onCancel }: {
-  payload: ApprovalPayload;
+function ApprovalCard({ summary, busy, onApprove, onCancel }: {
+  summary: string;
   busy: boolean;
   onApprove: () => void;
   onCancel: () => void;
@@ -488,7 +517,7 @@ function ApprovalCard({ payload, busy, onApprove, onCancel }: {
         </View>
       </View>
       <View style={{ borderRadius: Radii.sm, borderWidth: 1, borderColor: ts.border.primary20, padding: Spacing.s2, backgroundColor: ts.bg.low }}>
-        <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>{payload.approval.summary}</Text>
+        <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>{summary}</Text>
       </View>
       <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
         Nothing is written until you authorize it. This has no undo window.
@@ -722,6 +751,11 @@ export default function ChatScreen() {
   const toast = useToast();
   const { checkForNewAchievements } = useAchievements();
 
+  // FR-12.1: S-12 routes here with `intent=import`. The flag switches S-07 into
+  // the import-context producer without changing the normal chat behaviour.
+  const params = useLocalSearchParams<{ intent?: string }>();
+  const importMode = params.intent === 'import';
+
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [inputText, setInputText] = useState('');
@@ -943,6 +977,36 @@ export default function ChatScreen() {
     setProcessingImage(Boolean(image));
 
     try {
+      // FR-12.1/FR-12.2: in import mode the send is a parse, not a chat turn. The
+      // producer structures the input and writes nothing; the batch is gated by
+      // the same Tier 2 `log_expenses_bulk` approval the rest of chat uses, then
+      // handed to S-12's shared preview on confirm.
+      if (importMode) {
+        const batch = await aiChatService.extractImportBatch({ text, imageUri: image?.uri });
+        if (batch.length === 0) {
+          appendEntries([{ id: localId(), role: 'assistant', createdAt: Date.now(), kind: 'assistant_text', text: IMPORT_EMPTY_TEXT }]);
+          return;
+        }
+        const approval = await aiChatService.executeChatAction(
+          { kind: 'log_expenses_bulk', items: toApprovalActions(batch) },
+          'request',
+        );
+        if (approval.status !== 'requires_approval') {
+          appendEntries([{ id: localId(), role: 'assistant', createdAt: Date.now(), kind: 'assistant_text', text: TIER2_UNSUPPORTED_TEXT }]);
+          return;
+        }
+        appendEntries([{
+          id: localId(),
+          role: 'assistant',
+          createdAt: Date.now(),
+          kind: 'import_approval',
+          text: `I parsed ${batch.length} transaction${batch.length === 1 ? '' : 's'} from your pasted text. Please verify before writing to the ledger:`,
+          importApproval: { approval: approval.approval },
+          importBatch: batch,
+        }]);
+        return;
+      }
+
       const tier3Kind = detectTier3Kind(text);
       if (tier3Kind) {
         const result = await aiChatService.executeChatAction({ kind: tier3Kind } as ChatActionRequest, 'request', userMessage);
@@ -1042,7 +1106,7 @@ export default function ChatScreen() {
       setIsProcessing(false);
       setProcessingImage(false);
     }
-  }, [appendEntries, buildChartForQuery, categoryTitles, isOffline, provider, runSideEffects, settings.currency, toast]);
+  }, [appendEntries, buildChartForQuery, categoryTitles, importMode, isOffline, provider, runSideEffects, settings.currency, toast]);
 
   const handleSend = useCallback(() => {
     if (isProcessing) return;
@@ -1202,6 +1266,20 @@ export default function ChatScreen() {
     }
   }, [actionBusy, appendEntries, toast]);
 
+  // FR-12.1/FR-12.6: the chat hand-off never writes. Confirm consumes the Tier 2
+  // card and hands the parsed batch to S-12's single shared preview
+  // (prepareImportPreview), where the one import commit boundary lives. Cancel
+  // drops the card and stages nothing.
+  const resolveImportApproval = useCallback((entry: ChatEntry, decision: 'approve' | 'discard') => {
+    if (!entry.importBatch || entry.importBatch.length === 0) return;
+    setEntries((prev) => prev.filter((item) => item.id !== entry.id));
+    if (decision === 'approve') {
+      router.replace({ pathname: '/import', params: { parsed: JSON.stringify(entry.importBatch) } });
+    } else {
+      appendEntries([{ id: localId(), role: 'assistant', createdAt: Date.now(), kind: 'system', text: 'No import was started.' }]);
+    }
+  }, [appendEntries, router]);
+
   const togglePrivacy = useCallback(async () => {
     try {
       await updateSetting('prices_visible', pricesVisible ? 'false' : 'true');
@@ -1297,11 +1375,26 @@ export default function ChatScreen() {
       return (
         <AssistantBubble>
           <ApprovalCard
-            payload={entry.approval}
+            summary={entry.approval.approval.summary}
             busy={actionBusy}
             onApprove={() => { void resolveApproval(entry, 'approve'); }}
             onCancel={() => { void resolveApproval(entry, 'discard'); }}
           />
+        </AssistantBubble>
+      );
+    }
+    if (entry.kind === 'import_approval' && entry.importApproval) {
+      return (
+        <AssistantBubble>
+          <View style={{ gap: Spacing.s2 }}>
+            <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>{entry.text}</Text>
+            <ApprovalCard
+              summary={entry.importApproval.approval.summary}
+              busy={actionBusy}
+              onApprove={() => resolveImportApproval(entry, 'approve')}
+              onCancel={() => resolveImportApproval(entry, 'discard')}
+            />
+          </View>
         </AssistantBubble>
       );
     }
@@ -1359,13 +1452,52 @@ export default function ChatScreen() {
         <ScopedMarkdown content={entry.text} />
       </AssistantBubble>
     );
-  }, [actionBusy, handleRetry, resolveApproval, resolveDuplicate, resolveUnauthorized, router, settings.currency]);
+  }, [actionBusy, handleRetry, resolveApproval, resolveDuplicate, resolveImportApproval, resolveUnauthorized, router, settings.currency, ts]);
 
   const renderEmpty = useCallback(() => {
     if (loadingHistory) {
       return (
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.s6 }}>
           <ActivityIndicator color={ts.raw.primary} />
+        </View>
+      );
+    }
+    if (importMode) {
+      return (
+        <View style={{ paddingTop: Spacing.s4 }}>
+          <AssistantBubble>
+            <View style={{ gap: Spacing.s3 }}>
+              <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>
+                Paste transaction lines, bank SMS text, or attach a receipt image. I will structure them into a batch you review before anything is saved.
+              </Text>
+              <View style={{ gap: Spacing.s2, borderTopWidth: 1, borderTopColor: ts.raw.outline, paddingTop: Spacing.s3 }}>
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textTransform: 'uppercase', letterSpacing: 1.2 }]}>
+                  Prefer another method?
+                </Text>
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Open Import for CSV, paste, or the external prompt"
+                  onPress={() => router.push('/import')}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: Spacing.s2,
+                    minHeight: 48,
+                    paddingHorizontal: Spacing.s3,
+                    paddingVertical: Spacing.s2,
+                    borderRadius: Radii.sm,
+                    borderWidth: 1,
+                    borderColor: ts.raw.outline,
+                    backgroundColor: ts.bg.low,
+                  }}
+                >
+                  <Text style={[Typography.labelMd, { color: ts.text.onSurface, flexShrink: 1 }]}>Open Import for CSV, paste, or the external prompt</Text>
+                  <ArrowRight size={14} color={ts.text.primary} />
+                </ScalePressable>
+              </View>
+            </View>
+          </AssistantBubble>
         </View>
       );
     }
@@ -1410,7 +1542,7 @@ export default function ChatScreen() {
         </AssistantBubble>
       </View>
     );
-  }, [handleSuggestion, loadingHistory, settings.profile_name, ts]);
+  }, [handleSuggestion, importMode, loadingHistory, router, settings.profile_name, ts]);
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: ts.bg.screen }} edges={['top']}>
@@ -1488,6 +1620,16 @@ export default function ChatScreen() {
       </View>
 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        {importMode ? (
+          <View style={{ paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 }}>
+            <View style={{ alignSelf: 'center', width: '100%', maxWidth: MAX_CONTENT_WIDTH, flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2, padding: Spacing.s3, borderRadius: Radii.md, backgroundColor: ts.raw.purple100, borderWidth: 1, borderColor: ts.border.primary20 }}>
+              <Sparkles size={16} color={ts.text.primary} />
+              <Text style={[Typography.micro, { color: ts.text.onSurface, flex: 1 }]}>
+                Import context: paste transactions or attach a receipt. I parse them into a batch you confirm before anything is written.
+              </Text>
+            </View>
+          </View>
+        ) : null}
         <FlatList
           ref={listRef}
           data={entries}
@@ -1592,7 +1734,7 @@ export default function ChatScreen() {
           >
           <ScalePressable
             accessibilityRole="button"
-            accessibilityLabel="Attach a receipt or image"
+            accessibilityLabel={importMode ? 'Attach a receipt image to parse' : 'Attach a receipt or image'}
             onPress={() => { void handleAttach(); }}
             style={{ width: 44, height: 44, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', backgroundColor: ts.bg.low }}
           >
@@ -1601,7 +1743,7 @@ export default function ChatScreen() {
           <TextInput
             value={inputText}
             onChangeText={setInputText}
-            placeholder="Ask Peach or log an expense..."
+            placeholder={importMode ? 'Paste transactions or attach a receipt...' : 'Ask Peach or log an expense...'}
             placeholderTextColor={ts.text.onSurfaceVariant}
             selectionColor={ts.raw.primary}
             multiline

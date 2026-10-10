@@ -51,13 +51,13 @@ const CLAUSES: PolicyClause[] = [
     id: 3,
     title: 'AI Interactions & Provider Security',
     body:
-      'When you use an AI feature, only these items are sent to your configured provider. Receipt scanning sends the receipt image you choose, for text extraction. AI chat sends your message plus a bounded snapshot of ledger context (totals, category breakdown, and recent merchant names and amounts) so the assistant can answer. Semantic search sends the text of candidate transactions (merchant, category, and note only when relevant) for ranking. The Insights narrative and digest send aggregate totals only, never individual transactions. You choose which provider to use and supply your own API key in AI Chat Settings; the key is held in device secure keychain storage and is never proxied through PeachSpend.',
+      'When you use an AI feature, only these items are sent to your configured provider. Receipt scanning sends the receipt image you choose, for text extraction. AI chat sends your message, any image you attach in the chat, plus a bounded snapshot of ledger context (totals, category breakdown, and recent merchant names and amounts) so the assistant can answer. Semantic search sends the text of candidate transactions (merchant, category, and note only when relevant) for ranking. The Insights narrative and digest send aggregate totals only, never individual transactions. You choose which provider to use and supply your own API key in AI Chat Settings; the key is held in device secure keychain storage and is never proxied through PeachSpend.',
   },
   {
     id: 4,
     title: 'Local Storage',
     body:
-      'All data is stored locally on your device using SQLite, sandboxed by the operating system. There is no PeachSpend server: your data is not sent to us and we cannot see it. Only the AI feature requests you trigger reach the provider you configure. You can export all categorized entries at any time, and you can delete your data from Settings, Data Stewardship.',
+      'All data is stored locally on your device using SQLite, sandboxed by the operating system. There is no PeachSpend server: your data is not sent to us and we cannot see it. Only the AI feature requests you trigger reach the provider you configure. You can export all categorized entries at any time. Clearing your records in Settings, Data Stewardship also removes the receipt images attached to them, and a full reset additionally removes your profile avatars and any exported CSV files.',
   },
   {
     id: 5,
@@ -69,7 +69,7 @@ const CLAUSES: PolicyClause[] = [
     id: 6,
     title: 'Data Portability & Instant Erasure',
     body:
-      'You retain full ownership of your ledger. You can export, modify, or permanently delete your data from within the app at any time. No account is required. Nothing leaves your device to any PeachSpend server or third party except the AI feature requests you trigger with your own configured provider.',
+      'You retain full ownership of your ledger. You can export, modify, or permanently delete your data, including the receipt images attached to it, from within the app at any time. No account is required. Nothing leaves your device to any PeachSpend server or third party except the AI feature requests you trigger with your own configured provider.',
   },
 ];
 

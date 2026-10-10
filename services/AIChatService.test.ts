@@ -217,3 +217,52 @@ describe('AI chat untrusted context and action authorization (S-05R-03)', () => 
     expect(mocks.getCaptureRepository).not.toHaveBeenCalled();
   });
 });
+
+describe('AI chat import-context producer (FR-12.1/FR-12.6)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSetting.mockImplementation(async (key: string) => {
+      switch (key) {
+        case 'chat_provider': return 'gemini';
+        case 'chat_gemini_model': return 'gemini-2.5-flash';
+        default: return null;
+      }
+    });
+    mocks.getSecret.mockResolvedValue('test-key');
+  });
+
+  it('returns the structured batch from a JSON array reply and writes nothing', async () => {
+    providerMocks.chatWithProvider.mockResolvedValue({
+      text: 'Here you go:\n[{"merchant":"Cafe","amount":12,"currency":"NGN","category":"dining","date":"2024-10-24"},{"merchant":"Bus","amount":"300","category":"transport"}]',
+      provider: 'gemini',
+      model: 'm',
+    });
+
+    const batch = await aiChatService.extractImportBatch({ text: 'Cafe 12 NGN dining\nBus 300 transport' });
+
+    expect(batch).toHaveLength(2);
+    expect(batch[0]).toMatchObject({ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining' });
+    expect(batch[1]).toMatchObject({ merchant: 'Bus', amount: 300, category: 'transport' });
+    expect(mocks.saveChatMessage).not.toHaveBeenCalled();
+    expect(mocks.getCaptureRepository).not.toHaveBeenCalled();
+  });
+
+  it('throws a typed missing_key error before any provider call when no key is set', async () => {
+    mocks.getSecret.mockResolvedValue(null);
+
+    await expect(aiChatService.extractImportBatch({ text: 'Cafe 12' })).rejects.toMatchObject({ code: 'missing_key' });
+    expect(providerMocks.chatWithProvider).not.toHaveBeenCalled();
+  });
+
+  it('throws a typed invalid_response error when the reply carries no array', async () => {
+    providerMocks.chatWithProvider.mockResolvedValue({ text: 'I could not parse that.', provider: 'gemini', model: 'm' });
+
+    await expect(aiChatService.extractImportBatch({ text: 'nonsense' })).rejects.toMatchObject({ code: 'invalid_response' });
+  });
+
+  it('returns an empty batch for an empty array reply, distinct from a malformed reply', async () => {
+    providerMocks.chatWithProvider.mockResolvedValue({ text: '[]', provider: 'gemini', model: 'm' });
+
+    await expect(aiChatService.extractImportBatch({ text: 'nothing usable here' })).resolves.toEqual([]);
+  });
+});

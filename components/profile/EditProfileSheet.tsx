@@ -14,7 +14,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as ImagePicker from 'expo-image-picker';
-import { makeDirectoryAsync, copyAsync } from 'expo-file-system/legacy';
+import { makeDirectoryAsync, copyAsync, deleteAsync } from 'expo-file-system/legacy';
 import { AlertCircle, Calendar, Camera, Trash2, User, X } from 'lucide-react-native';
 
 import { PeachButton } from '../ui/PeachButton';
@@ -23,7 +23,7 @@ import { LuminousCard } from '../ui/LuminousCard';
 import { useToast } from '../ui/ToastProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
-import { PROFILE_AVATAR_DIR } from '../../utils/profileAvatar';
+import { isOwnedAvatarFile, PROFILE_AVATAR_DIR } from '../../utils/profileAvatar';
 import { settingsPort, saveProfileEdit } from '../../services/DataServices';
 import type { ProfileEditDraft } from '../../services/DataServices';
 import { PROFILE_NAME_MAX_LENGTH } from '../../data/ProfileContracts';
@@ -97,6 +97,28 @@ export function EditProfileSheet({
   const [focused, setFocused] = useState(false);
 
   const saving = saveState === 'saving';
+
+  // S-06R-03: a replaced or removed avatar is personal data the user expects to
+  // be gone. Only an owned `avatar_<digits>.<ext>` file is ever deleted, and the
+  // persisted file is deleted only on a committed save, so a cancelled edit can
+  // never orphan the avatar the settings row still points at.
+  const persistedAvatarFile = initialAvatarFile;
+  const deleteOwnedAvatar = async (file: string | null | undefined) => {
+    if (!file || !isOwnedAvatarFile(file)) return;
+    try {
+      await deleteAsync(PROFILE_AVATAR_DIR + file, { idempotent: true });
+    } catch {
+      // best effort: cleanup never blocks the edit
+    }
+  };
+
+  const handleClose = () => {
+    if (saving) return;
+    // Discard an unsaved pick: remove the temporary file this session wrote. The
+    // persisted avatar is never touched here.
+    if (avatarFile && avatarFile !== persistedAvatarFile) void deleteOwnedAvatar(avatarFile);
+    onClose();
+  };
   const initials = initialsOf(name);
   const memberSinceLabel = memberSince
     ? new Date(memberSince).toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
@@ -128,12 +150,16 @@ export function EditProfileSheet({
     const uri = result.assets[0].uri;
     const ext = uri.split('.').pop() || 'jpg';
     const filename = `avatar_${Date.now()}.${ext}`;
+    const superseded = avatarFile;
     try {
       await makeDirectoryAsync(PROFILE_AVATAR_DIR, { intermediates: true });
       await copyAsync({ from: uri, to: PROFILE_AVATAR_DIR + filename });
       setAvatarFile(filename);
       setAvatarUri(PROFILE_AVATAR_DIR + filename);
       setError(null);
+      // A pick superseded earlier in this same session is a temporary file, not
+      // the persisted avatar, so it is safe to remove immediately.
+      if (superseded && superseded !== persistedAvatarFile) void deleteOwnedAvatar(superseded);
     } catch {
       setError('Could not save that photo. Try another image.');
     }
@@ -169,6 +195,7 @@ export function EditProfileSheet({
         return;
       }
       setSaveState('idle');
+      if (result.avatarFile !== persistedAvatarFile) await deleteOwnedAvatar(persistedAvatarFile);
       showToast('Profile updated', 'success');
       onSaved({
         name: result.name,
@@ -187,7 +214,7 @@ export function EditProfileSheet({
       animationType="slide"
       statusBarTranslucent
       onRequestClose={() => {
-        if (!saving) onClose();
+        handleClose();
       }}
     >
       <View style={{ flex: 1, justifyContent: 'flex-end' }}>
@@ -195,7 +222,7 @@ export function EditProfileSheet({
           accessibilityRole="button"
           accessibilityLabel="Close edit profile"
           onPress={() => {
-            if (!saving) onClose();
+            handleClose();
           }}
           style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: ts.bg.overlay }}
         />
@@ -271,7 +298,7 @@ export function EditProfileSheet({
                   accessibilityLabel="Close edit profile"
                   haptic={false}
                   disabled={saving}
-                  onPress={onClose}
+                  onPress={handleClose}
                   hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
                   style={{
                     width: CLOSE_SIZE,
@@ -522,7 +549,7 @@ export function EditProfileSheet({
                     size="lg"
                     fullWidth
                     disabled={saving}
-                    onPress={onClose}
+                    onPress={handleClose}
                   />
                 </View>
                 <View style={{ flex: 1 }}>

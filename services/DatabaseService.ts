@@ -13,6 +13,8 @@ import { formatCurrency, resolveCurrency } from '../utils/currency';
 import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense } from '../data/SettingsContracts';
 import { CategoryService } from '../data/CategoryService';
 import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../data/RecurringDataService';
+import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
+import { eraseOwnedMediaForScope } from './MediaErasureService';
 
 const DATABASE_NAME = 'peachspend.db';
 const ACHIEVEMENT_THRESHOLDS = {
@@ -1152,22 +1154,28 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     return db.getAllAsync<Income>('SELECT * FROM income WHERE date >= ? AND date <= ?', [startDate, endDate]);
   }
 
-  // D8 / FR-06.6: Clear All Data clears the user's financial records and their
-  // dependent rows in one transaction. Expenses and income are the records;
-  // chat expense confirmations and the capture audit/queue are derived from
-  // them. Categories, settings, API keys, achievements, and merchant-category
-  // memory are deliberately kept (see CLEAR_ALL_DATA_SCOPE). Reset App is a
-  // separate, wider boundary and is unchanged.
+  // D8 / FR-06.6 and D9 / S-06R-02: Clear All Data clears the user's financial
+  // records and their dependent rows in one transaction, and removes the owned
+  // receipt images those expense rows point at before COMMIT, so the rows and the
+  // imagery leave together. Categories, settings, API keys, achievements, avatars,
+  // and merchant-category memory are deliberately kept (see CLEAR_ALL_DATA_SCOPE).
+  // Reset App is a separate, wider boundary.
   async clearAllData() {
     if (!this.db) await this.init();
     const db = this.db!;
     await db.execAsync('BEGIN');
     try {
+      const rows = await db.getAllAsync<{ image_uri: string | null }>('SELECT image_uri FROM expenses');
+      const receiptImageUris = rows
+        .map(row => row.image_uri)
+        .filter((uri): uri is string => typeof uri === 'string' && uri.length > 0);
       await db.runAsync('DELETE FROM expenses');
       await db.runAsync('DELETE FROM income');
       await db.runAsync("DELETE FROM chat_messages WHERE message_type = ?", ['expense_confirmation']);
       await db.runAsync('DELETE FROM capture_events');
       await db.runAsync('DELETE FROM capture_queue');
+      const media = await eraseOwnedMediaForScope(CLEAR_ALL_DATA_MEDIA_SCOPE, receiptImageUris);
+      if (media.failed > 0) logger.warn('Some cleared receipt images could not be erased', 'clear_all_data_media_partial');
       await db.execAsync('COMMIT');
     } catch (error) {
       await db.execAsync('ROLLBACK');
@@ -1193,6 +1201,10 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     `);
     await Promise.all(SECRET_SETTING_KEYS.map(deleteSecret));
     await this.seedCategories();
+    // D9 / S-06R-01: reset is the widest boundary, so it also removes every media
+    // file the app wrote: receipt images, profile avatars, and export CSVs.
+    const media = await eraseOwnedMediaForScope(RESET_APP_MEDIA_SCOPE);
+    if (media.failed > 0) logger.warn('Some app media could not be erased on reset', 'reset_media_erase_partial');
     logger.warn('Complete app reset performed');
   }
 }
