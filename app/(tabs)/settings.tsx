@@ -14,8 +14,9 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import Constants from 'expo-constants';
+import * as DocumentPicker from 'expo-document-picker';
 import { LinearGradient } from 'expo-linear-gradient';
-import { cacheDirectory, writeAsStringAsync } from 'expo-file-system/legacy';
+import { cacheDirectory, readAsStringAsync, writeAsStringAsync } from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import {
   AlertTriangle,
@@ -30,6 +31,7 @@ import {
   Sun,
   Tag,
   Target,
+  Upload,
   User,
   Zap,
 } from 'lucide-react-native';
@@ -71,6 +73,11 @@ import { databaseService } from '../../services/DatabaseService';
 import { getCurrencyName } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
 import type { ProfileSnapshot } from '../../data/ProfileContracts';
+import {
+  describeContinuityFileReadFailure,
+  describeContinuityMigration,
+  type ContinuityFeedback,
+} from '../../services/ContinuityUiService';
 
 // S-06 Settings. Rebuilt as a replacement for the legacy screen: sectioned
 // control center with an editable budget, an independent light/dark toggle, a
@@ -107,6 +114,24 @@ function formatSampleDate(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(0, 10);
 }
 
+type ThemeRaw = ReturnType<typeof useThemeStyles>['raw'];
+
+// Tone palette for the continuity feedback card, drawn from the existing theme
+// tokens rather than a new palette. Mirrors the S-12 parse-notice treatment.
+function continuityTone(raw: ThemeRaw, tone: ContinuityFeedback['tone']) {
+  switch (tone) {
+    case 'success':
+      return { background: raw.successContainer, border: raw.successBorder, text: raw.statusSuccessText };
+    case 'warning':
+      return { background: raw.warningContainer, border: raw.warningBorder, text: raw.warningContainerText };
+    case 'info':
+      return { background: raw.purple100, border: raw.primary + '33', text: raw.primary };
+    case 'error':
+    default:
+      return { background: raw.dangerSoft, border: raw.danger + '40', text: raw.danger };
+  }
+}
+
 export default function SettingsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
@@ -136,6 +161,9 @@ export default function SettingsScreen() {
 
   const [pendingAction, setPendingAction] = useState<DataStewardshipAction | null>(null);
   const [stewardBusy, setStewardBusy] = useState(false);
+
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreFeedback, setRestoreFeedback] = useState<ContinuityFeedback | null>(null);
 
   const settingsSnapshot: SettingsSnapshot = useMemo(() => buildSettingsSnapshot(settings), [settings]);
 
@@ -330,6 +358,36 @@ export default function SettingsScreen() {
     }
   };
 
+  // DEC-32 manual fallback. The data layer owns the bytes-to-records boundary;
+  // this handler owns only the picker, the read, and the honest result copy. A
+  // non-v1 file routes the user to the S-12 Import screen, which owns every other
+  // format. No SQL and no second migration path.
+  const handleRestoreV1 = useCallback(async () => {
+    if (restoreBusy) return;
+    try {
+      const picked = await DocumentPicker.getDocumentAsync({
+        type: ['text/csv', 'text/comma-separated-values', 'application/vnd.ms-excel', 'text/plain'],
+      });
+      if (picked.canceled || !picked.assets?.[0]) return;
+      const asset = picked.assets[0];
+      setRestoreBusy(true);
+      setRestoreFeedback(null);
+      const content = await readAsStringAsync(asset.uri);
+      const result = await databaseService.migrateV1Export({ content, fileName: asset.name });
+      const feedback = describeContinuityMigration(result);
+      setRestoreFeedback(feedback);
+      if (result.status === 'imported' || result.status === 'partially_imported' || result.status === 'already_current') {
+        await refreshExpenses();
+        await refreshSettings();
+      }
+      showToast(feedback.title, feedback.tone === 'success' ? 'success' : feedback.tone === 'error' ? 'error' : 'info');
+    } catch {
+      setRestoreFeedback(describeContinuityFileReadFailure());
+    } finally {
+      setRestoreBusy(false);
+    }
+  }, [restoreBusy, refreshExpenses, refreshSettings, showToast]);
+
   if (!snapshot) {
     return (
       <SafeAreaView style={{ backgroundColor: ts.bg.screen, flex: 1 }} edges={['top']}>
@@ -372,6 +430,7 @@ export default function SettingsScreen() {
   );
 
   const chevron = <ChevronRight size={16} color={ts.raw.onSurfaceVariant} />;
+  const restoreToneStyle = restoreFeedback ? continuityTone(ts.raw, restoreFeedback.tone) : null;
 
   return (
     <SafeAreaView style={{ backgroundColor: ts.bg.screen, flex: 1 }} edges={['top']}>
@@ -770,7 +829,55 @@ export default function SettingsScreen() {
 
               <View style={[styles.divider, { backgroundColor: ts.raw.outline }]} />
 
-              <View style={styles.destructiveRow}>
+              <View style={styles.actionRow}>
+                <View style={styles.rowText}>
+                  <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Restore PeachSpend v1 Data</Text>
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
+                    Import an older v1 export file if this device did not find it automatically
+                  </Text>
+                </View>
+                <PeachButton
+                  title="Choose File"
+                  onPress={() => void handleRestoreV1()}
+                  variant="secondary"
+                  size="xs"
+                  accessibilityLabel="Choose a PeachSpend v1 export file to restore"
+                  icon={<Upload size={14} color={ts.raw.primary} />}
+                  isLoading={restoreBusy}
+                  disabled={restoreBusy}
+                />
+              </View>
+
+              {restoreFeedback && restoreToneStyle ? (
+                <View
+                  accessibilityLiveRegion="polite"
+                  style={[
+                    styles.restoreFeedback,
+                    { backgroundColor: restoreToneStyle.background, borderColor: restoreToneStyle.border },
+                  ]}
+                >
+                  <Text style={[Typography.labelBold, { color: restoreToneStyle.text }]}>
+                    {restoreFeedback.title}
+                  </Text>
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant, marginTop: Spacing.s1 }]}>
+                    {restoreFeedback.message}
+                  </Text>
+                  {restoreFeedback.routeToImport ? (
+                    <PeachButton
+                      title="Open Import"
+                      onPress={() => router.push('/import')}
+                      variant="secondary"
+                      size="xs"
+                      accessibilityLabel="Open the Import screen for other file formats"
+                      style={{ marginTop: Spacing.s2, alignSelf: 'flex-start' }}
+                    />
+                  ) : null}
+                </View>
+              ) : null}
+
+              <View style={[styles.divider, { backgroundColor: ts.raw.outline }]} />
+
+              <View style={styles.actionRow}>
                 <View style={styles.rowText}>
                   <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Clear Transaction Records</Text>
                   <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
@@ -785,7 +892,7 @@ export default function SettingsScreen() {
                 />
               </View>
 
-              <View style={styles.destructiveRow}>
+              <View style={styles.actionRow}>
                 <View style={styles.rowText}>
                   <Text style={[Typography.labelBold, { color: ts.raw.danger }]}>Full Factory App Reset</Text>
                   <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
@@ -1165,13 +1272,14 @@ const styles = StyleSheet.create({
   },
   budgetInput: { flex: 1, minWidth: 60, paddingVertical: Spacing.s2 },
   stewardCard: { padding: Spacing.s4, gap: Spacing.s3 },
+  restoreFeedback: { borderRadius: Radii.sm, borderWidth: 1, padding: Spacing.s3 },
   exportRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: Spacing.s3,
   },
-  destructiveRow: {
+  actionRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
