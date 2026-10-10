@@ -24,6 +24,7 @@ import "../global.css";
 import { ToastProvider } from '../components/ui/ToastProvider';
 import { ThemeProvider } from '../components/ui/ThemeProvider';
 import { SettingsProvider, useSettings } from '../components/ui/SettingsProvider';
+import ContinuityGate from '../components/ui/ContinuityGate';
 import AnimatedSplashScreen from '../components/ui/AnimatedSplashScreen';
 import StreakGate from '../components/ui/StreakGate';
 import { AchievementProvider } from '../components/ui/AchievementProvider';
@@ -255,6 +256,7 @@ export default function RootLayout() {
   return (
       <SettingsProvider>
         <NotificationPermissionGate />
+        <ContinuityGate />
         <ThemeProvider>
           <ToastProvider>
             <AchievementProvider>
