@@ -54,7 +54,7 @@ const FAB_Z_INDEX = 3;
 const TAB_ICON_SIZE = 24;
 // Canonical tab-bar geometry (spec_8 px-4 gutter, gap-7 pair spacing, icon
 // centers 28 from the edge and 52 apart) lives in tabBarGeometry.ts, which owns
-// the 44pt touch target and the responsive clamp and is unit tested directly.
+// the 48pt touch target and the responsive clamp and is unit tested directly.
 // The canonical `pb-3` (12) is measured to the icon. A 44pt box adds 10 below
 // the 24 icon, so the box bottom sits at 12 - 10 = 2.
 const TAB_ROW_PAD_BOTTOM = 2;
@@ -115,7 +115,7 @@ export function PeachTabBar({
   // Scale the design icon-center distances to the measured bar width once per
   // layout, not per frame. The 24pt icons land on the design fractions 0.080,
   // 0.229, 0.771, 0.920 across phone widths; gutter and gap are floored at 0 so
-  // the 44pt targets cannot overlap. See tabBarGeometry.ts for the tests.
+  // the 48pt targets cannot overlap. See tabBarGeometry.ts for the tests.
   const rowLayout = useMemo(() => computeTabRowLayout(width), [width]);
   const dialVisible = fabOpen && !!actions?.length;
 

@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
-  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -339,7 +338,8 @@ export default function ManualEntryScreen() {
               </View>
             ) : null}
 
-            <Pressable
+            <ScalePressable
+              haptic={false}
               accessibilityRole="button"
               accessibilityLabel="Amount spent"
               accessibilityState={{ expanded: keypadOpen }}
@@ -362,7 +362,7 @@ export default function ManualEntryScreen() {
               <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
                 Tap to enter via virtual numpad below
               </Text>
-            </Pressable>
+            </ScalePressable>
 
             <View style={styles.formGroup}>
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>

@@ -3,9 +3,10 @@
 // (px-4 16 plus the 12 half icon, line 85), and the two icons in a pair are 52
 // apart (24 icon plus gap-7 28, lines 87 and 99). The app bar is the full window
 // width, so the design distances scale by width / 350 and clamp so extreme
-// widths stay legible, then convert from icon centers to the 44pt touch frame:
+// widths stay legible, then convert from icon centers to the touch frame:
 // subtract half the target for the edge gutter and the full target for the pair
-// gap. At scale 1 this reduces to gutter 6, gap 8, and icon centers 28 and 80.
+// gap. At scale 1 with the 48pt target this reduces to gutter 4, gap 4, and icon
+// centers still 28 and 80, so the visible spacing is unchanged.
 //
 // Kept pure and free of React Native imports so the design targets are unit
 // tested directly, without a renderer.
@@ -13,9 +14,12 @@ export const DESIGN_BAR_WIDTH = 350;
 export const DESIGN_OUTER_CENTER = 28;
 export const DESIGN_PAIR_CENTER = 52;
 
-// Minimum touch target. The 24pt icon is centered inside it, which is what the
-// gutter and gap conversions below account for.
-export const TAB_TARGET = 44;
+// Minimum touch target. The design icon centers are held fixed; only the
+// invisible hit frame grows, and it is kept at the Android 48dp minimum so the
+// primary navigation row clears the smallest target both platforms allow. The
+// 24pt icon is centered inside it, which is what the gutter and gap conversions
+// below account for.
+export const TAB_TARGET = 48;
 
 // The scale is clamped so the outer gutter never collapses on a narrow screen
 // and the pair never drifts to the far corners on a tablet.
