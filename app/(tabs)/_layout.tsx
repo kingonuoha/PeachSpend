@@ -5,15 +5,21 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as Haptics from 'expo-haptics';
 import { ArrowDownLeft, BarChart2, Edit3, Home, MessageCircle, Scan, User } from 'lucide-react-native';
-import { PeachTabBar, type PeachTabAction } from '../../components/navigation/PeachTabBar';
+import { PeachTabBar, type PeachTabAction, type PeachTabItem } from '../../components/navigation/PeachTabBar';
+import { TAB_ROUTES, resolveActiveTabIndex } from '../../components/navigation/tabRoutes';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 
-const TABS = [
-  { key: '/(tabs)', route: '/(tabs)', icon: Home, label: 'Home' },
-  { key: '/(tabs)/analytics', route: '/(tabs)/analytics', icon: BarChart2, label: 'Insights' },
-  { key: '/(tabs)/chat', route: '/(tabs)/chat', icon: MessageCircle, label: 'AI Chat' },
-  { key: '/(tabs)/profile', route: '/(tabs)/profile', icon: User, label: 'Profile' },
-] as const;
+type TabIcon = PeachTabItem['icon'];
+
+const TAB_ICONS: Record<string, TabIcon> = {
+  '/(tabs)': Home,
+  '/(tabs)/analytics': BarChart2,
+  '/(tabs)/chat': MessageCircle,
+  '/(tabs)/profile': User,
+};
+
+// key carries the navigation href so onSelect can push it directly.
+const TABS: PeachTabItem[] = TAB_ROUTES.map(route => ({ key: route.href, label: route.label, icon: TAB_ICONS[route.href] }));
 
 export default function TabLayout() {
   const router = useRouter();
@@ -21,7 +27,9 @@ export default function TabLayout() {
   const insets = useSafeAreaInsets();
   const theme = useThemeStyles();
   const [fabOpen, setFabOpen] = useState(false);
-  const currentIndex = Math.max(0, TABS.findIndex(tab => pathname === tab.route || (tab.route === '/(tabs)' && pathname === '/(tabs)/')));
+  // Expo Router strips the `(tabs)` group from usePathname(), so the active tab
+  // is resolved from the normalized path (see tabRoutes.ts) rather than the href.
+  const currentIndex = resolveActiveTabIndex(pathname);
   // Capture surfaces (S-04 scan) are full-screen camera flows with no tab chrome,
   // matching their canonical pairs. Everything else keeps the persistent tab bar.
   const isFullScreenCapture = pathname === '/scan';
@@ -32,12 +40,12 @@ export default function TabLayout() {
       const next = gesture.dx < 0 ? currentIndex + 1 : currentIndex - 1;
       if (next < 0 || next >= TABS.length) return;
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      router.push(TABS[next].route as never);
+      router.push(TABS[next].key as never);
     },
   }), [currentIndex, router]);
 
-  const navigate = (route: (typeof TABS)[number]['route']) => {
-    router.push(route as never);
+  const navigate = (href: string) => {
+    router.push(href as never);
   };
   const toggleFab = () => setFabOpen(value => !value);
   const openCapture = (route: '/expense/manual' | '/income/manual' | '/scan') => {
@@ -59,9 +67,9 @@ export default function TabLayout() {
       {!isFullScreenCapture && (
         <View style={{ position: 'absolute', left: 0, right: 0, bottom: 0 }}>
           <PeachTabBar
-            tabs={TABS.map(tab => ({ key: tab.key, label: tab.label, icon: tab.icon }))}
+            tabs={TABS}
             activeKey={TABS[currentIndex].key}
-            onSelect={key => navigate(key as (typeof TABS)[number]['route'])}
+            onSelect={navigate}
             onFabPress={toggleFab}
             fabOpen={fabOpen}
             actions={actions}
