@@ -15,7 +15,7 @@ vi.mock('expo-secure-store', () => secureStore);
 vi.mock('expo-sqlite', () => ({ openDatabaseAsync: vi.fn() }));
 vi.mock('expo-file-system', () => ({ getInfoAsync: vi.fn(), deleteAsync: vi.fn() }));
 vi.mock('expo-file-system/legacy', () => ({ cacheDirectory: null, getInfoAsync: vi.fn(), deleteAsync: vi.fn() }));
-vi.mock('../data/migrations', () => ({ runMigrations: vi.fn() }));
+vi.mock('../data/migrations', async (importOriginal) => ({ ...(await importOriginal<typeof import('../data/migrations')>()), runMigrations: vi.fn() }));
 
 type MockDatabase = {
   getAllAsync: ReturnType<typeof vi.fn>;
@@ -344,5 +344,80 @@ describe('DatabaseService Clear All Data scope (D8)', () => {
     expect(database.execAsync).toHaveBeenCalledWith('BEGIN');
     expect(database.execAsync).toHaveBeenCalledWith('ROLLBACK');
     expect(database.execAsync).not.toHaveBeenCalledWith('COMMIT');
+  });
+});
+
+describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)', () => {
+  const resetStartup = () => {
+    (databaseService as unknown as { startupSchema: unknown }).startupSchema = null;
+  };
+
+  beforeEach(resetStartup);
+
+  it('classifies an unversioned file with the legacy table as v1 and reports no records', async () => {
+    database.getAllAsync.mockResolvedValue([{ name: 'expenses' }]);
+    database.getFirstAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('user_version')) return { user_version: 0 };
+      if (sql.includes('COUNT(*)')) return { count: 0 };
+      return null;
+    });
+
+    await expect(databaseService.detectContinuity()).resolves.toEqual({
+      schema: 'v1', userVersion: 0, currentVersion: 6, hasRecords: false,
+    });
+  });
+
+  it('classifies a versioned file with rows as an existing v2 account', async () => {
+    database.getAllAsync.mockResolvedValue([{ name: 'expenses' }]);
+    database.getFirstAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('user_version')) return { user_version: 6 };
+      if (sql.includes('COUNT(*)')) return { count: 3 };
+      return null;
+    });
+
+    await expect(databaseService.detectContinuity()).resolves.toEqual({
+      schema: 'v2', userVersion: 6, currentVersion: 6, hasRecords: true,
+    });
+  });
+
+  it('classifies a file with no tables and no version as none', async () => {
+    database.getAllAsync.mockResolvedValue([]);
+    database.getFirstAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('user_version')) return { user_version: 0 };
+      if (sql.includes('COUNT(*)')) return { count: 0 };
+      return null;
+    });
+
+    await expect(databaseService.detectContinuity()).resolves.toEqual({
+      schema: 'none', userVersion: 0, currentVersion: 6, hasRecords: false,
+    });
+  });
+
+  it('moves a supplied v1 export through the shared capture save boundary', async () => {
+    const save = vi.fn().mockResolvedValue({ id: 'saved' });
+    vi.spyOn(databaseService, 'getCaptureRepository').mockResolvedValue({
+      save, withTransaction: (operation: () => Promise<unknown>) => operation(),
+    } as never);
+    vi.spyOn(databaseService, 'getCategories').mockResolvedValue([]);
+    database.getFirstAsync.mockResolvedValue({ count: 0 });
+
+    const content = [
+      'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image',
+      '2026-03-09,"Cafe",10,"NGN","dining","",,1,yes',
+    ].join('\n');
+
+    await expect(databaseService.migrateV1Export({ content })).resolves.toMatchObject({ status: 'imported', imported: 1 });
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      merchant: 'Cafe', amount: 10, currency: 'NGN', category: 'dining', source: 'import', scanned: true,
+    }), true);
+  });
+
+  it('reports a non v1 file as unsupported without writing', async () => {
+    const save = vi.fn();
+    vi.spyOn(databaseService, 'getCaptureRepository').mockResolvedValue({ save } as never);
+
+    await expect(databaseService.migrateV1Export({ content: 'a,b\n1,2' })).resolves.toMatchObject({ status: 'unsupported' });
+    expect(save).not.toHaveBeenCalled();
   });
 });
