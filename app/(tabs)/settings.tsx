@@ -48,11 +48,15 @@ import {
   buildExportPreview,
   buildSettingsSnapshot,
   categoryService,
+  CLEAR_ALL_DATA_MEDIA_SCOPE,
+  CLEAR_ALL_DATA_SCOPE,
   dataStewardshipPort,
   executeDataStewardship,
   executeExport,
+  MEDIA_ERASURE_SCOPES,
   profileDataService,
   recurringDataService,
+  RESET_APP_MEDIA_SCOPE,
   settingsPort,
   updateBudget,
 } from '../../services/DataServices';
@@ -63,6 +67,7 @@ import type {
   ExportOutcome,
   ExportPreview,
   ExportWriter,
+  MediaErasureScope,
   SettingsSnapshot,
 } from '../../services/DataServices';
 import { setThemeMode } from '../../data/ThemePackContracts';
@@ -90,6 +95,79 @@ const SUPPORTED_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'NGN', 'CAD', 'AUD'] a
 const CODE_SURFACE = '#17162A';
 const CODE_TEXT = '#D7D3E6';
 const CODE_MUTED = '#8B8B99';
+
+// Data Stewardship copy is built from the D8/D9 scope facts so the dialog can
+// never claim a wider or narrower clear than the database and the media erasure
+// boundary perform (S-06R-01, S-06R-02). The key-to-label maps are presentation
+// only; every action named here is read from the exported scope constants.
+const CLEAR_SCOPE_LABELS: Record<string, string> = {
+  expenses: 'expenses',
+  income: 'income',
+  chat_expense_confirmations: 'chat expense confirmations',
+  capture_events: 'capture records',
+  capture_queue: 'queued captures',
+};
+const KEPT_SCOPE_LABELS: Record<string, string> = {
+  categories: 'categories',
+  settings: 'settings and budgets',
+  api_keys: 'stored provider keys',
+  achievements: 'achievements',
+  merchant_category_memory: 'merchant memory',
+};
+type MediaScopeKey = 'receiptImages' | 'profileAvatars' | 'exportFiles';
+const MEDIA_SCOPE_LABELS: Record<MediaScopeKey, string> = {
+  receiptImages: 'receipt images',
+  profileAvatars: 'profile avatars',
+  exportFiles: 'exported CSV files',
+};
+
+function joinLabels(labels: readonly string[]): string {
+  if (labels.length <= 1) return labels[0] ?? '';
+  return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+}
+
+function scopeLabels(keys: readonly string[], map: Record<string, string>): string[] {
+  return keys.map((key) => map[key] ?? key.replace(/_/g, ' '));
+}
+
+function mediaLabels(scope: MediaErasureScope): string[] {
+  const spec = MEDIA_ERASURE_SCOPES[scope];
+  return (Object.keys(MEDIA_SCOPE_LABELS) as MediaScopeKey[])
+    .filter((key) => spec[key])
+    .map((key) => MEDIA_SCOPE_LABELS[key]);
+}
+
+function capitalizeFirst(value: string): string {
+  return value.length ? value[0].toUpperCase() + value.slice(1) : value;
+}
+
+const CLEARED_RECORDS = scopeLabels(CLEAR_ALL_DATA_SCOPE.clears, CLEAR_SCOPE_LABELS);
+const KEPT_RECORDS = scopeLabels(CLEAR_ALL_DATA_SCOPE.keeps, KEPT_SCOPE_LABELS);
+const CLEAR_MEDIA = mediaLabels(CLEAR_ALL_DATA_MEDIA_SCOPE);
+const RESET_MEDIA = mediaLabels(RESET_APP_MEDIA_SCOPE);
+
+const CLEAR_ROW_SUBTITLE =
+  `Removes ${joinLabels(CLEARED_RECORDS)} and their ${joinLabels(CLEAR_MEDIA)}; ` +
+  `keeps ${joinLabels(KEPT_RECORDS)}.`;
+const RESET_ROW_SUBTITLE =
+  `Erases all local data and keys, and removes ${joinLabels(RESET_MEDIA)}; returns to onboarding.`;
+const CLEAR_DIALOG_BODY =
+  `This removes ${joinLabels(CLEARED_RECORDS)} from this device, along with their ` +
+  `${joinLabels(CLEAR_MEDIA)}. ${capitalizeFirst(joinLabels(KEPT_RECORDS))} are kept.`;
+const RESET_DIALOG_BODY =
+  `This erases all local database content and every stored provider key, and removes ` +
+  `${joinLabels(RESET_MEDIA)}. The app returns to onboarding.`;
+const CLEAR_IMPACT = [
+  `Removed: ${capitalizeFirst(joinLabels(CLEARED_RECORDS))}`,
+  `Removed media: ${capitalizeFirst(joinLabels(CLEAR_MEDIA))}`,
+  `Kept: ${capitalizeFirst(joinLabels(KEPT_RECORDS))}`,
+];
+const RESET_IMPACT = [
+  'All local database content is cleared',
+  'Stored provider keys are deleted',
+  `Removed media: ${capitalizeFirst(joinLabels(RESET_MEDIA))}`,
+  'Returns to onboarding',
+];
 
 function initialsOf(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -773,9 +851,9 @@ export default function SettingsScreen() {
               <View style={styles.destructiveRow}>
                 <View style={styles.rowText}>
                   <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Clear Transaction Records</Text>
-                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
-                     Wipes expenses and income; categories and settings stay
-                   </Text>
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={3}>
+                    {CLEAR_ROW_SUBTITLE}
+                  </Text>
                 </View>
                 <PeachButton
                   title="Clear Data"
@@ -788,8 +866,8 @@ export default function SettingsScreen() {
               <View style={styles.destructiveRow}>
                 <View style={styles.rowText}>
                   <Text style={[Typography.labelBold, { color: ts.raw.danger }]}>Full Factory App Reset</Text>
-                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
-                    Erases all local data and keys, then returns to onboarding
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={3}>
+                    {RESET_ROW_SUBTITLE}
                   </Text>
                 </View>
                 <PeachButton
@@ -969,15 +1047,10 @@ export default function SettingsScreen() {
               {pendingAction === 'reset_app' ? 'Factory Reset PeachSpend?' : 'Clear Transaction Records?'}
             </Text>
             <Text style={[Typography.labelMd, styles.dialogBody, { color: ts.raw.onSurfaceVariant }]}>
-              {pendingAction === 'reset_app'
-                ? 'This erases all local data, including transactions, categories, recurring schedules, chat history, and every stored provider key. The app returns to onboarding.'
-                : 'This removes every recorded expense and income from this device. Categories, budgets, and settings are kept.'}
+              {pendingAction === 'reset_app' ? RESET_DIALOG_BODY : CLEAR_DIALOG_BODY}
             </Text>
             <View style={[styles.impactBox, { backgroundColor: ts.raw.dangerSoft, borderColor: ts.raw.danger + '40' }]}>
-              {(pendingAction === 'reset_app'
-                ? ['All local databases are cleared', 'Stored provider keys are deleted', 'Returns to onboarding']
-                : ['All recorded expenses and income are erased', 'Categories, budgets, and settings are preserved']
-              ).map((item) => (
+              {(pendingAction === 'reset_app' ? RESET_IMPACT : CLEAR_IMPACT).map((item) => (
                 <View key={item} style={styles.impactRow}>
                   <Text style={[Typography.micro, { color: ts.raw.danger }]}>•</Text>
                   <Text style={[Typography.micro, { color: ts.raw.onSurface, flex: 1 }]}>{item}</Text>
