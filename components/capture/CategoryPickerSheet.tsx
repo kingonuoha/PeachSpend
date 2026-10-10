@@ -1,9 +1,12 @@
 import React from 'react';
-import { Modal, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated from 'react-native-reanimated';
 import { Check, Info, Plus, Search, SearchX, X } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
+import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { CategoryTints, Colors, Radii, Spacing, Typography } from '../../constants/tokens';
 import { CategoryGlyph } from './CategoryGlyph';
 
@@ -42,6 +45,9 @@ const TILE_SHADOW = {
 
 const PRESS_SCALE = 0.95;
 const SELECTED_SCALE = 1.05;
+// Longest exit (the drag dismiss spring) plus a frame, so the Modal stays mounted
+// through the slide instead of popping when the native animation is disabled.
+const EXIT_HOLD_MS = 320;
 
 function pressFeedback() {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -310,12 +316,17 @@ export function CategoryPickerSheet({ visible, onClose, flowType = 'expense', or
   const { height } = useWindowDimensions();
   const [query, setQuery] = React.useState('');
   const [wasVisible, setWasVisible] = React.useState(visible);
+  // The Modal stays mounted through the exit slide, then unmounts, so the sheet
+  // animates out instead of popping now that the native slide animation is off.
+  const [isMounted, setIsMounted] = React.useState(visible);
 
   // Reset the search when the sheet transitions closed, without setState in an
   // effect body: derive on the visible edge during render.
   if (visible !== wasVisible) {
     setWasVisible(visible);
     if (!visible && query) setQuery('');
+    // Mount the Modal on the opening edge so the entry translate can run.
+    if (visible) setIsMounted(true);
   }
 
   const isIncome = flowType === 'income';
@@ -324,31 +335,56 @@ export function CategoryPickerSheet({ visible, onClose, flowType = 'expense', or
   const maxSheetHeight = Math.min(height * 0.92, 760);
   const maxGridHeight = Math.min(height * 0.5, 380);
 
+  const { translateY, pan, sheetStyle, backdropStyle } = useSheetDragToDismiss({
+    height: maxSheetHeight,
+    visible,
+    reduceMotion,
+    onDismiss: onClose,
+  });
+
+  React.useEffect(() => {
+    if (visible || !isMounted) return;
+    // A drag already carried the sheet off-screen, so drop the Modal now. The
+    // button and backdrop paths hold it open for the exit slide instead.
+    const alreadyOffScreen = translateY.get() >= maxSheetHeight;
+    const timer = setTimeout(() => setIsMounted(false), reduceMotion || alreadyOffScreen ? 0 : EXIT_HOLD_MS);
+    return () => clearTimeout(timer);
+  }, [visible, isMounted, reduceMotion, translateY, maxSheetHeight]);
+
   const handleClose = () => {
     setQuery('');
     onClose();
   };
 
   return (
-    <Modal visible={visible} transparent animationType={reduceMotion ? 'none' : 'slide'} onRequestClose={handleClose}>
-      <View style={{ flex: 1, justifyContent: 'flex-end', backgroundColor: ts.bg.overlay }} accessibilityViewIsModal>
+    <Modal visible={isMounted} transparent animationType="none" onRequestClose={handleClose}>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+      <View style={{ flex: 1, justifyContent: 'flex-end' }} accessibilityViewIsModal>
+        <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFill, backdropStyle, { backgroundColor: ts.bg.overlay }]} />
         <Pressable style={{ flex: 1 }} onPress={handleClose} accessibilityRole="button" accessibilityLabel="Dismiss category picker" />
-        <View
+        <Animated.View
           accessibilityLabel="Category picker"
-          style={{
-            width: '100%',
-            maxWidth: 640,
-            alignSelf: 'center',
-            maxHeight: maxSheetHeight,
-            backgroundColor: ts.raw.surface,
-            borderTopLeftRadius: Radii.xl,
-            borderTopRightRadius: Radii.xl,
-            borderTopWidth: 1,
-            borderColor: ts.border.card,
-            paddingTop: Spacing.s3,
-            overflow: 'hidden',
-          }}
+          style={[
+            sheetStyle,
+            {
+              width: '100%',
+              maxWidth: 640,
+              alignSelf: 'center',
+              maxHeight: maxSheetHeight,
+              backgroundColor: ts.raw.surface,
+              borderTopLeftRadius: Radii.xl,
+              borderTopRightRadius: Radii.xl,
+              borderTopWidth: 1,
+              borderColor: ts.border.card,
+              paddingTop: Spacing.s3,
+              overflow: 'hidden',
+            },
+          ]}
         >
+          {/* The drag is attached to the handle and header only, so a vertical
+              drag never fights the scrollable category grid below it. */}
+          <GestureDetector gesture={pan}>
+          <View>
           <View style={{ alignItems: 'center', paddingBottom: Spacing.s1 }}>
             <View style={{ width: 40, height: 4, borderRadius: Radii.full, backgroundColor: ts.raw.outline }} />
           </View>
@@ -388,6 +424,8 @@ export function CategoryPickerSheet({ visible, onClose, flowType = 'expense', or
               <X size={16} color={ts.icon.muted} />
             </Pressable>
           </View>
+          </View>
+          </GestureDetector>
 
           <View style={{ paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s3, borderBottomWidth: 1, borderBottomColor: ts.border.subtle, backgroundColor: ts.bg.screen }}>
             <CategorySearchBar value={query} onChange={setQuery} placeholder="Search categories..." />
@@ -421,8 +459,9 @@ export function CategoryPickerSheet({ visible, onClose, flowType = 'expense', or
             </View>
             <Text style={[Typography.micro, { color: ts.text.primary }]}>Auto-returns on tap</Text>
           </View>
-        </View>
+        </Animated.View>
       </View>
+      </GestureHandlerRootView>
     </Modal>
   );
 }
