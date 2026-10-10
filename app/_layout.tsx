@@ -249,10 +249,6 @@ export default function RootLayout() {
     registerBg();
   }, []);
 
-  if (!loaded && !error) {
-    return null;
-  }
-
   return (
       <SettingsProvider>
         <NotificationPermissionGate />
@@ -261,9 +257,7 @@ export default function RootLayout() {
           <ToastProvider>
             <AchievementProvider>
             <View style={{ flex: 1, backgroundColor: Colors.background }}>
-              {showSplash && <AnimatedSplashScreen onFinish={handleSplashFinish} />}
-              {!showSplash && (
-                <BiometricGate>
+              <BiometricGate>
                   <StreakGate>
                     {canUseNativeRuntime('expo-share-intent') && <ShareIntentHandler />}
                    <AutoCaptureConfirmHost />
@@ -293,7 +287,7 @@ export default function RootLayout() {
                 </Stack>
                 </StreakGate>
               </BiometricGate>
-            )}
+            {showSplash && <AnimatedSplashScreen onFinish={handleSplashFinish} />}
             <StatusBar style={showSplash ? 'dark' : 'light'} />
           </View>
             </AchievementProvider>

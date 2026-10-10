@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -119,6 +120,7 @@ export default function ManualEntryScreen() {
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateMatch | null>(null);
   const [saving, setSaving] = useState<'idle' | 'checking' | 'saving'>('idle');
   const [saveFailed, setSaveFailed] = useState(false);
+  const [keypadOpen, setKeypadOpen] = useState(false);
 
   const enterOpacity = useSharedValue(reduceMotion ? 1 : 0);
   const enterOffset = useSharedValue(reduceMotion ? 0 : 16);
@@ -337,8 +339,11 @@ export default function ManualEntryScreen() {
               </View>
             ) : null}
 
-            <View
+            <Pressable
+              accessibilityRole="button"
               accessibilityLabel="Amount spent"
+              accessibilityState={{ expanded: keypadOpen }}
+              onPress={() => setKeypadOpen(v => !v)}
               style={[styles.card, styles.heroCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
             >
               <View style={styles.rowBetween}>
@@ -357,7 +362,7 @@ export default function ManualEntryScreen() {
               <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
                 Tap to enter via virtual numpad below
               </Text>
-            </View>
+            </Pressable>
 
             <View style={styles.formGroup}>
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
@@ -372,6 +377,7 @@ export default function ManualEntryScreen() {
                 <TextInput
                   value={merchant}
                   onChangeText={setMerchant}
+                  onFocus={() => setKeypadOpen(false)}
                   placeholder="e.g. Whole Foods, Blue Bottle Coffee"
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -455,6 +461,7 @@ export default function ManualEntryScreen() {
                 <TextInput
                   value={note}
                   onChangeText={setNote}
+                  onFocus={() => setKeypadOpen(false)}
                   placeholder="Add receipt notes or memo..."
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -541,17 +548,27 @@ export default function ManualEntryScreen() {
             </View>
             </View>
 
-            <View style={styles.keypadSection}>
-              <View style={styles.keypadHeader}>
-                <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.onSurfaceVariant, textTransform: 'uppercase' }]}>
-                  Quick Keypad
-                </Text>
-                <Text style={[Typography.micro, { color: ts.text.primary }]}>12-Key Virtual Pad</Text>
-              </View>
-              <VirtualNumpad onKeyPress={handleKeyPress} />
-            </View>
           </Animated.View>
         </ScrollView>
+
+        {keypadOpen ? (
+          <View style={[styles.keypadDock, { backgroundColor: ts.bg.screen, borderTopColor: ts.border.card }]}>
+            <View style={styles.keypadHeader}>
+              <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.onSurfaceVariant, textTransform: 'uppercase' }]}>
+                Quick Keypad
+              </Text>
+              <ScalePressable
+                accessibilityRole="button"
+                accessibilityLabel="Close keypad"
+                onPress={() => setKeypadOpen(false)}
+                style={styles.keypadDone}
+              >
+                <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.primary }]}>Done</Text>
+              </ScalePressable>
+            </View>
+            <VirtualNumpad onKeyPress={handleKeyPress} />
+          </View>
+        ) : null}
 
         <View style={styles.footer} pointerEvents="box-none">
           <LinearGradient
@@ -724,7 +741,8 @@ const styles = StyleSheet.create({
   },
   frequencyOptions: { flexDirection: 'row', gap: Spacing.s2 },
   frequencyButton: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, borderRadius: Radii.sm, minHeight: 44, justifyContent: 'center' },
-  keypadSection: { marginTop: Spacing.s2, gap: Spacing.s2 },
+  keypadDock: { paddingHorizontal: Spacing.s5, paddingTop: Spacing.s3, paddingBottom: 120, borderTopWidth: 1 },
+  keypadDone: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, minHeight: 44, justifyContent: 'center' },
   keypadHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.s1 },
   errorBox: { borderWidth: 1, borderRadius: Radii.md, padding: Spacing.s3, gap: Spacing.s2 },
   retry: { minHeight: 44, justifyContent: 'center' },
