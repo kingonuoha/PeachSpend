@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TAB_ROUTES, resolveActiveTabIndex } from './tabRoutes';
+import { normalizeTabPath, resolveActiveTabIndex, TAB_ROUTES } from './tabRoutes';
 
 describe('tab bar active route resolution', () => {
   it('matches the normalized pathname expo-router reports for each tab', () => {
@@ -9,16 +9,33 @@ describe('tab bar active route resolution', () => {
     expect(resolveActiveTabIndex('/profile')).toBe(3);
   });
 
-  it('never matches a grouped href, which expo-router strips from the pathname', () => {
-    // Regression: the pathname is '/profile', not '/(tabs)/profile', so matching
-    // on the href left every tab except Home permanently inactive.
-    expect(TAB_ROUTES.some(tab => tab.path === '/(tabs)/profile')).toBe(false);
-    expect(resolveActiveTabIndex('/(tabs)/profile')).toBe(0);
+  it('matches a grouped href too, so resolution survives either pathname form', () => {
+    // Some expo-router versions and deep links surface the group in the
+    // pathname. Matching on the stripped path alone left those screens pinned
+    // to Home, so the grouped href must resolve to its own tab.
+    expect(resolveActiveTabIndex('/(tabs)/analytics')).toBe(1);
+    expect(resolveActiveTabIndex('/(tabs)/chat')).toBe(2);
+    expect(resolveActiveTabIndex('/(tabs)/profile')).toBe(3);
+    expect(resolveActiveTabIndex('/(tabs)')).toBe(0);
+    expect(resolveActiveTabIndex('/(tabs)/')).toBe(0);
   });
 
-  it('defaults to Home for a route that is not a tab', () => {
+  it('ignores a trailing slash on either form', () => {
+    expect(resolveActiveTabIndex('/profile/')).toBe(3);
+  });
+
+  it('defaults to Home only when no tab matches at all', () => {
     expect(resolveActiveTabIndex('/settings')).toBe(0);
     expect(resolveActiveTabIndex('/scan')).toBe(0);
+    expect(resolveActiveTabIndex('')).toBe(0);
+  });
+
+  it('normalizes a group prefix away without collapsing a real path', () => {
+    expect(normalizeTabPath('/(tabs)/profile')).toBe('/profile');
+    expect(normalizeTabPath('/profile/')).toBe('/profile');
+    expect(normalizeTabPath('/(tabs)')).toBe('/');
+    expect(normalizeTabPath('/')).toBe('/');
+    expect(normalizeTabPath('/(tabs)/chat/history')).toBe('/chat/history');
   });
 
   it('keeps each tab href and path consistent with the route group', () => {
