@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
-  KeyboardAvoidingView,
   Platform,
   Pressable,
   Text,
@@ -31,7 +30,12 @@ import {
   Sparkles,
   X,
 } from 'lucide-react-native';
-import Animated, { FadeIn, FadeInUp } from 'react-native-reanimated';
+import Animated, {
+  FadeIn,
+  FadeInUp,
+  useAnimatedKeyboard,
+  useAnimatedStyle,
+} from 'react-native-reanimated';
 import { Colors, Radii, Spacing, Typography, Gradients } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
@@ -41,6 +45,7 @@ import { LuminousCard } from '../components/ui/LuminousCard';
 import { PeachButton } from '../components/ui/PeachButton';
 import { ScalePressable } from '../components/ui/ScalePressable';
 import { SearchFilterBar } from '../components/ui/SearchFilterBar';
+import { Skeleton } from '../components/ui/Skeleton';
 import { AIProcessingOverlay } from '../components/capture/AIProcessingOverlay';
 import { ScopedMarkdown } from '../components/chat/ScopedMarkdown';
 import { ChatChartView } from '../components/chat/ChatChartView';
@@ -747,6 +752,17 @@ export default function ChatScreen() {
   const insets = useSafeAreaInsets();
   const reduceMotion = useReduceMotion();
   const { height: windowHeight } = useWindowDimensions();
+  // Surface 6 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
+  // math, but measured and applied on the UI thread so the message list tracks the
+  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
+  // soft-input resize already shrinks the window, so adding this padding there would
+  // double-count the keyboard and overlap the input bar. Hooks run unconditionally;
+  // only the style is gated at render time.
+  const isIOS = Platform.OS === 'ios';
+  const keyboard = useAnimatedKeyboard();
+  const keyboardPaddingStyle = useAnimatedStyle(() => ({
+    paddingBottom: keyboard.height.get(),
+  }));
   const { settings, updateSetting } = useSettings();
   const toast = useToast();
   const { checkForNewAchievements } = useAchievements();
@@ -1456,9 +1472,33 @@ export default function ChatScreen() {
 
   const renderEmpty = useCallback(() => {
     if (loadingHistory) {
+      // Message-stream placeholder. Two assistant bubbles and one user bubble drawn at
+      // the real bubble geometry (same row wrappers, same 85% max width, same radius and
+      // padding) so nothing shifts when history resolves. The blocks are decorative and
+      // hidden; the single wrapping container exposes the busy state to assistive tech.
+      const lineHeight = Typography.bodyRegular.lineHeight;
       return (
-        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.s6 }}>
-          <ActivityIndicator color={ts.raw.primary} />
+        <View
+          accessible
+          accessibilityRole="progressbar"
+          accessibilityLabel="Loading chat"
+          accessibilityState={{ busy: true }}
+          style={{ flexGrow: 1, paddingVertical: Spacing.s3 }}
+        >
+          <View style={{ alignItems: 'flex-start', paddingHorizontal: Spacing.s4, marginVertical: Spacing.s1 }}>
+            <View style={{ maxWidth: '85%', width: '85%', borderRadius: Radii.lg, borderTopLeftRadius: Spacing.s1, borderWidth: 1, backgroundColor: ts.raw.surface, borderColor: ts.raw.outline, paddingHorizontal: Spacing.s4, paddingVertical: Spacing.s3, gap: Spacing.s2 }}>
+              <Skeleton width="100%" height={lineHeight} />
+              <Skeleton width="68%" height={lineHeight} />
+            </View>
+          </View>
+          <View style={{ alignItems: 'flex-end', paddingHorizontal: Spacing.s4, marginVertical: Spacing.s1 }}>
+            <Skeleton width={152} height={44} borderRadius={Radii.md} style={{ borderTopRightRadius: Spacing.s1 }} />
+          </View>
+          <View style={{ alignItems: 'flex-start', paddingHorizontal: Spacing.s4, marginVertical: Spacing.s1 }}>
+            <View style={{ maxWidth: '85%', width: '85%', borderRadius: Radii.lg, borderTopLeftRadius: Spacing.s1, borderWidth: 1, backgroundColor: ts.raw.surface, borderColor: ts.raw.outline, paddingHorizontal: Spacing.s4, paddingVertical: Spacing.s3, gap: Spacing.s2 }}>
+              <Skeleton width="92%" height={lineHeight} />
+            </View>
+          </View>
         </View>
       );
     }
@@ -1619,7 +1659,7 @@ export default function ChatScreen() {
         </View>
       </View>
 
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <Animated.View style={[{ flex: 1 }, isIOS ? keyboardPaddingStyle : null]}>
         {importMode ? (
           <View style={{ paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 }}>
             <View style={{ alignSelf: 'center', width: '100%', maxWidth: MAX_CONTENT_WIDTH, flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2, padding: Spacing.s3, borderRadius: Radii.md, backgroundColor: ts.raw.purple100, borderWidth: 1, borderColor: ts.border.primary20 }}>
@@ -1799,7 +1839,7 @@ export default function ChatScreen() {
           </ScalePressable>
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </Animated.View>
 
       <AIProcessingOverlay
         visible={isProcessing && processingImage}
