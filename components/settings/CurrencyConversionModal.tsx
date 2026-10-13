@@ -1,17 +1,23 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Modal,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
   useWindowDimensions,
   View,
+  type ViewStyle,
 } from 'react-native';
+import Animated, { type AnimatedStyle } from 'react-native-reanimated';
+import { GestureDetector, GestureHandlerRootView, type GestureType } from 'react-native-gesture-handler';
 import { AlertTriangle, ArrowDown, ArrowDownUp, Check, ChevronDown, RotateCcw, X } from 'lucide-react-native';
 
 import { PeachButton } from '../ui/PeachButton';
 import { ScalePressable } from '../ui/ScalePressable';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useReduceMotion } from '../../hooks/useReduceMotion';
+import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { Radii, Spacing, Typography } from '../../constants/tokens';
 import {
   buildConversionOptions,
@@ -41,6 +47,9 @@ const HEADER_CHIP = 28;
 const HANDLE_WIDTH = 40;
 const HANDLE_HEIGHT = 4;
 const CHECK_BOX = 18;
+// How long the Modal is held mounted after `visible` goes false, covering the
+// 300ms drag-dismiss spring so the sheet animates out instead of popping.
+const EXIT_HOLD_MS = 320;
 // The pair locks a 12s "rate age" and an ECB live hook. This app has no network
 // rate source, so the sheet reports the real saved rate with no fabricated age.
 
@@ -64,6 +73,11 @@ export interface CurrencyConversionSheetProps {
   onConfirm: () => void;
   onRetry: () => void;
   onClose: () => void;
+  /**
+   * Optional drag-to-dismiss gesture owned by the modal. Omitted by the showcase
+   * preview, which renders the sheet as a static fixture.
+   */
+  dragGesture?: GestureType;
 }
 
 // Presentational canonical body. Used by the modal and, with dev-only fixtures,
@@ -81,6 +95,7 @@ export function CurrencyConversionSheet({
   onConfirm,
   onRetry,
   onClose,
+  dragGesture,
 }: CurrencyConversionSheetProps) {
   const ts = useThemeStyles();
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -105,41 +120,48 @@ export function CurrencyConversionSheet({
     onConsentChange(!consent);
   };
 
+  // The drag is attached to the handle and header only, so a vertical drag never
+  // fights the scrollable body below it. The showcase renders the sheet with no
+  // gesture, so this stays a plain header there.
+  const sheetHeader = (
+    <View style={[styles.header, { borderBottomColor: ts.raw.outline }]}>
+      <View
+        style={[styles.handle, { backgroundColor: ts.raw.onSurfaceVariant + '66' }]}
+        accessible={false}
+        importantForAccessibility="no-hide-descendants"
+      />
+      <View style={styles.headerRow}>
+        <View style={[styles.headerChip, { backgroundColor: ts.raw.purple100 }]}>
+          <ArrowDownUp size={16} color={ts.raw.primary} strokeWidth={2.2} />
+        </View>
+        <View style={styles.headerText}>
+          <Text
+            accessibilityRole="header"
+            numberOfLines={2}
+            style={[Typography.bodyBold, { color: ts.raw.onSurface }]}
+          >
+            Convert Account Currency
+          </Text>
+          <Text numberOfLines={2} style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+            Bulk recalculate all balances, budgets and ledger items
+          </Text>
+        </View>
+        <ScalePressable
+          accessibilityRole="button"
+          accessibilityLabel="Close currency conversion"
+          hitSlop={CLOSE_HIT_SLOP}
+          onPress={onClose}
+          style={[styles.close, { backgroundColor: ts.isDark ? ts.bg.card : ts.bg.low }]}
+        >
+          <X size={16} color={ts.raw.onSurfaceVariant} strokeWidth={2} />
+        </ScalePressable>
+      </View>
+    </View>
+  );
+
   return (
     <View style={[styles.sheet, { backgroundColor: ts.raw.surface, borderTopColor: ts.raw.outline }]}>
-      <View style={[styles.header, { borderBottomColor: ts.raw.outline }]}>
-        <View
-          style={[styles.handle, { backgroundColor: ts.raw.onSurfaceVariant + '66' }]}
-          accessible={false}
-          importantForAccessibility="no-hide-descendants"
-        />
-        <View style={styles.headerRow}>
-          <View style={[styles.headerChip, { backgroundColor: ts.raw.purple100 }]}>
-            <ArrowDownUp size={16} color={ts.raw.primary} strokeWidth={2.2} />
-          </View>
-          <View style={styles.headerText}>
-            <Text
-              accessibilityRole="header"
-              numberOfLines={2}
-              style={[Typography.bodyBold, { color: ts.raw.onSurface }]}
-            >
-              Convert Account Currency
-            </Text>
-            <Text numberOfLines={2} style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
-              Bulk recalculate all balances, budgets and ledger items
-            </Text>
-          </View>
-          <ScalePressable
-            accessibilityRole="button"
-            accessibilityLabel="Close currency conversion"
-            hitSlop={CLOSE_HIT_SLOP}
-            onPress={onClose}
-            style={[styles.close, { backgroundColor: ts.isDark ? ts.bg.card : ts.bg.low }]}
-          >
-            <X size={16} color={ts.raw.onSurfaceVariant} strokeWidth={2} />
-          </ScalePressable>
-        </View>
-      </View>
+      {dragGesture ? <GestureDetector gesture={dragGesture}>{sheetHeader}</GestureDetector> : sheetHeader}
 
       <ScrollView
         style={styles.body}
@@ -531,39 +553,92 @@ export function CurrencyConversionModal({
   onConverted,
 }: CurrencyConversionModalProps) {
   const ts = useThemeStyles();
+  const reduceMotion = useReduceMotion();
+  const { height } = useWindowDimensions();
+  // Owned here because the drag hook needs the sheet travel height. The same value
+  // caps the sheet in Content, so the two can never diverge.
+  const sheetMaxHeight = useMemo(() => Math.min(height * 0.92, 790), [height]);
+
+  // The Modal stays mounted through the exit slide, then unmounts, so the sheet
+  // animates out instead of popping now that the native slide animation is off.
+  const [wasVisible, setWasVisible] = useState(visible);
+  const [isMounted, setIsMounted] = useState(visible);
+  // Bumped only on the opening edge, so Content remounts fresh per session without
+  // resetting mid-exit (Content must stay stable while the sheet slides away).
+  const [sessionId, setSessionId] = useState(0);
+
+  // Derive on the visible edge during render rather than in an effect body.
+  if (visible !== wasVisible) {
+    setWasVisible(visible);
+    if (visible) {
+      setIsMounted(true);
+      setSessionId((id) => id + 1);
+    }
+  }
+
+  const { translateY, pan, sheetStyle, backdropStyle } = useSheetDragToDismiss({
+    height: sheetMaxHeight,
+    visible,
+    reduceMotion,
+    onDismiss: onClose,
+  });
+
+  useEffect(() => {
+    if (visible || !isMounted) return;
+    // A drag already carried the sheet off-screen, so drop the Modal now. The
+    // backdrop and close-button paths hold it open for the exit slide instead.
+    const alreadyOffScreen = translateY.get() >= sheetMaxHeight;
+    const timer = setTimeout(() => setIsMounted(false), reduceMotion || alreadyOffScreen ? 0 : EXIT_HOLD_MS);
+    return () => clearTimeout(timer);
+  }, [visible, isMounted, reduceMotion, translateY, sheetMaxHeight]);
 
   return (
     <Modal
-      visible={visible}
+      visible={isMounted}
       transparent
-      animationType="slide"
+      animationType="none"
       onRequestClose={onClose}
       accessibilityViewIsModal
     >
-      <View style={styles.root}>
-        <ScalePressable
-          haptic={false}
-          accessibilityElementsHidden
-          importantForAccessibility="no-hide-descendants"
-          onPress={onClose}
-          style={[styles.backdrop, { backgroundColor: ts.bg.overlay }]}
-        >
-          <View />
-        </ScalePressable>
-        <CurrencyConversionModalContent
-          // Remount on open so every session starts unconfirmed, with a fresh
-          // target and no carried success or error banner.
-          key={visible ? 'sh-06a-open' : 'sh-06a-closed'}
-          fromCurrency={fromCurrency}
-          expenses={expenses}
-          candidateCurrencies={candidateCurrencies}
-          rates={rates}
-          onClose={onClose}
-          onConverted={onConverted}
-        />
-      </View>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <View style={styles.root}>
+          <Animated.View
+            pointerEvents="none"
+            style={[StyleSheet.absoluteFill, backdropStyle, { backgroundColor: ts.bg.overlay }]}
+          />
+          <Pressable
+            onPress={onClose}
+            accessibilityRole="button"
+            accessibilityLabel="Close currency conversion"
+            style={styles.backdrop}
+          />
+          <CurrencyConversionModalContent
+            // Remount on each open so every session starts unconfirmed, with a fresh
+            // target and no carried success or error banner.
+            key={sessionId}
+            fromCurrency={fromCurrency}
+            expenses={expenses}
+            candidateCurrencies={candidateCurrencies}
+            rates={rates}
+            sheetMaxHeight={sheetMaxHeight}
+            dragGesture={pan}
+            sheetStyle={sheetStyle}
+            onClose={onClose}
+            onConverted={onConverted}
+          />
+        </View>
+      </GestureHandlerRootView>
     </Modal>
   );
+}
+
+interface CurrencyConversionModalContentProps extends Omit<CurrencyConversionModalProps, 'visible'> {
+  /** Sheet travel cap, shared with the drag hook so geometry stays in step. */
+  sheetMaxHeight: number;
+  /** Drag-to-dismiss gesture owned by the modal. */
+  dragGesture: GestureType;
+  /** Animated sheet transform driven by the drag hook. */
+  sheetStyle: AnimatedStyle<ViewStyle>;
 }
 
 function CurrencyConversionModalContent({
@@ -571,10 +646,12 @@ function CurrencyConversionModalContent({
   expenses,
   candidateCurrencies,
   rates,
+  sheetMaxHeight,
+  dragGesture,
+  sheetStyle,
   onClose,
   onConverted,
-}: Omit<CurrencyConversionModalProps, 'visible'>) {
-  const { height } = useWindowDimensions();
+}: CurrencyConversionModalContentProps) {
   const [target, setTarget] = useState('');
   const [consent, setConsent] = useState(false);
   const [converting, setConverting] = useState(false);
@@ -596,8 +673,6 @@ function CurrencyConversionModalContent({
     [expenses, fromCurrency, activeTarget, rates, candidateCurrencies],
   );
 
-  const sheetMaxHeight = useMemo(() => Math.min(height * 0.92, 790), [height]);
-
   const confirm = useCallback(async () => {
     if (converting || !consent || preview.status !== 'ready') return;
     setConverting(true);
@@ -617,7 +692,7 @@ function CurrencyConversionModalContent({
   }, [converting, consent, preview.status, expenses, activeTarget, rates, onConverted]);
 
   return (
-    <View style={[styles.sheetWrap, { maxHeight: sheetMaxHeight }]}>
+    <Animated.View style={[styles.sheetWrap, { maxHeight: sheetMaxHeight }, sheetStyle]}>
       <CurrencyConversionSheet
         fromCurrency={fromCurrency}
         preview={preview}
@@ -636,8 +711,9 @@ function CurrencyConversionModalContent({
         onConfirm={() => void confirm()}
         onRetry={() => setError(null)}
         onClose={onClose}
+        dragGesture={dragGesture}
       />
-    </View>
+    </Animated.View>
   );
 }
 

@@ -1,10 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -12,6 +11,7 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
+import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { differenceInCalendarDays } from 'date-fns';
@@ -23,6 +23,7 @@ import {
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useToast } from '../../components/ui/ToastProvider';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
@@ -133,6 +134,80 @@ function emptyForm(categoryId: string): FormState {
   };
 }
 
+// Loading placeholder. Mirrors the loaded banner, summary card, filter pills and
+// template cards using the real content/gap/card styles, so content arrives with
+// no shift. Decorative blocks stay hidden from assistive tech; the container
+// exposes one busy label, matching the Home/notifications skeleton convention.
+const SKELETON_ROW_COUNT = 4;
+
+function RecurringSkeleton() {
+  const ts = useThemeStyles();
+
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading recurring"
+      accessibilityState={{ busy: true }}
+      style={{ flex: 1 }}
+    >
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
+        <LuminousCard
+          variant="low"
+          style={[
+            styles.infoBanner,
+            { backgroundColor: ts.isDark ? ts.raw.surface : ts.bg.primary5, borderColor: ts.raw.primary + '33' },
+          ]}
+        >
+          <Skeleton width={32} height={32} borderRadius={Radii.full} />
+          <View style={[styles.infoText, styles.skeletonStack]}>
+            <Skeleton width="55%" height={12} />
+            <Skeleton width="95%" height={10} />
+            <Skeleton width="78%" height={10} />
+          </View>
+        </LuminousCard>
+
+        <LuminousCard variant="high" style={[styles.summaryCard, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
+          <View style={[styles.summaryLeft, styles.skeletonStack]}>
+            <Skeleton width={160} height={10} />
+            <Skeleton width={140} height={26} />
+          </View>
+          <View style={[styles.summaryRight, styles.skeletonStack]}>
+            <Skeleton width={84} height={16} borderRadius={Radii.full} />
+            <Skeleton width={72} height={10} />
+          </View>
+        </LuminousCard>
+
+        <View style={styles.filterRow}>
+          {[64, 84, 60, 76].map((width) => (
+            <Skeleton key={width} width={width} height={44} borderRadius={Radii.full} />
+          ))}
+        </View>
+
+        <View style={styles.list}>
+          {Array.from({ length: SKELETON_ROW_COUNT }).map((_, index) => (
+            <View key={index} style={[styles.card, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
+              <View style={styles.cardRow}>
+                <View style={styles.cardLeft}>
+                  <Skeleton width={40} height={40} borderRadius={Radii.md} />
+                  <View style={styles.cardText}>
+                    <Skeleton width="55%" height={12} />
+                    <Skeleton width="75%" height={10} />
+                  </View>
+                </View>
+                <View style={styles.cardRight}>
+                  <Skeleton width={64} height={12} />
+                  <Skeleton width={44} height={10} />
+                </View>
+              </View>
+            </View>
+          ))}
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function RecurringScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
@@ -141,6 +216,18 @@ export default function RecurringScreen() {
   const reduceMotion = useReduceMotion();
   const { showToast } = useToast();
   const { currency, getCurrencySymbol, convertAmount } = useSettings();
+
+  // Surface 8 keyboard avoidance. Replaces KeyboardAvoidingView with the same
+  // padding math, but measured and applied on the UI thread so the add/edit sheet
+  // tracks the keyboard without waiting on a JS bridge frame. iOS only: Android's
+  // default soft-input resize already shrinks the window, so adding this padding
+  // there would double-count the keyboard. Hooks run unconditionally; only the
+  // style is gated at render time.
+  const isIOS = Platform.OS === 'ios';
+  const keyboard = useAnimatedKeyboard();
+  const keyboardPaddingStyle = useAnimatedStyle(() => ({
+    paddingBottom: keyboard.height.get(),
+  }));
 
   const [templates, setTemplates] = useState<RecurringRecord[]>([]);
   const [categories, setCategories] = useState<CategoryRecord[]>([]);
@@ -172,6 +259,18 @@ export default function RecurringScreen() {
       if (showSpinner) setLoading(false);
     }
   }, []);
+
+  // Pull-to-refresh reuses the existing reload path with showSpinner=false, so the
+  // list stays on screen behind the native spinner instead of flashing the skeleton.
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await load(false);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [load]);
 
   useEffect(() => {
     // Deferred so the initial load does not setState synchronously inside the
@@ -355,9 +454,7 @@ export default function RecurringScreen() {
       </View>
 
       {loading ? (
-        <View style={styles.centerBox}>
-          <ActivityIndicator color={ts.raw.primary} />
-        </View>
+        <RecurringSkeleton />
       ) : loadError ? (
         <View style={styles.centerBox}>
           <LuminousCard variant="low" style={styles.messageCard}>
@@ -379,6 +476,14 @@ export default function RecurringScreen() {
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.content}
           keyboardShouldPersistTaps="handled"
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => void refresh()}
+              tintColor={ts.raw.primary}
+              colors={[ts.raw.primary]}
+            />
+          }
         >
           <LuminousCard
             variant="low"
@@ -549,7 +654,7 @@ export default function RecurringScreen() {
         animationType={reduceMotion ? 'none' : 'slide'}
         onRequestClose={closeForm}
       >
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalRoot}>
+        <Animated.View style={[styles.modalRoot, isIOS ? keyboardPaddingStyle : null]}>
           <Pressable onPress={closeForm} accessibilityRole="button" accessibilityLabel="Dismiss template editor" style={[styles.backdrop, { backgroundColor: ts.bg.overlay }]} />
           <View
             accessibilityViewIsModal
@@ -796,7 +901,7 @@ export default function RecurringScreen() {
               </>
             ) : null}
           </View>
-        </KeyboardAvoidingView>
+        </Animated.View>
       </Modal>
 
       <Modal
@@ -988,6 +1093,9 @@ const styles = StyleSheet.create({
   },
   emptyFilter: {
     paddingVertical: Spacing.s6,
+  },
+  skeletonStack: {
+    gap: Spacing.s1,
   },
   list: {
     gap: Spacing.s2,

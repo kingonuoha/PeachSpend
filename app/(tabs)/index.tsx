@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -31,6 +30,7 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
+import { Skeleton } from '../../components/ui/Skeleton';
 import StreakSplash, { selectNextStreakBadge } from '../../components/ui/StreakSplash';
 import { BadgeDetailModal } from '../../components/ui/BadgeDetailModal';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
@@ -198,11 +198,7 @@ export default function HomeScreen() {
   }, [updateSetting, router]);
 
   if (loading) {
-    return (
-      <View style={[styles.loading, { backgroundColor: ts.bg.screen, paddingTop: insets.top }]}>
-        <ActivityIndicator color={ts.raw.primary} />
-      </View>
-    );
+    return <HomeSkeleton />;
   }
 
   return (
@@ -525,6 +521,116 @@ export default function HomeScreen() {
   );
 }
 
+// Loading placeholder. Mirrors the loaded Home geometry: the same hero gradient and
+// bottom corner radius, the same category chip and transaction row padding/radius, so
+// real content arrives with no layout shift. Decorative blocks stay hidden from
+// assistive tech; the container exposes a single busy label.
+const HERO_PLACEHOLDER = `${Colors.white}26`; // white at 15%, the existing hero glass convention
+const SKELETON_CATEGORY_COUNT = 4;
+const SKELETON_RECENT_COUNT = 4;
+
+function HomeSkeleton() {
+  const ts = useThemeStyles();
+  const insets = useSafeAreaInsets();
+  const heroTint = { backgroundColor: HERO_PLACEHOLDER };
+
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading your ledger"
+      accessibilityState={{ busy: true }}
+      style={[styles.loadingScreen, { backgroundColor: ts.bg.screen }]}
+    >
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: 90 + insets.bottom + Spacing.s6 }}
+      >
+        <LinearGradient
+          colors={ts.isDark ? Gradients.dark : Gradients.light}
+          locations={GRADIENT_LOCATIONS}
+          start={GRADIENT_START}
+          end={GRADIENT_END}
+          style={[styles.hero, { paddingTop: insets.top + Spacing.s2 }]}
+        >
+          <View style={styles.heroHeader}>
+            <View style={styles.identity}>
+              <Skeleton width={40} height={40} borderRadius={Radii.full} style={heroTint} />
+              <View style={[styles.identityText, styles.skeletonStack]}>
+                <Skeleton width={96} height={11} style={heroTint} />
+                <Skeleton width={120} height={16} style={heroTint} />
+              </View>
+            </View>
+            <View style={styles.heroActions}>
+              <Skeleton width={36} height={36} borderRadius={Radii.full} style={heroTint} />
+              <Skeleton width={36} height={36} borderRadius={Radii.full} style={heroTint} />
+              <Skeleton width={36} height={36} borderRadius={Radii.full} style={heroTint} />
+            </View>
+          </View>
+
+          <Skeleton width={140} height={12} style={heroTint} />
+          <View style={styles.amountRow}>
+            <Skeleton width={180} height={34} style={heroTint} />
+          </View>
+          <View style={styles.summaryRow}>
+            <Skeleton width={20} height={20} borderRadius={Radii.full} style={heroTint} />
+            <Skeleton width={150} height={12} style={heroTint} />
+          </View>
+        </LinearGradient>
+
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionTitleRow}>
+              <Skeleton width={92} height={14} />
+              <Skeleton width={40} height={11} />
+            </View>
+            <Skeleton width={64} height={24} borderRadius={Radii.full} />
+          </View>
+          <View style={styles.categoryRow}>
+            {Array.from({ length: SKELETON_CATEGORY_COUNT }).map((_, index) => (
+              <View
+                key={index}
+                style={[styles.categoryChip, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }]}
+              >
+                <Skeleton width={44} height={44} style={styles.skeletonChipIcon} />
+                <Skeleton width="70%" height={12} />
+                <Skeleton width="50%" height={10} style={styles.skeletonChipAmount} />
+              </View>
+            ))}
+          </View>
+        </View>
+
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <View style={styles.sectionTitleRow}>
+              <Skeleton width={84} height={14} />
+              <Skeleton width={52} height={18} borderRadius={Radii.full} />
+            </View>
+            <Skeleton width={56} height={14} />
+          </View>
+          <View style={styles.transactionList}>
+            {Array.from({ length: SKELETON_RECENT_COUNT }).map((_, index) => (
+              <View
+                key={index}
+                style={[styles.transaction, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }]}
+              >
+                <View style={styles.transactionLeft}>
+                  <Skeleton width={40} height={40} />
+                  <View style={[styles.transactionText, styles.skeletonStack]}>
+                    <Skeleton width="60%" height={12} />
+                    <Skeleton width="45%" height={10} />
+                  </View>
+                </View>
+                <Skeleton width={56} height={12} />
+              </View>
+            ))}
+          </View>
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
 function BudgetPill({ state, percent }: { state: 'on' | 'near' | 'over'; percent: number }) {
   const label = state === 'over' ? `Exceeded (+${Math.max(percent - 100, 1)}%)` : state === 'near' ? `Near Limit (${percent}%)` : 'On Pace';
   const color = state === 'over' ? '#FCA5A5' : state === 'near' ? '#FCD34D' : '#DDD6FE';
@@ -592,7 +698,12 @@ function TransactionRow({
 }
 
 const styles = StyleSheet.create({
-  loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  loadingScreen: { flex: 1 },
+  // Loading placeholder spacing. Kept here so the skeleton blocks use the same
+  // tokens as the real rows they stand in for.
+  skeletonStack: { gap: Spacing.s1 },
+  skeletonChipIcon: { marginBottom: Spacing.s1 },
+  skeletonChipAmount: { marginTop: 2 },
   hero: {
     paddingHorizontal: Spacing.s5,
     paddingBottom: Spacing.s6,

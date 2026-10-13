@@ -1,10 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -12,6 +11,7 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
+import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { ArrowLeft, Check, FolderOpen, Info, Pencil, Plus, ShieldCheck, X } from 'lucide-react-native';
@@ -19,6 +19,7 @@ import { ArrowLeft, Check, FolderOpen, Info, Pencil, Plus, ShieldCheck, X } from
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
@@ -73,15 +74,99 @@ interface EditorState {
   isDefault: boolean;
 }
 
+// Brief skeleton count for the category list. One Default-badged card plus two
+// plain cards mirrors the real geometry so the loaded list arrives without shift.
+const SKELETON_CATEGORY_COUNT = 3;
+
+// Loading placeholder. Mirrors the loaded banner, count label, category cards,
+// Add button, and policy line using the real content/gap styles so content lands
+// with no layout shift. Decorative blocks stay hidden from assistive tech; the
+// container exposes a single busy label, matching the Home/notifications convention.
+function CategoriesSkeleton() {
+  const ts = useThemeStyles();
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading categories"
+      accessibilityState={{ busy: true }}
+      style={{ flex: 1 }}
+    >
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
+        <LuminousCard
+          variant="low"
+          style={[
+            styles.banner,
+            {
+              backgroundColor: ts.isDark ? ts.raw.surface : ts.bg.primary5,
+              borderColor: ts.raw.primary + '33',
+            },
+          ]}
+        >
+          <Skeleton width={32} height={32} />
+          <View style={[styles.bannerText, styles.skeletonStack]}>
+            <Skeleton width="45%" height={12} />
+            <Skeleton width="85%" height={10} />
+          </View>
+        </LuminousCard>
+
+        <Skeleton width={140} height={10} style={styles.countLabel} />
+
+        <View style={styles.list}>
+          {Array.from({ length: SKELETON_CATEGORY_COUNT }).map((_, index) => (
+            <LuminousCard
+              key={index}
+              variant="low"
+              style={[styles.card, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
+            >
+              <View style={styles.cardRow}>
+                <View style={styles.cardLeft}>
+                  <Skeleton width={ICON_CHIP} height={ICON_CHIP} borderRadius={Radii.md} />
+                  <View style={styles.cardText}>
+                    <View style={styles.nameRow}>
+                      <Skeleton width={index === 0 ? 120 : 90} height={14} />
+                      {index === 0 ? <Skeleton width={52} height={16} borderRadius={Radii.full} /> : null}
+                    </View>
+                  </View>
+                </View>
+                <Skeleton width={64} height={32} borderRadius={Radii.sm} />
+              </View>
+            </LuminousCard>
+          ))}
+        </View>
+
+        <Skeleton width="100%" height={50} borderRadius={Radii.md} />
+
+        <View style={[styles.policyBox, { backgroundColor: ts.bg.low, borderColor: ts.raw.outline }]}>
+          <Skeleton width={13} height={13} />
+          <Skeleton width="70%" height={10} />
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function ManageCategoriesScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const { showToast } = useToast();
   const { height } = useWindowDimensions();
   const reduceMotion = useReduceMotion();
+  // Surface 7 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
+  // math, but measured and applied on the UI thread so the category sheet tracks the
+  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
+  // soft-input resize already shrinks the window, so adding this padding there would
+  // double-count the keyboard. Hooks run unconditionally; only the style is gated at
+  // render time.
+  const isIOS = Platform.OS === 'ios';
+  const keyboard = useAnimatedKeyboard();
+  const keyboardPaddingStyle = useAnimatedStyle(() => ({
+    paddingBottom: keyboard.height.get(),
+  }));
 
   const [categories, setCategories] = useState<CategoryRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -98,6 +183,20 @@ export default function ManageCategoriesScreen() {
       setLoading(false);
     }
   }, []);
+
+  // Pull-to-refresh variant. Re-reads the same typed contract but never flips the
+  // loading flag, so the loaded list does not flash back into the skeleton state.
+  // A failed pull keeps the current list on screen and surfaces a toast instead.
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      setCategories(await categoryService.list());
+    } catch {
+      showToast('Categories could not refresh', 'error');
+    } finally {
+      setRefreshing(false);
+    }
+  }, [showToast]);
 
   useEffect(() => {
     // Deferred so the initial load does not setState synchronously inside the
@@ -219,9 +318,7 @@ export default function ManageCategoriesScreen() {
       </View>
 
       {loading ? (
-        <View style={styles.centerBox}>
-          <ActivityIndicator color={ts.raw.primary} />
-        </View>
+        <CategoriesSkeleton />
       ) : loadError ? (
         <View style={styles.centerBox}>
           <LuminousCard variant="low" style={styles.messageCard}>
@@ -243,6 +340,9 @@ export default function ManageCategoriesScreen() {
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.content}
           keyboardShouldPersistTaps="handled"
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
+          }
         >
           <LuminousCard variant="low" style={[styles.banner, { backgroundColor: ts.isDark ? ts.raw.surface : ts.bg.primary5, borderColor: ts.raw.primary + '33' }]}>
             <View style={[styles.bannerChip, { backgroundColor: ts.raw.purple100 }]}>
@@ -337,10 +437,7 @@ export default function ManageCategoriesScreen() {
         animationType={reduceMotion ? 'none' : 'slide'}
         onRequestClose={closeEditor}
       >
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={styles.modalRoot}
-        >
+        <Animated.View style={[styles.modalRoot, isIOS ? keyboardPaddingStyle : null]}>
           <Pressable
             onPress={closeEditor}
             accessibilityRole="button"
@@ -537,7 +634,7 @@ export default function ManageCategoriesScreen() {
               </>
             ) : null}
           </View>
-        </KeyboardAvoidingView>
+        </Animated.View>
       </Modal>
     </SafeAreaView>
   );
@@ -613,6 +710,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
     marginTop: Spacing.s1,
   },
+  skeletonStack: { gap: Spacing.s1 },
   list: {
     gap: Spacing.s2,
   },

@@ -1,8 +1,9 @@
 import React, { useMemo, useState } from 'react';
-import { PanResponder, Pressable, View } from 'react-native';
+import { Pressable, View } from 'react-native';
 import { Slot, usePathname, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
+import { scheduleOnRN } from 'react-native-worklets';
 import * as Haptics from 'expo-haptics';
 import { ArrowDownLeft, BarChart2, Edit3, Home, MessageCircle, Scan, User } from 'lucide-react-native';
 import { PeachTabBar, type PeachTabAction, type PeachTabItem } from '../../components/navigation/PeachTabBar';
@@ -33,16 +34,26 @@ export default function TabLayout() {
   // Capture surfaces (S-04 scan) are full-screen camera flows with no tab chrome,
   // matching their canonical pairs. Everything else keeps the persistent tab bar.
   const isFullScreenCapture = pathname === '/scan';
-  const panResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dx) > 24 && Math.abs(gesture.dx) > Math.abs(gesture.dy),
-    onPanResponderRelease: (_, gesture) => {
-      if (Math.abs(gesture.dx) < 60) return;
-      const next = gesture.dx < 0 ? currentIndex + 1 : currentIndex - 1;
+  // The switch itself does not slide: tabs are peers, so the pan only decides
+  // whether to change tab, then hands off to a normal push.
+  const commitTabSwitch = React.useCallback((nextIndex: number) => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    router.push(TABS[nextIndex].key as never);
+  }, [router]);
+  // Horizontal axis declared (activeOffsetX) so the pan never steals vertical
+  // scroll; failOffsetY cancels it when the finger moves vertically first.
+  // Commit at 60px, clamped at the ends. onEnd runs as a worklet, so the
+  // RN-runtime work is scheduled back with scheduleOnRN (not the deprecated
+  // runOnJS).
+  const tabPan = useMemo(() => Gesture.Pan()
+    .activeOffsetX([-30, 30])
+    .failOffsetY([-15, 15])
+    .onEnd((event) => {
+      if (Math.abs(event.translationX) < 60) return;
+      const next = event.translationX < 0 ? currentIndex + 1 : currentIndex - 1;
       if (next < 0 || next >= TABS.length) return;
-      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      router.push(TABS[next].key as never);
-    },
-  }), [currentIndex, router]);
+      scheduleOnRN(commitTabSwitch, next);
+    }), [currentIndex, commitTabSwitch]);
 
   const navigate = (href: string) => {
     // Tapping the tab you are already on must not push a duplicate route.
@@ -63,7 +74,7 @@ export default function TabLayout() {
     { key: 'expense', label: 'Expense', icon: <Edit3 color={theme.text.onSurface} size={20} />, color: theme.raw.primary, onPress: () => openCapture('/expense/manual') },
   ];
 
-  return <GestureHandlerRootView style={{ flex: 1 }} {...panResponder.panHandlers}>
+  return <GestureDetector gesture={tabPan}>
     <View style={{ flex: 1, backgroundColor: theme.bg.screen }}><Slot />
       {!isFullScreenCapture && fabOpen && <Pressable accessibilityRole="button" accessibilityLabel="Close log transaction menu" onPress={() => setFabOpen(false)} style={{ position: 'absolute', inset: 0, backgroundColor: theme.bg.overlay }} />}
       {!isFullScreenCapture && (
@@ -80,5 +91,5 @@ export default function TabLayout() {
         </View>
       )}
     </View>
-  </GestureHandlerRootView>;
+  </GestureDetector>;
 }

@@ -1,15 +1,16 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
   FlatList,
   Modal,
   Pressable,
+  RefreshControl,
   StyleSheet,
   Text,
   useWindowDimensions,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import ReanimatedSwipeable from 'react-native-gesture-handler/ReanimatedSwipeable';
 import { Stack, useFocusEffect, useRouter } from 'expo-router';
 import {
   ArrowLeft,
@@ -24,6 +25,7 @@ import {
 import { LuminousCard } from '../components/ui/LuminousCard';
 import { PeachButton } from '../components/ui/PeachButton';
 import { ScalePressable } from '../components/ui/ScalePressable';
+import { Skeleton } from '../components/ui/Skeleton';
 import { useToast } from '../components/ui/ToastProvider';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { useThemeStyles } from '../hooks/useThemeStyles';
@@ -54,6 +56,12 @@ const DELETE_HIT_SLOP = { top: 6, bottom: 6, left: 6, right: 6 };
 // remaining 44pt target vertically through hitSlop (app-wide chip convention).
 const PILL_HIT_SLOP = { top: 6, bottom: 6 };
 const UNREAD_DOT_SIZE = 12;
+// Loading placeholder count. Three rows mirror the common first viewport of the
+// real inbox so the skeleton-to-content swap has no layout shift.
+const SKELETON_ROW_COUNT = 3;
+// Revealed swipe action width. Wide enough for the trash glyph plus the Delete
+// label and above the 44pt minimum target in both axes.
+const SWIPE_ACTION_WIDTH = 88;
 
 // A stored body can carry a formatted amount. When prices are hidden, any
 // whitespace token containing a digit is masked before it reaches the screen so
@@ -92,6 +100,46 @@ function destinationBadge(screen: NotificationDestination['screen']): string | n
 }
 
 type PendingAction = { mode: 'clear' } | { mode: 'single'; id: string; title: string };
+
+// Loading placeholder. Mirrors the loaded row geometry (same list padding/gap and
+// the real rowCard/rowInner/iconChip styles) so content arrives with no shift.
+// Decorative blocks stay hidden from assistive tech; the container exposes one
+// busy label, matching the Home/Insights skeleton convention.
+function NotificationsSkeleton() {
+  const ts = useThemeStyles();
+  const rowSurface = ts.isDark ? ts.bg.low : ts.bg.card;
+
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading notifications"
+      accessibilityState={{ busy: true }}
+      style={styles.listWrap}
+    >
+      <View style={styles.listContent}>
+        {Array.from({ length: SKELETON_ROW_COUNT }).map((_, index) => (
+          <View
+            key={index}
+            style={[
+              styles.rowCard,
+              { backgroundColor: rowSurface, borderColor: ts.raw.outline, borderWidth: 1 },
+            ]}
+          >
+            <View style={styles.rowInner}>
+              <Skeleton width={ICON_CHIP_SIZE} height={ICON_CHIP_SIZE} borderRadius={Radii.md} />
+              <View style={[styles.rowText, styles.skeletonStack]}>
+                <Skeleton width="55%" height={11} />
+                <Skeleton width="90%" height={11} />
+                <Skeleton width={64} height={16} borderRadius={Radii.full} />
+              </View>
+            </View>
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
 
 interface NotificationRowProps {
   record: NotificationRecord;
@@ -198,6 +246,56 @@ function NotificationRow({ record, pricesVisible, onOpen, onDelete }: Notificati
   );
 }
 
+// Swipe-to-reveal Delete wrapper. NotificationRow stays untouched so the resting
+// row is unchanged; the swipeable only adds the revealed action behind it. The
+// action is the visible-button alternative to the inline trash and routes to the
+// same confirmation flow, never a direct delete. It stays hidden from assistive
+// tech until the row is swiped open so a closed row never exposes a phantom
+// second Delete control.
+function SwipeableNotificationRow(props: NotificationRowProps) {
+  const ts = useThemeStyles();
+  const [swipeOpen, setSwipeOpen] = useState(false);
+  const handleSwipeOpen = useCallback(() => setSwipeOpen(true), []);
+  const handleSwipeClose = useCallback(() => setSwipeOpen(false), []);
+  const { record, onDelete } = props;
+
+  return (
+    <ReanimatedSwipeable
+      // Keep the row's own shadow unclipped (the component default is overflow
+      // hidden, which would crop the unread Android elevation shadow).
+      containerStyle={styles.swipeContainer}
+      overshootRight={false}
+      friction={2}
+      onSwipeableOpen={handleSwipeOpen}
+      onSwipeableClose={handleSwipeClose}
+      renderRightActions={(_progress, _translation, methods) => (
+        <View
+          style={styles.swipeActionWrap}
+          accessibilityElementsHidden={!swipeOpen}
+          importantForAccessibility={swipeOpen ? 'auto' : 'no-hide-descendants'}
+        >
+          <ScalePressable
+            onPress={() => {
+              methods.close();
+              onDelete(record);
+            }}
+            accessibilityRole="button"
+            accessibilityLabel={`Delete ${record.title}`}
+            style={[styles.swipeDelete, { backgroundColor: ts.raw.dangerSoft }]}
+          >
+            <Trash2 size={18} color={ts.raw.danger} />
+            <Text style={[Typography.micro, styles.semibold, { color: ts.raw.danger }]}>
+              Delete
+            </Text>
+          </ScalePressable>
+        </View>
+      )}
+    >
+      <NotificationRow {...props} />
+    </ReanimatedSwipeable>
+  );
+}
+
 export default function NotificationsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
@@ -212,6 +310,7 @@ export default function NotificationsScreen() {
 
   const [records, setRecords] = useState<NotificationRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [failed, setFailed] = useState(false);
   const [filter, setFilter] = useState<'all' | 'unread'>('all');
   const [pending, setPending] = useState<PendingAction | null>(null);
@@ -248,6 +347,18 @@ export default function NotificationsScreen() {
   const retry = useCallback(() => {
     setLoading(true);
     void load();
+  }, [load]);
+
+  // Pull-to-refresh re-runs the same load without the full skeleton: only the
+  // native refresh spinner shows, so an existing list stays on screen while it
+  // revalidates.
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await load();
+    } finally {
+      setRefreshing(false);
+    }
   }, [load]);
 
   const goBack = useCallback(() => {
@@ -290,14 +401,18 @@ export default function NotificationsScreen() {
   );
 
   const markAllReadNow = useCallback(async () => {
+    // Optimistic: flip every row to read immediately, but capture the prior rows
+    // so a failed persist rolls the UI back to the real state.
+    const previous = records;
     setRecords((prev) => prev.map((record) => ({ ...record, read: true })));
     try {
       await notificationDataService.markAllRead();
       showToast('All notifications marked as read', 'success');
     } catch {
+      setRecords(previous);
       showToast('Could not mark notifications as read.', 'error');
     }
-  }, [showToast]);
+  }, [records, showToast]);
 
   const requestClearAll = useCallback(() => {
     if (records.length === 0) return;
@@ -440,9 +555,7 @@ export default function NotificationsScreen() {
       </View>
 
       {loading ? (
-        <View style={styles.center}>
-          <ActivityIndicator color={ts.raw.primary} />
-        </View>
+        <NotificationsSkeleton />
       ) : failed ? (
         <View style={styles.center}>
           <LuminousCard variant="low" style={styles.failureCard}>
@@ -461,7 +574,7 @@ export default function NotificationsScreen() {
             data={visible}
             keyExtractor={(item) => item.id}
             renderItem={({ item }) => (
-              <NotificationRow
+              <SwipeableNotificationRow
                 record={item}
                 pricesVisible={pricesVisible}
                 onOpen={openRecord}
@@ -470,6 +583,14 @@ export default function NotificationsScreen() {
             )}
             contentContainerStyle={[styles.listContent, visible.length === 0 ? styles.listContentEmpty : null]}
             showsVerticalScrollIndicator={false}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={() => void onRefresh()}
+                tintColor={ts.raw.primary}
+                colors={[ts.raw.primary]}
+              />
+            }
             ListEmptyComponent={
               <View style={styles.emptyWrap}>
                 <View
@@ -645,6 +766,25 @@ const styles = StyleSheet.create({
   },
   rowWrap: {
     position: 'relative',
+  },
+  // ReanimatedSwipeable defaults the container to overflow hidden, which would
+  // crop the row's own unread shadow on Android. Keep it visible so the resting
+  // row is byte-for-byte the same as before the gesture was added.
+  swipeContainer: {
+    overflow: 'visible',
+  },
+  swipeActionWrap: {
+    width: SWIPE_ACTION_WIDTH,
+  },
+  swipeDelete: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.s1,
+    borderRadius: Radii.md,
+  },
+  skeletonStack: {
+    gap: Spacing.s1,
   },
   rowCard: {
     borderRadius: Radii.md,

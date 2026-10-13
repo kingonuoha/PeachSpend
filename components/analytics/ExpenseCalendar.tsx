@@ -12,7 +12,8 @@ import {
   isSameMonth,
 } from 'date-fns';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import Animated, { SlideInRight, SlideOutLeft, SlideInLeft, SlideOutRight, runOnJS } from 'react-native-reanimated';
+import Animated, { SlideInRight, SlideOutLeft, SlideInLeft, SlideOutRight } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import { Expense } from '../../types/database';
 import { ExpenseItem } from '../expense/ExpenseItem';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
@@ -93,16 +94,19 @@ export const ExpenseCalendar: React.FC<ExpenseCalendarProps> = ({
     setCurrentMonth(prev => subMonths(prev, 1));
   }, []);
 
-  const panGesture = Gesture.Pan()
+  // Memoized so the recognizer is not rebuilt on every render. onEnd runs as a
+  // worklet, so the RN-runtime month change is scheduled back with scheduleOnRN
+  // (not the deprecated runOnJS).
+  const panGesture = useMemo(() => Gesture.Pan()
     .activeOffsetX([-30, 30])
     .failOffsetY([-15, 15])
     .onEnd((e) => {
       if (e.velocityX > 400) {
-        runOnJS(goToPrevMonth)();
+        scheduleOnRN(goToPrevMonth);
       } else if (e.velocityX < -400) {
-        runOnJS(goToNextMonth)();
+        scheduleOnRN(goToNextMonth);
       }
-    });
+    }), [goToPrevMonth, goToNextMonth]);
 
   const handleDayPress = (day: Date) => {
     const key = format(day, 'yyyy-MM-dd');

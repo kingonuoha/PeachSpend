@@ -12,7 +12,8 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
-import Animated, { Easing, useAnimatedStyle, useReducedMotion, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import Animated, { useReducedMotion } from 'react-native-reanimated';
+import { GestureDetector } from 'react-native-gesture-handler';
 import { Image } from 'expo-image';
 import { AlertCircle, AlertTriangle, ChevronRight, RotateCcw, Trash2 } from 'lucide-react-native';
 import { CategoryGlyph } from '../capture/CategoryGlyph';
@@ -20,6 +21,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { format } from 'date-fns';
 import { Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { ScannedReceipt } from '../../types/gemini';
 import { formatCurrency, getCurrencyPrefix, resolveCurrency } from '../../utils/currency';
 import { PeachButton } from '../ui/PeachButton';
@@ -83,9 +85,6 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
   const [saving, setSaving] = useState(false);
   const mountedRef = useRef(true);
 
-  const overlayOpacity = useSharedValue(0);
-  const sheetTranslate = useSharedValue(windowHeight);
-
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -106,16 +105,11 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
         setConfirmClose(false);
         setSaving(false);
       }, 0);
-      overlayOpacity.value = reduceMotion ? 1 : withTiming(1, { duration: 250 });
-      sheetTranslate.value = reduceMotion ? 0 : withSpring(0, { damping: 20, mass: 1, stiffness: 200 });
-    } else {
-      overlayOpacity.value = reduceMotion ? 0 : withTiming(0, { duration: 200 });
-      sheetTranslate.value = reduceMotion ? windowHeight : withTiming(windowHeight, { duration: 200, easing: Easing.in(Easing.cubic) });
     }
     return () => {
       if (resetTimer) clearTimeout(resetTimer);
     };
-  }, [isVisible, data, overlayOpacity, sheetTranslate, windowHeight, reduceMotion]);
+  }, [isVisible, data]);
 
   // Category titles live in the data layer, not in the sheet. Load once per open.
   useEffect(() => {
@@ -134,9 +128,6 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
       active = false;
     };
   }, [isVisible]);
-
-  const overlayStyle = useAnimatedStyle(() => ({ opacity: overlayOpacity.value }));
-  const sheetStyle = useAnimatedStyle(() => ({ transform: [{ translateY: sheetTranslate.value }] }));
 
   const sheetMaxHeight = Math.min(SHEET_MAX_HEIGHT, windowHeight - insets.top - Spacing.s3);
   const bodyMaxHeight = Math.min(BODY_MAX_HEIGHT, windowHeight * 0.52);
@@ -212,6 +203,18 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
     onCancel();
   }, [onCancel]);
 
+  // Shared drag-to-dismiss. A drag routes through handleCancel, which decides
+  // whether to dismiss or open the unsaved-changes confirm; the sheet only
+  // follows the finger to dismissal when there is nothing to lose.
+  const { pan, sheetStyle, backdropStyle } = useSheetDragToDismiss({
+    height: windowHeight,
+    visible: isVisible,
+    reduceMotion,
+    dismissable: items.length === 0,
+    onDismiss: handleCancel,
+    onBlocked: handleCancel,
+  });
+
   const handleConfirm = useCallback(async () => {
     if (!canConfirm) return;
     setSaving(true);
@@ -229,7 +232,7 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
 
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents={isVisible ? 'auto' : 'none'}>
-      <Animated.View style={[overlayStyle, { backgroundColor: ts.bg.overlay }]} className="absolute inset-0">
+      <Animated.View style={[backdropStyle, { backgroundColor: ts.bg.overlay }]} className="absolute inset-0">
         <Pressable className="flex-1" onPress={handleCancel} accessibilityLabel="Dismiss verification" />
       </Animated.View>
 
@@ -256,7 +259,8 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
               },
             ]}
           >
-            {/* Header */}
+            {/* Header (also the drag-to-dismiss grab region) */}
+            <GestureDetector gesture={pan}>
             <View style={{ paddingTop: Spacing.s3, paddingHorizontal: Spacing.s5, paddingBottom: Spacing.s2, borderBottomWidth: 1, borderBottomColor: ts.border.subtle }}>
               <View style={{ width: 40, height: 6, borderRadius: Radii.full, backgroundColor: ts.raw.outline, alignSelf: 'center', marginBottom: Spacing.s3 }} />
               <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3 }}>
@@ -282,6 +286,7 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
                 ) : null}
               </View>
             </View>
+            </GestureDetector>
 
             {/* Low-confidence banner */}
             {isLowConfidence ? (

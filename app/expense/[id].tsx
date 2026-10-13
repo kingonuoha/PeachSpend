@@ -1,6 +1,5 @@
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   FlatList,
   Image,
   Modal,
@@ -47,6 +46,7 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { PeachButton } from '../../components/ui/PeachButton';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
 import { useExpenseDetail, type ExpenseCategoryMeta } from '../../hooks/useExpenseDetail';
@@ -332,12 +332,104 @@ export default function ExpenseDetailScreen() {
   );
 
   if (loading) {
+    // Placeholder mirrors the loaded detail page (hint bar, hero card, reimbursable
+    // tile, note tile, metadata card) using the real card styles and tokens, so
+    // content arrives with no layout shift. Decorative shapes stay hidden from
+    // assistive tech; the content wrapper exposes one busy label.
     return (
       <View style={[styles.root, { backgroundColor: ts.bg.screen }]}>
         {header}
-        <View style={styles.stateWrap}>
-          <ActivityIndicator color={ts.raw.primary} />
-        </View>
+        <ScrollView
+          style={styles.page}
+          contentContainerStyle={[styles.pageContent, { paddingBottom: Spacing.s8 + insets.bottom }]}
+          showsVerticalScrollIndicator={false}
+        >
+          <View
+            accessible
+            accessibilityRole="progressbar"
+            accessibilityLabel="Loading this record"
+            accessibilityState={{ busy: true }}
+          >
+            {/* Swipe hint bar (HTML 205-213) */}
+            <View style={styles.hintBar}>
+              <Skeleton width={64} height={12} />
+              <Skeleton width={72} height={20} borderRadius={Radii.sm} />
+              <Skeleton width={64} height={12} />
+            </View>
+
+            {/* Hero detail card (HTML 216-279) */}
+            <LuminousCard variant="high" style={styles.heroCard}>
+              <View style={styles.originRow}>
+                <Skeleton width={128} height={20} borderRadius={Radii.full} />
+                <Skeleton width={40} height={11} />
+              </View>
+              <View style={styles.merchantRow}>
+                <Skeleton width={52} height={52} borderRadius={Radii.md} />
+                <View style={[styles.flexShrink, styles.skeletonStack]}>
+                  <Skeleton width="70%" height={17} />
+                  <Skeleton width="45%" height={11} />
+                </View>
+              </View>
+              <View style={[styles.amountRow, { borderTopColor: ts.raw.outline, borderBottomColor: ts.raw.outline }]}>
+                <View style={[styles.flexShrink, styles.skeletonStack]}>
+                  <Skeleton width={84} height={11} />
+                  <Skeleton width={160} height={34} />
+                </View>
+                <View style={[styles.originalBox, styles.skeletonStack]}>
+                  <Skeleton width={56} height={11} />
+                  <Skeleton width={56} height={18} borderRadius={Radii.sm} />
+                </View>
+              </View>
+              <View style={styles.categoryRow}>
+                <View style={styles.categoryLeft}>
+                  <Skeleton width={52} height={12} />
+                  <Skeleton width={120} height={34} borderRadius={Radii.sm} />
+                </View>
+                <Skeleton width={44} height={12} />
+              </View>
+            </LuminousCard>
+
+            {/* Reimbursable card (HTML 282-296) */}
+            <LuminousCard variant="high" style={styles.tileCard}>
+              <View style={styles.tileLeft}>
+                <Skeleton width={40} height={40} borderRadius={Radii.md} />
+                <View style={[styles.flexShrink, styles.skeletonStack]}>
+                  <Skeleton width={140} height={15} />
+                  <Skeleton width="80%" height={11} />
+                </View>
+              </View>
+              <Skeleton width={52} height={32} borderRadius={Radii.full} />
+            </LuminousCard>
+
+            {/* Note card (HTML 299-317) */}
+            <LuminousCard variant="high" style={styles.tileCard}>
+              <View style={styles.noteHeader}>
+                <Skeleton width={110} height={15} />
+                <Skeleton width={40} height={11} />
+              </View>
+              <Skeleton width="100%" height={64} borderRadius={Radii.sm} />
+              <View style={[styles.noteFooter, { borderTopColor: ts.raw.outline }]}>
+                <Skeleton width={120} height={11} />
+              </View>
+            </LuminousCard>
+
+            {/* Metadata card (HTML 320-341) */}
+            <LuminousCard variant="high" style={styles.metaCard}>
+              <View style={styles.metaRow}>
+                <Skeleton width={110} height={12} />
+                <Skeleton width={140} height={12} />
+              </View>
+              <View style={styles.metaRow}>
+                <Skeleton width={96} height={12} />
+                <Skeleton width={120} height={12} />
+              </View>
+              <View style={styles.metaRow}>
+                <Skeleton width={104} height={12} />
+                <Skeleton width={96} height={12} />
+              </View>
+            </LuminousCard>
+          </View>
+        </ScrollView>
       </View>
     );
   }
@@ -964,6 +1056,7 @@ const styles = StyleSheet.create({
   uppercase: { textTransform: 'uppercase', letterSpacing: 0.6 },
   bold: { fontFamily: 'Manrope_700Bold' },
   flexShrink: { flexShrink: 1, minWidth: 0 },
+  skeletonStack: { gap: Spacing.s2 },
   mono: { fontFamily: 'Manrope_500Medium', letterSpacing: 0.4 },
   dotsRow: {
     flexDirection: 'row',

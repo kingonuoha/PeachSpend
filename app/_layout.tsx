@@ -2,6 +2,7 @@ import 'react-native-get-random-values';
 import { HrefInputParams, Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { View, Text, TouchableOpacity, AppState } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as React from 'react';
 import { 
   useFonts,
@@ -250,6 +251,7 @@ export default function RootLayout() {
   }, []);
 
   return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
       <SettingsProvider>
         <NotificationPermissionGate />
         <ContinuityGate />
@@ -294,5 +296,6 @@ export default function RootLayout() {
         </ToastProvider>
       </ThemeProvider>
     </SettingsProvider>
+    </GestureHandlerRootView>
   );
 }

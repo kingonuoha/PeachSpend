@@ -1,6 +1,5 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
   Modal,
   Pressable,
   RefreshControl,
@@ -31,6 +30,7 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { PeachButton } from '../../components/ui/PeachButton';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { SearchFilterBar } from '../../components/ui/SearchFilterBar';
 import { DateRangePicker } from '../../components/ui/DateRangePicker';
 import { SpendingDonut } from '../../components/analytics/SpendingDonut';
@@ -45,6 +45,10 @@ const GRADIENT_START = { x: 0.33, y: 0 };
 const GRADIENT_END = { x: 0.67, y: 1 };
 const GRADIENT_LOCATIONS: [number, number, number] = [0, 0.45, 1];
 const DONUT_SIZE = 112;
+// White at 15 percent, the existing hero and narrative glass convention. Skeleton
+// blocks over the deep purple gradient cards use this tint instead of the neutral
+// surface fill, which would be invisible on the dark gradient.
+const GLASS_PLACEHOLDER = `${Colors.white}26`;
 
 const TIMEFRAMES: { key: InsightTimeframe; label: string }[] = [
   { key: 'week', label: 'Week' },
@@ -198,10 +202,158 @@ export default function AnalyticsScreen() {
     router.push({ pathname: '/spending-recap', params: { origin: 'insights' } } as never);
   }, [router]);
 
+  // Rendered above the scroll content in both the loaded and loading states so the
+  // header never shifts when the ledger resolves.
+  const header = (
+    <View
+      style={[
+        styles.header,
+        { paddingTop: insets.top + Spacing.s1, borderBottomColor: ts.raw.outline, backgroundColor: ts.bg.screen },
+      ]}
+    >
+      <View style={styles.headerInner}>
+        <View style={styles.headerLeft}>
+          <Text style={[styles.headerEyebrow, { color: ts.raw.primary }]}>PeachSpend</Text>
+          <Text accessibilityRole="header" style={[styles.headerTitle, { color: ts.raw.onSurface }]}>Insights</Text>
+        </View>
+        <ScalePressable
+          accessibilityRole="button"
+          accessibilityLabel="Open Spending Recap"
+          onPress={openRecap}
+          style={styles.recapButton}
+        >
+          <LinearGradient
+            colors={ts.isDark ? Gradients.dark : Gradients.light}
+            locations={GRADIENT_LOCATIONS}
+            start={GRADIENT_START}
+            end={GRADIENT_END}
+            style={StyleSheet.absoluteFill}
+          />
+          <Zap size={14} color={Colors.white} />
+          <Text style={styles.recapLabel} numberOfLines={1}>Spending Recap</Text>
+        </ScalePressable>
+      </View>
+    </View>
+  );
+
   if (loading && !snapshot) {
+    // Placeholder mirrors the loaded Insights scroll (timeframe bar, narrative
+    // gradient card, cashflow and category cards) using the real card styles and
+    // tokens, so content arrives with no layout shift. The header renders above
+    // unchanged. Decorative blocks stay hidden from assistive tech; the content
+    // wrapper exposes one busy label.
+    const glassTint = { backgroundColor: GLASS_PLACEHOLDER };
     return (
-      <View style={[styles.loading, { backgroundColor: ts.bg.screen, paddingTop: insets.top }]}>
-        <ActivityIndicator color={ts.raw.primary} />
+      <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
+        {header}
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{
+            paddingHorizontal: Spacing.s5,
+            paddingTop: Spacing.s3,
+            paddingBottom: 100 + insets.bottom,
+            alignSelf: 'center',
+            width: '100%',
+            maxWidth: 640,
+          }}
+        >
+          <View
+            accessible
+            accessibilityRole="progressbar"
+            accessibilityLabel="Loading insights"
+            accessibilityState={{ busy: true }}
+          >
+            {/* Timeframe segmented bar (FR-03.5) */}
+            <View style={[styles.timeframeBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
+              {TIMEFRAMES.map(timeframe => (
+                <View key={timeframe.key} style={styles.timeframeSegment}>
+                  <Skeleton width={40} height={12} />
+                </View>
+              ))}
+            </View>
+
+            {/* Narrative gradient card (FR-03.1) */}
+            <LinearGradient
+              colors={ts.isDark ? Gradients.dark : Gradients.light}
+              locations={GRADIENT_LOCATIONS}
+              start={GRADIENT_START}
+              end={GRADIENT_END}
+              style={styles.narrative}
+            >
+              <View pointerEvents="none" style={styles.narrativeBlob} />
+              <View style={styles.narrativeHeader}>
+                <Skeleton width={112} height={11} style={glassTint} />
+                <Skeleton width={64} height={18} borderRadius={Radii.full} style={glassTint} />
+              </View>
+              <Skeleton width="92%" height={16} style={glassTint} />
+              <Skeleton width="70%" height={12} style={[glassTint, styles.skeletonStackTight]} />
+              <View style={styles.narrativeFooter}>
+                <Skeleton width={120} height={11} style={glassTint} />
+                <Skeleton width={90} height={11} style={glassTint} />
+              </View>
+            </LinearGradient>
+
+            {/* Income vs Expense (FR-03.4) */}
+            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
+              <View style={styles.cashflowHeader}>
+                <View style={[styles.skeletonStack, { flexShrink: 1, minWidth: 0 }]}>
+                  <Skeleton width={96} height={11} />
+                  <Skeleton width={128} height={14} />
+                </View>
+                <Skeleton width={88} height={22} borderRadius={Radii.full} />
+              </View>
+              <View style={styles.cashflowCards}>
+                <View style={[styles.cashflowCard, styles.cashflowCardIncome, { backgroundColor: ts.isDark ? ts.raw.surfaceContainerLowest : Colors.black }]}>
+                  <Skeleton width={52} height={11} style={glassTint} />
+                  <Skeleton width={92} height={18} style={[glassTint, styles.skeletonStackTight]} />
+                  <Skeleton width={80} height={10} style={[glassTint, styles.skeletonStackTight]} />
+                </View>
+                <LinearGradient
+                  colors={[ts.raw.primary, ts.raw.primaryContainer]}
+                  start={GRADIENT_START}
+                  end={GRADIENT_END}
+                  style={[styles.cashflowCard, { borderColor: ts.raw.primaryBorder + '4D' }]}
+                >
+                  <Skeleton width={52} height={11} style={glassTint} />
+                  <Skeleton width={92} height={18} style={[glassTint, styles.skeletonStackTight]} />
+                  <Skeleton width={80} height={10} style={[glassTint, styles.skeletonStackTight]} />
+                </LinearGradient>
+              </View>
+              <View style={styles.cashflowTrackRow}>
+                <Skeleton width="100%" height={10} borderRadius={Radii.full} />
+                <View style={styles.cashflowTrackLabels}>
+                  <Skeleton width={64} height={10} />
+                  <Skeleton width={110} height={10} />
+                </View>
+              </View>
+            </LuminousCard>
+
+            {/* Donut and category share (FR-03.3) */}
+            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
+              <View style={styles.sectionHeaderRow}>
+                <View style={[styles.skeletonStack, { flexShrink: 1, minWidth: 0 }]}>
+                  <Skeleton width={84} height={11} />
+                  <Skeleton width={120} height={14} />
+                </View>
+                <Skeleton width={72} height={11} />
+              </View>
+              <View style={styles.shareRow}>
+                <Skeleton width={DONUT_SIZE} height={DONUT_SIZE} borderRadius={Radii.full} />
+                <View style={styles.shareLegend}>
+                  {Array.from({ length: 4 }).map((_, index) => (
+                    <View key={index} style={styles.skeletonLegendRow}>
+                      <View style={styles.skeletonLegendLeft}>
+                        <Skeleton width={10} height={10} borderRadius={Radii.full} />
+                        <Skeleton width={72} height={12} />
+                      </View>
+                      <Skeleton width={52} height={12} />
+                    </View>
+                  ))}
+                </View>
+              </View>
+            </LuminousCard>
+          </View>
+        </ScrollView>
       </View>
     );
   }
@@ -216,35 +368,7 @@ export default function AnalyticsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
-      <View
-        style={[
-          styles.header,
-          { paddingTop: insets.top + Spacing.s1, borderBottomColor: ts.raw.outline, backgroundColor: ts.bg.screen },
-        ]}
-      >
-        <View style={styles.headerInner}>
-          <View style={styles.headerLeft}>
-            <Text style={[styles.headerEyebrow, { color: ts.raw.primary }]}>PeachSpend</Text>
-            <Text accessibilityRole="header" style={[styles.headerTitle, { color: ts.raw.onSurface }]}>Insights</Text>
-          </View>
-          <ScalePressable
-            accessibilityRole="button"
-            accessibilityLabel="Open Spending Recap"
-            onPress={openRecap}
-            style={styles.recapButton}
-          >
-            <LinearGradient
-              colors={ts.isDark ? Gradients.dark : Gradients.light}
-              locations={GRADIENT_LOCATIONS}
-              start={GRADIENT_START}
-              end={GRADIENT_END}
-              style={StyleSheet.absoluteFill}
-            />
-            <Zap size={14} color={Colors.white} />
-            <Text style={styles.recapLabel} numberOfLines={1}>Spending Recap</Text>
-          </ScalePressable>
-        </View>
-      </View>
+      {header}
 
       <ScrollView
         showsVerticalScrollIndicator={false}
@@ -396,7 +520,7 @@ export default function AnalyticsScreen() {
               </ScalePressable>
             </View>
             <View style={styles.digestBody}>
-              {digest.status === 'generating' ? <ActivityIndicator size="small" color={ts.raw.primary} /> : null}
+              {digest.status === 'generating' ? <Skeleton width="60%" height={12} /> : null}
               <Text style={[styles.digestText, { color: ts.raw.onSurface }]}>
                 {digest.status === 'available' && digest.text ? digest.text : digest.localText}
               </Text>
@@ -717,7 +841,16 @@ function SortSheet({
 }
 
 const styles = StyleSheet.create({
-  loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  skeletonStack: { gap: Spacing.s2 },
+  skeletonStackTight: { marginTop: Spacing.s2 },
+  skeletonLegendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+    minHeight: 22,
+  },
+  skeletonLegendLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
   header: {
     paddingHorizontal: Spacing.s5,
     paddingBottom: Spacing.s3,
