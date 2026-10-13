@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -10,6 +11,8 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
+import { GestureDetector } from 'react-native-gesture-handler';
+import Animated from 'react-native-reanimated';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as Clipboard from 'expo-clipboard';
@@ -37,6 +40,8 @@ import { useToast } from '../../components/ui/ToastProvider';
 import { AIProcessingOverlay } from '../../components/capture/AIProcessingOverlay';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
+import { useReduceMotion } from '../../hooks/useReduceMotion';
+import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
@@ -77,6 +82,12 @@ const BACK_SIZE = 40;
 const BACK_HIT_SLOP = { top: 4, bottom: 4, left: 4, right: 4 };
 const CLOSE_SIZE = 32;
 const CLOSE_HIT_SLOP = { top: 6, bottom: 6, left: 6, right: 6 };
+// Compact text links under the amount keep their design height and earn the
+// rest of the 44pt target through hitSlop, the same convention PeachButton uses.
+const LINK_HIT_SLOP = { top: 8, bottom: 8, left: 10, right: 10 };
+// The include/exclude link stretches across the row's text column, so it only
+// needs vertical slop; horizontal slop would reach the 44pt checkbox beside it.
+const ROW_ACTION_HIT_SLOP = { top: 8, bottom: 8, left: 0, right: 0 };
 const SHEET_MAX_HEIGHT = 760;
 const AUTO_RETURN_MS = 2500;
 const CHECKBOX_SIZE = 22;
@@ -126,7 +137,8 @@ interface PreviewRowProps {
   item: ImportPreviewItem;
   category?: CaptureCategory;
   onToggle: (included: boolean) => void;
-  onEdit: () => void;
+  /** Reports the pressed node tag so focus can return to this control on drawer close. */
+  onEdit: (triggerTag?: number) => void;
 }
 
 function PreviewRow({ item, category, onToggle, onEdit }: PreviewRowProps) {
@@ -227,6 +239,7 @@ function PreviewRow({ item, category, onToggle, onEdit }: PreviewRowProps) {
                 accessibilityRole="button"
                 accessibilityLabel={item.included ? 'Exclude flagged duplicate' : 'Include flagged duplicate anyway'}
                 onPress={() => onToggle(!item.included)}
+                hitSlop={ROW_ACTION_HIT_SLOP}
                 style={{ minHeight: 28, justifyContent: 'center', marginTop: Spacing.s1 }}
               >
                 <Text style={[Typography.micro, { color: ts.raw.warningContainerText, fontFamily: 'Manrope_700Bold' }]}>
@@ -245,7 +258,14 @@ function PreviewRow({ item, category, onToggle, onEdit }: PreviewRowProps) {
             haptic={false}
             accessibilityRole="button"
             accessibilityLabel={`Edit ${title}`}
-            onPress={onEdit}
+            onPress={(event) => {
+              // The shipped .d.ts types nativeEvent.target as string; at runtime
+              // it is the numeric node id (RN Flow: ?number), so narrow it
+              // before it is stored for the focus return instead of casting.
+              const target = event.nativeEvent.target;
+              onEdit(typeof target === 'number' ? target : undefined);
+            }}
+            hitSlop={LINK_HIT_SLOP}
             style={{ minHeight: 28, justifyContent: 'center' }}
           >
             <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Edit</Text>
@@ -289,6 +309,11 @@ export default function ImportScreen() {
 
   const scrollRef = useRef<ScrollView>(null);
   const handoffHandled = useRef(false);
+  // Focus targets for the edit drawer: the sheet moves screen-reader focus in on
+  // open, and back to the pressed Edit control on close (POLISH Section 7).
+  const drawerRef = useRef<View>(null);
+  const editTriggerTag = useRef<number | null>(null);
+  const reduceMotion = useReduceMotion();
 
   const categoryById = useMemo(() => {
     const map = new Map<string, CaptureCategory>();
@@ -470,7 +495,8 @@ export default function ImportScreen() {
     setPreviewItems((items) => items.reduce((acc, item) => (item.candidate ? toggleImportItem(acc, item.id, included) : acc), items));
   }, []);
 
-  const openEdit = useCallback((item: ImportPreviewItem) => {
+  const openEdit = useCallback((item: ImportPreviewItem, triggerTag?: number) => {
+    editTriggerTag.current = triggerTag ?? null;
     setEditItemId(item.id);
     setEditMerchant(item.expense.merchant ?? '');
     setEditAmount(typeof item.expense.amount === 'number' ? String(item.expense.amount) : '');
@@ -563,6 +589,31 @@ export default function ImportScreen() {
   })();
 
   const sheetMaxHeight = Math.min(SHEET_MAX_HEIGHT, height * 0.9);
+
+  // Shared drag-to-dismiss for the inline edit drawer (POLISH Section 5): the
+  // sheet tracks the finger, the backdrop opacity is derived from the same
+  // translate, and a flick or a long pull dismisses through closeEdit. The
+  // drawer is an absolute overlay, not an RN Modal, so the root
+  // GestureHandlerRootView in app/_layout.tsx already covers this gesture.
+  const { pan, sheetStyle, backdropStyle } = useSheetDragToDismiss({
+    height: sheetMaxHeight,
+    visible: editItemId !== null,
+    reduceMotion,
+    onDismiss: closeEdit,
+  });
+
+  // POLISH Section 7: move screen-reader focus into the drawer when it opens and
+  // back to the Edit control that opened it when it closes. This only changes
+  // what a screen reader announces; nothing renders differently.
+  useEffect(() => {
+    if (editItemId !== null) {
+      if (drawerRef.current !== null) AccessibilityInfo.sendAccessibilityEvent(drawerRef.current, 'focus');
+      return;
+    }
+    const triggerTag = editTriggerTag.current;
+    editTriggerTag.current = null;
+    if (triggerTag !== null) AccessibilityInfo.setAccessibilityFocus(triggerTag);
+  }, [editItemId]);
 
   const renderMethod = () => (
     <View style={{ gap: Spacing.s4 }}>
@@ -844,7 +895,7 @@ export default function ImportScreen() {
           item={item}
           category={item.expense.category ? categoryById.get(item.expense.category) : undefined}
           onToggle={(included) => handleToggleItem(item.id, included)}
-          onEdit={() => openEdit(item)}
+          onEdit={(triggerTag) => openEdit(item, triggerTag)}
         />
       ))}
     </View>
@@ -897,8 +948,12 @@ export default function ImportScreen() {
     const selectedCategory = categoryById.get(editCategoryId);
     return (
       <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+        <Animated.View
+          pointerEvents="none"
+          style={[StyleSheet.absoluteFill, backdropStyle, { backgroundColor: ts.bg.overlay }]}
+        />
         <Pressable
-          style={[StyleSheet.absoluteFill, { backgroundColor: ts.bg.overlay }]}
+          style={StyleSheet.absoluteFill}
           onPress={closeEdit}
           accessibilityRole="button"
           accessibilityLabel="Dismiss edit"
@@ -909,37 +964,47 @@ export default function ImportScreen() {
           pointerEvents="box-none"
         >
           <View style={{ flex: 1, justifyContent: 'flex-end' }} pointerEvents="box-none">
-            <View
+            <Animated.View
+              ref={drawerRef}
               accessibilityViewIsModal
-              style={{
-                width: '100%',
-                maxWidth: MAX_CONTENT_WIDTH,
-                alignSelf: 'center',
-                maxHeight: sheetMaxHeight,
-                backgroundColor: ts.raw.surface,
-                borderTopLeftRadius: Radii.xl,
-                borderTopRightRadius: Radii.xl,
-                borderTopWidth: 1,
-                borderColor: ts.border.card,
-                paddingTop: Spacing.s3,
-                paddingHorizontal: Spacing.s5,
-                paddingBottom: Math.max(Spacing.s5, insets.bottom),
-              }}
+              style={[
+                sheetStyle,
+                {
+                  width: '100%',
+                  maxWidth: MAX_CONTENT_WIDTH,
+                  alignSelf: 'center',
+                  maxHeight: sheetMaxHeight,
+                  backgroundColor: ts.raw.surface,
+                  borderTopLeftRadius: Radii.xl,
+                  borderTopRightRadius: Radii.xl,
+                  borderTopWidth: 1,
+                  borderColor: ts.border.card,
+                  paddingTop: Spacing.s3,
+                  paddingHorizontal: Spacing.s5,
+                  paddingBottom: Math.max(Spacing.s5, insets.bottom),
+                },
+              ]}
             >
-              <View style={{ width: 40, height: 4, borderRadius: Radii.full, backgroundColor: ts.raw.outline, alignSelf: 'center', marginBottom: Spacing.s3 }} />
-              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3, paddingBottom: Spacing.s3, borderBottomWidth: 1, borderBottomColor: ts.border.subtle }}>
-                <Text style={[Typography.bodyBold, { color: ts.text.onSurface, flexShrink: 1 }]}>Edit Parsed Transaction</Text>
-                <ScalePressable
-                  haptic={false}
-                  accessibilityRole="button"
-                  accessibilityLabel="Close edit"
-                  onPress={closeEdit}
-                  hitSlop={CLOSE_HIT_SLOP}
-                  style={{ width: CLOSE_SIZE, height: CLOSE_SIZE, borderRadius: Radii.full, backgroundColor: ts.bg.low, alignItems: 'center', justifyContent: 'center' }}
-                >
-                  <X size={15} color={ts.icon.muted} />
-                </ScalePressable>
-              </View>
+              {/* The drag is attached to the handle and header only, so a vertical
+                  drag never fights the scrollable form or the inputs below it. */}
+              <GestureDetector gesture={pan}>
+                <View>
+                  <View style={{ width: 40, height: 4, borderRadius: Radii.full, backgroundColor: ts.raw.outline, alignSelf: 'center', marginBottom: Spacing.s3 }} />
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3, paddingBottom: Spacing.s3, borderBottomWidth: 1, borderBottomColor: ts.border.subtle }}>
+                    <Text style={[Typography.bodyBold, { color: ts.text.onSurface, flexShrink: 1 }]}>Edit Parsed Transaction</Text>
+                    <ScalePressable
+                      haptic={false}
+                      accessibilityRole="button"
+                      accessibilityLabel="Close edit"
+                      onPress={closeEdit}
+                      hitSlop={CLOSE_HIT_SLOP}
+                      style={{ width: CLOSE_SIZE, height: CLOSE_SIZE, borderRadius: Radii.full, backgroundColor: ts.bg.low, alignItems: 'center', justifyContent: 'center' }}
+                    >
+                      <X size={15} color={ts.icon.muted} />
+                    </ScalePressable>
+                  </View>
+                </View>
+              </GestureDetector>
 
               <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ paddingVertical: Spacing.s3, gap: Spacing.s3 }} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
                 <View style={{ gap: Spacing.s1 }}>
@@ -999,7 +1064,7 @@ export default function ImportScreen() {
                 <PeachButton title="Save Item Changes" onPress={() => { void saveEdit(); }} variant="primary" size="lg" fullWidth style={{ flex: 1 }} />
                 <PeachButton title="Cancel" onPress={closeEdit} variant="quiet" size="lg" fullWidth style={{ flex: 1 }} />
               </View>
-            </View>
+            </Animated.View>
           </View>
         </KeyboardAvoidingView>
       </View>
