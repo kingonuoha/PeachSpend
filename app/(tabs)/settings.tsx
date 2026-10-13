@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
   Image,
   Modal,
   Pressable,
@@ -39,6 +38,7 @@ import {
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { EditProfileSheet } from '../../components/profile/EditProfileSheet';
 import { CurrencyConversionModal } from '../../components/settings/CurrencyConversionModal';
 import { useSettings } from '../../components/ui/SettingsProvider';
@@ -208,6 +208,100 @@ function continuityTone(raw: ThemeRaw, tone: ContinuityFeedback['tone']) {
     default:
       return { background: raw.dangerSoft, border: raw.danger + '40', text: raw.danger };
   }
+}
+
+// Loading placeholder. Mirrors the loaded header and the two settings cards with
+// their real row geometry (card/row/spacing styles) so content arrives with no
+// layout shift. Decorative blocks stay hidden from assistive tech; the container
+// exposes a single busy label, matching the Home/notifications skeleton convention.
+function SettingsSkeleton() {
+  const ts = useThemeStyles();
+  return (
+    <SafeAreaView
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading settings"
+      accessibilityState={{ busy: true }}
+      style={{ backgroundColor: ts.bg.screen, flex: 1 }}
+      edges={['top']}
+    >
+      <View style={[styles.header, { borderBottomColor: ts.raw.outline }]}>
+        <Skeleton width={36} height={36} borderRadius={Radii.full} />
+        <Skeleton width={96} height={20} />
+        <View style={styles.headerCircle} />
+      </View>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
+        {/* Account & Identity */}
+        <View>
+          <Skeleton width={120} height={11} style={styles.skeletonSectionLabel} />
+          <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
+            <View style={styles.profileRow}>
+              <View style={styles.rowLeft}>
+                <Skeleton width={48} height={48} borderRadius={Radii.full} />
+                <View style={[styles.rowText, styles.skeletonStack]}>
+                  <Skeleton width="55%" height={14} />
+                  <Skeleton width="70%" height={11} />
+                </View>
+              </View>
+              <Skeleton width={64} height={36} borderRadius={Radii.full} />
+            </View>
+          </LuminousCard>
+        </View>
+
+        {/* Preferences & Core Setup */}
+        <View>
+          <Skeleton width={180} height={11} style={styles.skeletonSectionLabel} />
+          <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
+            <View style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
+              <View style={styles.rowLeft}>
+                <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
+                <View style={[styles.rowText, styles.skeletonStack]}>
+                  <Skeleton width="45%" height={14} />
+                  <Skeleton width="70%" height={11} />
+                </View>
+              </View>
+              <Skeleton width={48} height={28} borderRadius={Radii.full} />
+            </View>
+            <View style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
+              <View style={styles.rowLeft}>
+                <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
+                <View style={[styles.rowText, styles.skeletonStack]}>
+                  <Skeleton width="50%" height={14} />
+                  <Skeleton width="65%" height={11} />
+                </View>
+              </View>
+              <View style={styles.rowRight}>
+                <Skeleton width={56} height={14} />
+                <Skeleton width={40} height={32} borderRadius={Radii.sm} />
+              </View>
+            </View>
+            <View style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
+              <View style={styles.rowLeft}>
+                <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
+                <View style={[styles.rowText, styles.skeletonStack]}>
+                  <Skeleton width="45%" height={14} />
+                  <Skeleton width="55%" height={11} />
+                </View>
+              </View>
+              <View style={styles.rowRight}>
+                <Skeleton width={72} height={14} />
+                <Skeleton width={12} height={12} />
+              </View>
+            </View>
+            <View style={styles.row}>
+              <View style={styles.rowLeft}>
+                <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
+                <View style={[styles.rowText, styles.skeletonStack]}>
+                  <Skeleton width="40%" height={14} />
+                  <Skeleton width="60%" height={11} />
+                </View>
+              </View>
+            </View>
+          </LuminousCard>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
 }
 
 export default function SettingsScreen() {
@@ -467,16 +561,7 @@ export default function SettingsScreen() {
   }, [restoreBusy, refreshExpenses, refreshSettings, showToast]);
 
   if (!snapshot) {
-    return (
-      <SafeAreaView style={{ backgroundColor: ts.bg.screen, flex: 1 }} edges={['top']}>
-        <View style={styles.centerBox}>
-          <ActivityIndicator color={ts.raw.primary} />
-          <Text style={[Typography.labelMd, { color: ts.raw.onSurfaceVariant, marginTop: Spacing.s3 }]}>
-            Loading settings
-          </Text>
-        </View>
-      </SafeAreaView>
-    );
+    return <SettingsSkeleton />;
   }
 
   const autoCaptureEnabled = settings.auto_capture_enabled === 'true';
@@ -1248,6 +1333,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.s1,
     marginBottom: Spacing.s2,
   },
+  skeletonSectionLabel: {
+    paddingHorizontal: Spacing.s1,
+    marginBottom: Spacing.s2,
+  },
+  skeletonStack: { gap: Spacing.s1 },
   sectionLabelInline: {
     letterSpacing: 1.2,
     textTransform: 'uppercase',

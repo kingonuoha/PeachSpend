@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { AppState, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -21,6 +21,7 @@ import { createNativeAutoCaptureAdapter } from '../data/NativeAutoCaptureAdapter
 import { buildDiagnosticActivity, type AutoCapturePermissionState, type AutoCaptureSourceDescriptor, type CaptureEventStatus, type DiagnosticActivityState } from '../data/contracts';
 import { databaseService } from '../services/DatabaseService';
 import { PeachButton } from '../components/ui/PeachButton';
+import { Skeleton } from '../components/ui/Skeleton';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { formatCurrency } from '../utils/currency';
 import { formatRelativeDateWithTime } from '../utils/dateFormat';
@@ -51,6 +52,39 @@ function humanizeStatus(status: string): string {
     .split('_')
     .map(word => word.charAt(0).toUpperCase() + word.slice(1))
     .join(' ');
+}
+
+// One-row loading mirror shared by the three diagnostic cards. Replaces the old
+// centered spinner with the same chip, text-line, and tail-pill geometry the
+// loaded rows use, so content lands inside the card with no layout shift. The row
+// exposes one busy progressbar label so the loading state stays announced now that
+// the old spinner text is gone.
+function CardLoadingSkeleton({
+  chipSize,
+  tail,
+  label,
+}: {
+  chipSize: number;
+  tail: 'pill' | 'amountPill';
+  label: string;
+}) {
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel={label}
+      accessibilityState={{ busy: true }}
+      style={styles.loadingRow}
+    >
+      <Skeleton width={chipSize} height={chipSize} />
+      <View style={[styles.flex, styles.skeletonStack]}>
+        <Skeleton width="55%" height={12} />
+        <Skeleton width="70%" height={10} />
+      </View>
+      {tail === 'amountPill' ? <Skeleton width={48} height={10} style={styles.activityAmount} /> : null}
+      <Skeleton width={64} height={22} borderRadius={Radii.full} />
+    </View>
+  );
 }
 
 export default function AutoCaptureSettingsScreen() {
@@ -327,10 +361,7 @@ export default function AutoCaptureSettingsScreen() {
             style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
           >
             {loading && permission === null ? (
-              <View style={styles.loadingRow}>
-                <ActivityIndicator color={ts.icon.primary} />
-                <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Checking notification access...</Text>
-              </View>
+              <CardLoadingSkeleton chipSize={34} tail="pill" label="Checking notification access" />
             ) : (
               <>
                 <View style={styles.permissionTop}>
@@ -388,10 +419,7 @@ export default function AutoCaptureSettingsScreen() {
 
               <View style={[styles.card, styles.listCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
                 {loading && permission === null ? (
-                  <View style={styles.loadingRow}>
-                    <ActivityIndicator color={ts.icon.primary} />
-                    <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Checking installed sources...</Text>
-                  </View>
+                  <CardLoadingSkeleton chipSize={36} tail="pill" label="Checking installed sources" />
                 ) : sources.length === 0 ? (
                   <View style={styles.emptyState}>
                     <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
@@ -449,10 +477,7 @@ export default function AutoCaptureSettingsScreen() {
 
           <View style={[styles.card, styles.listCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
             {loading && activity === null ? (
-              <View style={styles.loadingRow}>
-                <ActivityIndicator color={ts.icon.primary} />
-                <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Checking recent activity...</Text>
-              </View>
+              <CardLoadingSkeleton chipSize={32} tail="amountPill" label="Checking recent activity" />
             ) : activity && activity.status === 'ready' ? (
               activity.entries.map((entry, index) => {
                 const tag = activityTag(entry.status);
@@ -590,6 +615,7 @@ const styles = StyleSheet.create({
   },
   retryHit: { minHeight: MIN_TOUCH_TARGET, justifyContent: 'center', paddingHorizontal: Spacing.s2 },
   loadingRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, minHeight: MIN_TOUCH_TARGET },
+  skeletonStack: { gap: Spacing.s1 },
   permissionTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3, marginBottom: Spacing.s3 },
   permissionLabelGroup: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
   permissionIcon: { width: 34, height: 34, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },

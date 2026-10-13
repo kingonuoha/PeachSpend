@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   FlatList,
   Modal,
   Pressable,
+  RefreshControl,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -25,13 +26,14 @@ import {
   Trash2,
 } from 'lucide-react-native';
 
-import { Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
+import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { SearchFilterBar } from '../../components/ui/SearchFilterBar';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useToast } from '../../components/ui/ToastProvider';
 import { aiChatService } from '../../services/AIChatService';
 import { databaseService } from '../../services/DatabaseService';
@@ -197,6 +199,114 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+// White at 16 percent: the existing vault icon and hero glass convention, so
+// skeleton bars on the gradient vault read like the real white-on-brand surface.
+const VAULT_SKELETON_TINT = `${Colors.white}26`;
+const SKELETON_MODEL_ROW_COUNT = 2;
+
+// Loading placeholder. Mirrors the loaded vault block, provider sections, key
+// cards, model selector, and two model rows using the real content/gap styles so
+// content lands with no layout shift. Decorative blocks stay hidden from assistive
+// tech; the container exposes a single busy label, matching the Home convention.
+function ChatSettingsSkeleton() {
+  const ts = useThemeStyles();
+  const vaultTint = { backgroundColor: VAULT_SKELETON_TINT };
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading AI chat settings"
+      accessibilityState={{ busy: true }}
+      style={{ flex: 1 }}
+    >
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.content}
+      >
+        <LinearGradient
+          colors={ts.isDark ? Gradients.dark : Gradients.light}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+          style={[styles.vaultCard, { borderColor: ts.raw.primaryBorder + '40' }]}
+        >
+          <View style={styles.vaultRow}>
+            <Skeleton width={32} height={32} style={vaultTint} />
+            <View style={[styles.vaultText, styles.skeletonStack]}>
+              <Skeleton width="55%" height={12} style={vaultTint} />
+              <Skeleton width="85%" height={10} style={vaultTint} />
+            </View>
+          </View>
+        </LinearGradient>
+
+        <View style={styles.sectionHead}>
+          <Skeleton width={140} height={11} />
+          <Skeleton width={80} height={10} />
+        </View>
+
+        <LuminousCard variant="low" style={styles.keyCard}>
+          <View style={styles.keyCardHead}>
+            <View style={styles.keyIdentity}>
+              <Skeleton width={24} height={24} />
+              <Skeleton width={140} height={12} />
+            </View>
+            <Skeleton width={64} height={22} borderRadius={Radii.full} />
+          </View>
+          <Skeleton width="100%" height={46} borderRadius={Radii.sm} />
+          <View style={styles.keyCardFoot}>
+            <Skeleton width="40%" height={10} />
+            <Skeleton width={72} height={32} borderRadius={Radii.sm} />
+          </View>
+        </LuminousCard>
+
+        <LuminousCard variant="low" style={styles.keyCard}>
+          <View style={styles.keyCardHead}>
+            <View style={styles.keyIdentity}>
+              <Skeleton width={24} height={24} />
+              <Skeleton width={120} height={12} />
+            </View>
+            <Skeleton width={80} height={22} borderRadius={Radii.full} />
+          </View>
+          <Skeleton width="100%" height={46} borderRadius={Radii.sm} />
+          <View style={styles.keyCardFoot}>
+            <Skeleton width="45%" height={10} />
+            <Skeleton width={72} height={32} borderRadius={Radii.sm} />
+          </View>
+        </LuminousCard>
+
+        <View style={styles.sectionHead}>
+          <View style={styles.sectionHeadText}>
+            <Skeleton width={110} height={11} />
+            <Skeleton width={150} height={10} />
+          </View>
+          <Skeleton width={72} height={32} borderRadius={Radii.sm} />
+        </View>
+
+        <View style={[styles.providerTabs, { backgroundColor: ts.bg.screen, borderColor: ts.raw.outline }]}>
+          <Skeleton width="100%" height={44} borderRadius={Radii.sm} />
+        </View>
+
+        <Skeleton width="100%" height={44} borderRadius={Radii.sm} />
+
+        {Array.from({ length: SKELETON_MODEL_ROW_COUNT }).map((_, index) => (
+          <View
+            key={index}
+            style={[styles.modelRow, { backgroundColor: ts.bg.low, borderColor: ts.raw.outline }]}
+          >
+            <Skeleton width={16} height={16} borderRadius={Radii.full} />
+            <View style={styles.modelMain}>
+              <View style={styles.modelTitleRow}>
+                <Skeleton width={index === 0 ? 130 : 100} height={13} />
+                <Skeleton width={52} height={18} borderRadius={Radii.sm} />
+              </View>
+            </View>
+            <Skeleton width={48} height={10} />
+          </View>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function ChatSettingsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
@@ -218,6 +328,7 @@ export default function ChatSettingsScreen() {
   const [openRouterRevealed, setOpenRouterRevealed] = useState(false);
   const [savingKey, setSavingKey] = useState<AiProvider | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshingPull, setRefreshingPull] = useState(false);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -253,6 +364,21 @@ export default function ChatSettingsScreen() {
     setActiveGeminiModel(geminiSetting ?? '');
     setActiveOpenRouterModel(openRouterSetting ?? '');
   }, []);
+
+  // Pull-to-refresh variant. Re-reads every settings surface through the same
+  // loadScreen contract but never flips the loading flag, so the loaded list does
+  // not flash back into the skeleton state. A failed pull keeps the current
+  // content and surfaces the error banner instead.
+  const refreshAll = useCallback(async () => {
+    setRefreshingPull(true);
+    try {
+      await loadScreen();
+    } catch {
+      setErrorNotice('Settings could not be refreshed. Try again.');
+    } finally {
+      setRefreshingPull(false);
+    }
+  }, [loadScreen]);
 
   useEffect(() => {
     let active = true;
@@ -708,12 +834,7 @@ export default function ChatSettingsScreen() {
       </View>
 
       {loading ? (
-        <View style={styles.loadingBox}>
-          <ActivityIndicator size="small" color={ts.raw.primary} />
-          <Text style={[Typography.labelMd, { color: ts.raw.onSurfaceVariant }]}>
-            Loading settings...
-          </Text>
-        </View>
+        <ChatSettingsSkeleton />
       ) : (
         <FlatList
           data={filteredModels}
@@ -744,6 +865,14 @@ export default function ChatSettingsScreen() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.content}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshingPull}
+              onRefresh={() => void refreshAll()}
+              tintColor={ts.raw.primary}
+              colors={[ts.raw.primary]}
+            />
+          }
         />
       )}
 
@@ -896,6 +1025,7 @@ const styles = StyleSheet.create({
   },
   sectionHeadText: { flex: 1, minWidth: 0 },
   sectionLabel: { letterSpacing: 1.6, textTransform: 'uppercase' },
+  skeletonStack: { gap: Spacing.s1 },
 
   keyCard: { marginBottom: Spacing.s3 },
   keyCardHead: {
