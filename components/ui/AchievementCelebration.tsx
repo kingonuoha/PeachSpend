@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   Modal,
   ScrollView,
   StyleSheet,
@@ -14,7 +15,6 @@ import Animated, {
   cancelAnimation,
   Easing,
   interpolate,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
@@ -23,6 +23,11 @@ import Animated, {
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
+// runOnJS is deprecated and scheduled for removal in the next major release, so
+// the exit callback crosses to the RN thread with scheduleOnRN instead, the form
+// POLISH Section 2 mandates for this pass.
+// https://docs.swmansion.com/react-native-worklets/docs/threading/runOnJS
+import { scheduleOnRN } from 'react-native-worklets';
 import { ArrowRight, Flame, Info, Sparkles, X } from 'lucide-react-native';
 
 import { BadgeGlyph } from './BadgeGlyph';
@@ -124,6 +129,12 @@ function ConfettiParticle({ particle }: { particle: Particle }) {
 
   return (
     <Animated.View
+      // Decorative only. The pair sets `pointer-events: none` on every particle
+      // (code.html 117) and the ray and aura already opt out of the accessibility
+      // tree, so the confetti opts out with them instead of shipping 24 unnamed
+      // nodes a screen reader can land on.
+      pointerEvents="none"
+      importantForAccessibility="no-hide-descendants"
       style={[
         styles.particle,
         { width: particle.size, height: particle.size * 0.6, backgroundColor: particle.color },
@@ -144,6 +155,9 @@ export default function AchievementCelebration({
   const { width, height } = useWindowDimensions();
 
   const dismissingRef = useRef(false);
+  // Mount target for the Section 7 focus move. The host only mounts this surface
+  // while a celebration is running, so mount is the opening edge.
+  const cardRef = useRef<View>(null);
   const [dismissing, setDismissing] = useState(false);
   const overlayOpacity = useSharedValue(0);
   // Drives the exit fade. Kept separate from the entrance opacity so the
@@ -210,13 +224,24 @@ export default function AchievementCelebration({
     };
   }, [reduceMotion, overlayOpacity, cardScale, cardTranslate, badgeScale, badgeRotate, auraScale, auraOpacity, raySpin]);
 
+  // POLISH Section 7: move screen-reader focus into the celebration when it opens.
+  // Best effort, the same AccessibilityInfo approach as EditProfileSheet and
+  // BadgeDetailModal; the card is not marked `accessible`, so focus lands on the
+  // first focusable child and the close control and both actions stay reachable.
+  // Returning focus to the opening control belongs to the host screen.
+  useEffect(() => {
+    if (cardRef.current !== null) {
+      AccessibilityInfo.sendAccessibilityEvent(cardRef.current, 'focus');
+    }
+  }, []);
+
   // Exit fade runs from an effect (never from a handler) so the dismissal path
   // does not mutate a shared value read by the entrance effect. The overlay
   // stays mounted until the fade finishes, then the origin unmounts it.
   useEffect(() => {
     if (!dismissing) return;
     exitProgress.value = withTiming(0, { duration: EXIT_DURATION, easing: Easing.out(Easing.quad) }, (finished) => {
-      if (finished) runOnJS(onDismiss)();
+      if (finished) scheduleOnRN(onDismiss);
     });
     return () => cancelAnimation(exitProgress);
   }, [dismissing, exitProgress, onDismiss]);
@@ -313,7 +338,7 @@ export default function AchievementCelebration({
           <View />
         </ScalePressable>
 
-        <Animated.View style={[styles.cardWrap, cardStyle]}>
+        <Animated.View ref={cardRef} style={[styles.cardWrap, cardStyle]}>
           <LuminousCard
             variant={ts.isDark ? 'low' : 'high'}
             style={[styles.card, { maxHeight: cardMaxHeight }]}
