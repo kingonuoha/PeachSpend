@@ -218,7 +218,7 @@ function RecapSkeleton() {
           <Skeleton width="78%" height={26} />
           <Skeleton width="96%" height={20} style={{ marginTop: Spacing.s2 }} />
           <Skeleton width="64%" height={20} />
-          <View style={styles.kpiRow}>
+          <View style={[styles.kpiRow, { borderTopColor: ts.raw.outline }]}>
             <View style={[styles.kpiPill, { backgroundColor: ts.bg.low }]}>
               <Skeleton width="70%" height={13} />
               <Skeleton width="82%" height={20} style={styles.kpiValue} />
