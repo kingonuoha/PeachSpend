@@ -1,5 +1,5 @@
 import React, { useCallback, useState } from 'react';
-import { Linking, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { AccessibilityInfo, Linking, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Stack, useRouter } from 'expo-router';
 import Constants from 'expo-constants';
@@ -32,7 +32,11 @@ const BANNER_ICON_SIZE = 28;
 const FAQ_NUMBER_SIZE = 20;
 // Canonical answer indent is pl-7 (28px): the 20px number circle plus an 8px gap.
 const FAQ_ANSWER_INDENT = FAQ_NUMBER_SIZE + Spacing.s2;
-const CONTROL_HIT_SLOP = { top: 2, bottom: 2, left: 2, right: 2 };
+// The back control paints a 40pt circle (the pair's w-10 h-10, code.html 155).
+// POLISH Section 7 asks for 48dp on Android and the circle is frozen by Section
+// 0, so the bounding is carried in hitSlop only: 40 + 2*4 = 48, no layout or
+// visual change.
+const CONTROL_HIT_SLOP = { top: 4, bottom: 4, left: 4, right: 4 };
 // Decorative header-chip glyph tint (canonical text-purple-200).
 const HEADER_CHIP_ICON_COLOR = '#E9D5FF';
 
@@ -88,6 +92,11 @@ export default function SupportCenterScreen() {
   const insets = useSafeAreaInsets();
   const { showToast } = useToast();
   const [busy, setBusy] = useState(false);
+  // POLISH Section 7: the OS handoff failure is async, so it is spoken as well as
+  // rendered. iOS has no live region, so it speaks through announceForAccessibility;
+  // Android reads the polite live region rendered after the scroll view. This is
+  // file-local because ToastProvider is shared and out of scope for this unit.
+  const [intentFailure, setIntentFailure] = useState('');
   const appVersion = Constants.expoConfig?.version;
 
   const gradient = ts.isDark ? Gradients.dark : Gradients.light;
@@ -112,6 +121,11 @@ export default function SupportCenterScreen() {
       } catch {
         await Clipboard.setStringAsync(fallbackValue);
         showToast(unavailableCopy, 'error');
+        if (Platform.OS === 'ios') {
+          AccessibilityInfo.announceForAccessibility(unavailableCopy);
+        } else {
+          setIntentFailure(unavailableCopy);
+        }
       } finally {
         setBusy(false);
       }
@@ -385,6 +399,13 @@ export default function SupportCenterScreen() {
           </View>
         </ScrollView>
       </View>
+
+      {/* POLISH Section 7: Android speaks the external-intent failure through this
+          polite live region. The node is a 1x1 clipped transparent box, so it
+          renders nothing the locked pair does not show. */}
+      <View accessibilityLiveRegion="polite" style={styles.announcement}>
+        <Text>{intentFailure}</Text>
+      </View>
     </SafeAreaView>
   );
 }
@@ -616,5 +637,12 @@ const styles = StyleSheet.create({
   },
   footerSub: {
     textAlign: 'center',
+  },
+  announcement: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0,
+    overflow: 'hidden',
   },
 });
