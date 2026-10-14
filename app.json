@@ -4,6 +4,14 @@
     "slug": "PeachSpend",
     "owner": "kingonuoha01",
     "version": "2.3.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/a9eaaa77-1cef-4084-9d19-66190ca73606",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 5000
+    },
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "app",
