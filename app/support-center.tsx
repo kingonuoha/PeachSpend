@@ -115,6 +115,13 @@ export default function SupportCenterScreen() {
   const openExternal = useCallback(
     async (url: string, fallbackValue: string, unavailableCopy: string) => {
       if (busy) return;
+      // A live region only speaks when its content changes, so the previous
+      // failure is cleared at the start of every attempt. This clear commits in
+      // the press handler and the failure string commits later in the promise
+      // continuation, so the region genuinely goes copy, then empty, then copy
+      // again and every retry is announced on Android. Clearing in `finally`
+      // instead would batch both writes into one commit and silence it.
+      setIntentFailure('');
       setBusy(true);
       try {
         await Linking.openURL(url);

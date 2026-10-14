@@ -21,7 +21,10 @@ import { Colors, Gradients, LightTheme, Radii, Spacing, Typography } from '../..
 
 const MAX_CONTENT_WIDTH = 640;
 const BACK_SIZE = 40;
-const CONTROL_HIT_SLOP = { top: 2, bottom: 2, left: 2, right: 2 };
+// 40pt visual plus 4 per side reaches the 48dp Android floor in POLISH Section 7
+// (and clears 44pt on iOS). The deficit rides in hitSlop, never in layout,
+// because the visual size is frozen by Section 0.
+const CONTROL_HIT_SLOP = { top: 4, bottom: 4, left: 4, right: 4 };
 const HERO_CHIP_SIZE = 40;
 const HERO_RADIUS = Radii.xl;
 const GLOW_SIZE = 144;

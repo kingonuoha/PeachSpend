@@ -301,7 +301,10 @@ export default function ProfileScreen() {
   const [themeBusy, setThemeBusy] = useState(false);
   // POLISH Section 7: the theme controls are async, so each outcome is announced.
   // iOS has no live region, so it speaks through announceForAccessibility; Android
-  // reads the polite live region rendered after the scroll view.
+  // reads the polite live region rendered after the scroll view. A live region only
+  // speaks when its content changes, so every attempt clears this string at entry
+  // before the outcome is written, otherwise the first result is spoken and every
+  // identical repeat after it is silent on Android.
   const [themeAnnouncement, setThemeAnnouncement] = useState('');
 
   const announceThemeOutcome = useCallback((message: string) => {
@@ -377,6 +380,10 @@ export default function ProfileScreen() {
 
   const applyThemePack = async (id: string) => {
     if (themeBusy || !snapshot || snapshot.themePack.activePackId === id) return;
+    // See the themeAnnouncement declaration: clear at entry so the live region
+    // content differs on every attempt. The clear commits in the press handler
+    // and the outcome commits after the await, so they never batch together.
+    setThemeAnnouncement('');
     setThemeBusy(true);
     try {
       const result = await setThemePack(settingsPort, id);
@@ -397,6 +404,8 @@ export default function ProfileScreen() {
 
   const applyThemeMode = async (mode: 'light' | 'dark') => {
     if (themeBusy) return;
+    // Same entry clear as applyThemePack, see the themeAnnouncement declaration.
+    setThemeAnnouncement('');
     setThemeBusy(true);
     try {
       const state = await setThemeMode(settingsPort, mode);
