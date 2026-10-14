@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
-  Platform,
   Pressable,
   Text,
   TextInput,
@@ -754,11 +753,11 @@ export default function ChatScreen() {
   const { height: windowHeight } = useWindowDimensions();
   // Surface 6 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
   // math, but measured and applied on the UI thread so the message list tracks the
-  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
-  // soft-input resize already shrinks the window, so adding this padding there would
-  // double-count the keyboard and overlap the input bar. Hooks run unconditionally;
-  // only the style is gated at render time.
-  const isIOS = Platform.OS === 'ios';
+  // keyboard without waiting on a JS bridge frame. Applies on both platforms: per the
+  // Reanimated docs, while useAnimatedKeyboard is mounted it disables Android's default
+  // window resize for the whole app, so Android gets no system resize and this padding
+  // is the only keyboard handling. With the keyboard closed the height is 0, so the
+  // resting layout is unchanged. Hooks run unconditionally.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
@@ -1659,7 +1658,7 @@ export default function ChatScreen() {
         </View>
       </View>
 
-      <Animated.View style={[{ flex: 1 }, isIOS ? keyboardPaddingStyle : null]}>
+      <Animated.View style={[{ flex: 1 }, keyboardPaddingStyle]}>
         {importMode ? (
           <View style={{ paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 }}>
             <View style={{ alignSelf: 'center', width: '100%', maxWidth: MAX_CONTENT_WIDTH, flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2, padding: Spacing.s3, borderRadius: Radii.md, backgroundColor: ts.raw.purple100, borderWidth: 1, borderColor: ts.border.primary20 }}>

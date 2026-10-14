@@ -3,7 +3,6 @@ import {
   AccessibilityInfo,
   Image,
   Modal,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -95,11 +94,11 @@ export function EditProfileSheet({
 
   // Surface 10 keyboard avoidance. Replaces KeyboardAvoidingView with the same
   // padding math, but measured and applied on the UI thread so the name input
-  // tracks the keyboard without waiting on a JS bridge frame. iOS only: Android's
-  // default soft-input resize already shrinks the window, so adding this padding
-  // there would double-count the keyboard. Hooks run unconditionally; only the
-  // style is gated at render time.
-  const isIOS = Platform.OS === 'ios';
+  // tracks the keyboard without waiting on a JS bridge frame. Applies on both
+  // platforms: per the Reanimated docs, while useAnimatedKeyboard is mounted it
+  // disables Android's default window resize for the whole app, so Android gets no
+  // system resize and this padding is the only keyboard handling. With the keyboard
+  // closed the height is 0, so the resting layout is unchanged.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
@@ -268,7 +267,7 @@ export function EditProfileSheet({
     >
       <GestureHandlerRootView style={{ flex: 1 }}>
         <Animated.View
-          style={[{ flex: 1, justifyContent: 'flex-end' }, isIOS ? keyboardPaddingStyle : null]}
+          style={[{ flex: 1, justifyContent: 'flex-end' }, keyboardPaddingStyle]}
         >
           <Animated.View
             pointerEvents="none"

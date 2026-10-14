@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Modal,
-  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -219,11 +218,11 @@ export default function RecurringScreen() {
 
   // Surface 8 keyboard avoidance. Replaces KeyboardAvoidingView with the same
   // padding math, but measured and applied on the UI thread so the add/edit sheet
-  // tracks the keyboard without waiting on a JS bridge frame. iOS only: Android's
-  // default soft-input resize already shrinks the window, so adding this padding
-  // there would double-count the keyboard. Hooks run unconditionally; only the
-  // style is gated at render time.
-  const isIOS = Platform.OS === 'ios';
+  // tracks the keyboard without waiting on a JS bridge frame. Applies on both
+  // platforms: per the Reanimated docs, while useAnimatedKeyboard is mounted it
+  // disables Android's default window resize for the whole app, so Android gets no
+  // system resize and this padding is the only keyboard handling. With the keyboard
+  // closed the height is 0, so the resting layout is unchanged.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
@@ -654,7 +653,7 @@ export default function RecurringScreen() {
         animationType={reduceMotion ? 'none' : 'slide'}
         onRequestClose={closeForm}
       >
-        <Animated.View style={[styles.modalRoot, isIOS ? keyboardPaddingStyle : null]}>
+        <Animated.View style={[styles.modalRoot, keyboardPaddingStyle]}>
           <Pressable onPress={closeForm} accessibilityRole="button" accessibilityLabel="Dismiss template editor" style={[styles.backdrop, { backgroundColor: ts.bg.overlay }]} />
           <View
             accessibilityViewIsModal
