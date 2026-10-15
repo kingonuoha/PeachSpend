@@ -10,7 +10,7 @@ import { SqliteCaptureRepository } from '../data/CaptureRepository';
 import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSettings, type CaptureCandidate, type CaptureRepository, type OnboardingSettings, type OnboardingSettingsStore } from '../data/contracts';
 import { deleteOwnedReceiptImage, isOwnedReceiptImage } from '../utils/ownedReceiptImage';
 import { formatCurrency, resolveCurrency } from '../utils/currency';
-import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense } from '../data/SettingsContracts';
+import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense, parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
 import { CategoryService } from '../data/CategoryService';
 import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../data/RecurringDataService';
 import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
@@ -448,17 +448,21 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // follows the setup currency so Home never reconverts a value the user typed in
   // the currency they chose during setup. The join date is written here so S-05
   // has a real install date; existing installs fall back to their earliest record.
+  // BUG-09-04a: the typed budget goes through the one canonical write rule, so a
+  // thousands separator, a currency symbol, or letters can no longer be stored as
+  // the budget. An entry that cannot be parsed is not written (E-12), and a blank
+  // entry keeps its existing meaning of no budget row at all.
   async completeOnboarding(settings: OnboardingSettings): Promise<void> {
     const db = await this.getDb();
     const profileName = settings.profileName?.trim();
-    const monthlyBudget = settings.monthlyBudget?.trim();
+    const storedBudget = toStoredBudget(settings.monthlyBudget);
 
     await db.execAsync('BEGIN');
     try {
       await this.writePublicSetting(db, 'currency', settings.currency);
       await this.writePublicSetting(db, 'budget_currency', settings.currency);
       if (profileName) await this.writePublicSetting(db, 'profile_name', profileName);
-      if (monthlyBudget) await this.writePublicSetting(db, 'monthly_budget', monthlyBudget);
+      if (storedBudget !== null) await this.writePublicSetting(db, 'monthly_budget', storedBudget);
       await this.writePublicSetting(db, 'profile_join_date', String(Date.now()));
       await this.writePublicSetting(db, 'onboarding_complete', 'true');
       await db.execAsync('COMMIT');
@@ -848,7 +852,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async checkAchievements(): Promise<string[]> {
     const db = await this.getDb();
     const allSettings = await this.getAllSettings();
-    const monthlyBudget = parseFloat(allSettings.monthly_budget) || 0;
+    const monthlyBudget = parseStoredBudget(allSettings.monthly_budget);
     const streak = monthlyBudget > 0 ? await this.getStreak() : 0;
 
     const expenseCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses'))?.count || 0;

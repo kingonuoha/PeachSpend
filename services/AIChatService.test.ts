@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   deleteExpense: vi.fn(),
   updateSetting: vi.fn(),
   updateCategoryColor: vi.fn(),
+  getBudgetStatus: vi.fn(),
   hasSecret: vi.fn(),
   getSecret: vi.fn(),
 }));
@@ -110,6 +111,15 @@ describe('AI chat tiered actions', () => {
     const result = await aiChatService.executeChatAction({ kind: 'update_budget', amount: 500 }, 'approve');
     expect(result).toEqual({ status: 'settings_applied', tier: 2, kind: 'update_budget', actionAuthorized: true });
     expect(mocks.updateSetting).toHaveBeenCalledWith('monthly_budget', '500');
+  });
+
+  // BUG-09-04a: one canonical budget write, so no writer can store a string a
+  // strict reader refuses. `String(NaN)` was the hole this closes.
+  it('refuses a non-finite budget amount instead of writing it', async () => {
+    mocks.updateSetting.mockResolvedValue(undefined);
+    const result = await aiChatService.executeChatAction({ kind: 'update_budget', amount: Number.NaN }, 'approve');
+    expect(result).toEqual({ status: 'unsupported', tier: 2, kind: 'update_budget', actionAuthorized: true });
+    expect(mocks.updateSetting).not.toHaveBeenCalled();
   });
 
   it('fires the shared achievement and notification hooks for a confirmed chat expense', async () => {
@@ -264,5 +274,69 @@ describe('AI chat import-context producer (FR-12.1/FR-12.6)', () => {
     providerMocks.chatWithProvider.mockResolvedValue({ text: '[]', provider: 'gemini', model: 'm' });
 
     await expect(aiChatService.extractImportBatch({ text: 'nothing usable here' })).resolves.toEqual([]);
+  });
+});
+
+// BUG-09-04a read side: two more readers of the same stored key used parseFloat, so
+// a stored "66,000" reached the prompt and the forecast as a cap of 66 that the user
+// never set.
+describe('AI chat reads the stored budget strictly (BUG-09-04a)', () => {
+  const setStoredBudget = (monthlyBudget: string) => {
+    mocks.getAllSettings.mockResolvedValue({ monthly_budget: monthlyBudget, currency: 'NGN' });
+    mocks.getSetting.mockImplementation(async (key: string) => {
+      switch (key) {
+        case 'chat_provider': return 'gemini';
+        case 'chat_gemini_model': return 'gemini-2.5-flash';
+        case 'monthly_budget': return monthlyBudget;
+        case 'currency': return 'NGN';
+        default: return null;
+      }
+    });
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSecret.mockResolvedValue('test-key');
+    mocks.getChatHistory.mockResolvedValue([]);
+    mocks.saveChatMessage.mockResolvedValue(undefined);
+    mocks.getMonthlySummary.mockResolvedValue({ totalSpent: 1000 });
+    mocks.getIncomeForPeriod.mockResolvedValue(0);
+    mocks.getReimbursableTotal.mockResolvedValue({ total: 0, expenses: [] });
+    mocks.getExpensesByCategory.mockResolvedValue([]);
+    mocks.getRecentExpenses.mockResolvedValue([]);
+    mocks.getBudgetStatus.mockResolvedValue({ spent: 1000, remaining: 0, usedPercent: 0, dailySpendRate: 0, daysRemaining: 0 });
+    providerMocks.chatWithProvider.mockResolvedValue({ text: 'Nothing unusual.', provider: 'gemini', model: 'm' });
+  });
+
+  it('tells the model the budget is unset rather than the first group of a grouped value', async () => {
+    // The static summary is cached for 60s, so the read is forced the same way a
+    // cold start does it.
+    (aiChatService as unknown as { cachedSummary: null }).cachedSummary = null;
+    setStoredBudget('66,000');
+
+    await aiChatService.sendMessage('show me recent expenses');
+
+    const request = providerMocks.chatWithProvider.mock.calls[0][1] as ChatProviderRequest;
+    const systemMessage = request.messages[0].content as string;
+    expect(systemMessage).toContain('Monthly budget: ₦0.00 (0% used)');
+    expect(systemMessage).not.toContain('₦66.00');
+  });
+
+  it('passes a budget of zero to the forecast and budget slices when the stored value cannot be parsed', async () => {
+    setStoredBudget('66,000');
+
+    await aiChatService.sendMessage('forecast my budget');
+
+    expect(mocks.getBudgetStatus).toHaveBeenCalledTimes(2);
+    expect(mocks.getBudgetStatus).toHaveBeenNthCalledWith(1, 0, expect.any(Number), expect.any(Number));
+    expect(mocks.getBudgetStatus).toHaveBeenNthCalledWith(2, 0, expect.any(Number), expect.any(Number));
+  });
+
+  it('still passes a real stored budget to the budget slice', async () => {
+    setStoredBudget('100000');
+
+    await aiChatService.sendMessage('how am I doing on budget?');
+
+    expect(mocks.getBudgetStatus).toHaveBeenCalledWith(100000, expect.any(Number), expect.any(Number));
   });
 });

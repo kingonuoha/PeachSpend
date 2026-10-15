@@ -235,6 +235,8 @@ describe('DatabaseService achievement currency descriptions', () => {  it('uses 
 
 describe('DatabaseService atomic onboarding completion', () => {
   const upsert = 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)';
+  const monthlyBudgetWrites = () =>
+    database.runAsync.mock.calls.filter(call => (call[1] as [string, string])[0] === 'monthly_budget');
 
   it('writes every onboarding value inside one transaction and marks complete last', async () => {
     await databaseService.completeOnboarding({ profileName: ' Peach ', currency: 'USD', monthlyBudget: '1200' });
@@ -269,6 +271,29 @@ describe('DatabaseService atomic onboarding completion', () => {
     expect(writtenKeys).toEqual(['currency', 'budget_currency', 'profile_join_date', 'onboarding_complete']);
   });
 
+  it('stores a typed budget in canonical form instead of the raw string', async () => {
+    await databaseService.completeOnboarding({ currency: 'NGN', monthlyBudget: ' 4500 ' });
+
+    expect(monthlyBudgetWrites()).toEqual([[upsert, ['monthly_budget', '4500']]]);
+  });
+
+  // BUG-09-04a: onboarding was the one writer that stored the typed budget raw, and
+  // "66,000" typed or pasted into the S-01 field became a stored cap of 66 on Home
+  // while Settings read the same string as not set. E-12 proposal, recorded: an
+  // entry that cannot be parsed is dropped rather than written, with no new UI on
+  // the locked S-01 pair.
+  it('refuses an entry it cannot parse instead of persisting the raw string', async () => {
+    for (const monthlyBudget of ['66,000', '66,000.5', 'NGN 66,000', '-4500', 'abc']) {
+      database.runAsync.mockClear();
+
+      await databaseService.completeOnboarding({ currency: 'NGN', monthlyBudget });
+
+      expect(monthlyBudgetWrites(), monthlyBudget).toEqual([]);
+      const writtenKeys = database.runAsync.mock.calls.map(call => (call[1] as [string, string])[0]);
+      expect(writtenKeys, monthlyBudget).toContain('onboarding_complete');
+    }
+  });
+
   it('registers profile name and budget so logs cannot echo them', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
@@ -277,6 +302,33 @@ describe('DatabaseService atomic onboarding completion', () => {
 
     expect(error).toHaveBeenCalledWith('[ERROR]:', 'settings_write_failed', '[REDACTED] spent [REDACTED]');
     error.mockRestore();
+  });
+});
+
+// BUG-09-04a read side: the achievement gate was a fourth reader of the same stored
+// key, and its parseFloat('66,000') read a cap of 66 that no one had set.
+describe('DatabaseService reads the stored budget strictly (BUG-09-04a)', () => {
+  const settingsRows = (monthlyBudget: string) => async (sql: string) =>
+    sql.includes('FROM achievements') ? [] : [{ key: 'monthly_budget', value: monthlyBudget }];
+
+  it('does not open the budget streak gate for a stored value a strict parse refuses', async () => {
+    database.getAllAsync.mockImplementation(settingsRows('66,000'));
+    const streak = vi.spyOn(databaseService, 'getStreak').mockResolvedValue(9);
+
+    await databaseService.checkAchievements();
+
+    expect(streak).not.toHaveBeenCalled();
+    streak.mockRestore();
+  });
+
+  it('still opens the budget streak gate for a stored numeric budget', async () => {
+    database.getAllAsync.mockImplementation(settingsRows('4500'));
+    const streak = vi.spyOn(databaseService, 'getStreak').mockResolvedValue(9);
+
+    await databaseService.checkAchievements();
+
+    expect(streak).toHaveBeenCalledTimes(1);
+    streak.mockRestore();
   });
 });
 

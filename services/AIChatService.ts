@@ -17,6 +17,7 @@ import {
   type ConversationHistoryState, type ModelRefreshOutcome, type ProviderKeyState,
 } from '../data/ProviderSettings';
 import { formatCurrency, resolveDisplayCurrency } from '../utils/currency';
+import { parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
 
 const MAX_HISTORY_MESSAGES = 50;
 const TRIM_HISTORY_TO = 40;
@@ -293,9 +294,17 @@ class AIChatService {
         if (resolution.status === 'discarded') return { status: 'discarded', tier: 2 };
         return { status: 'batch_saved', tier: 2, expenseIds: resolution.records.map(record => record.id), resolution };
       }
-      case 'update_budget':
-        await databaseService.updateSetting('monthly_budget', String(request.amount));
+      case 'update_budget': {
+        // Same canonical write as onboarding (BUG-09-04a): the amount reaches this
+        // boundary as a number, but a non-finite or negative one would still store
+        // a string no strict reader can honour, so it is refused rather than
+        // written. The Tier 2 vocabulary for a kind with no usable write is
+        // `unsupported`, and nothing is faked.
+        const stored = toStoredBudget(String(request.amount));
+        if (stored === null) return { status: 'unsupported', tier: 2, kind: request.kind };
+        await databaseService.updateSetting('monthly_budget', stored);
         return { status: 'settings_applied', tier: 2, kind: request.kind };
+      }
       case 'update_currency':
         await databaseService.updateSetting('currency', request.currency);
         return { status: 'settings_applied', tier: 2, kind: request.kind };
@@ -402,8 +411,9 @@ class AIChatService {
 
   private async buildStaticSummary(): Promise<StaticSummary> {
     const allSettings = await databaseService.getAllSettings();
-    const parsedBudget = Number.parseFloat(allSettings.monthly_budget);
-    const monthlyBudget = Number.isFinite(parsedBudget) && parsedBudget >= 0 ? parsedBudget : 0;
+    // One canonical budget read (BUG-09-04a): a strict parse, never a partial one,
+    // so the prompt cannot be told about a limit the user never set.
+    const monthlyBudget = parseStoredBudget(allSettings.monthly_budget);
     const currency = resolveDisplayCurrency(allSettings.currency);
     this.activeCurrency = currency;
 
@@ -466,7 +476,7 @@ class AIChatService {
           break;
         }
         case 'forecast': {
-          const budget = parseFloat((await databaseService.getSetting('monthly_budget')) || '0');
+          const budget = parseStoredBudget(await databaseService.getSetting('monthly_budget'));
           const budgetStatus = await databaseService.getBudgetStatus(budget, startOfMonth, endOfMonth);
           const projectedTotal = budgetStatus.dailySpendRate * budgetStatus.daysRemaining + budgetStatus.spent;
           data = `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${this.fmt(budgetStatus.remaining)}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`;
@@ -478,7 +488,7 @@ class AIChatService {
           break;
         }
         case 'budget_check': {
-          const budget = parseFloat((await databaseService.getSetting('monthly_budget')) || '0');
+          const budget = parseStoredBudget(await databaseService.getSetting('monthly_budget'));
           const budgetStatus = await databaseService.getBudgetStatus(budget, startOfMonth, endOfMonth);
           data = `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${this.fmt(budgetStatus.remaining)}\nUsed: ${budgetStatus.usedPercent.toFixed(1)}%\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`;
           break;
