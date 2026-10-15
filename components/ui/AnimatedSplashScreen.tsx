@@ -1,5 +1,14 @@
-import React, { useEffect } from 'react';
-import { View, Text, Image, Dimensions, StyleSheet, useWindowDimensions } from 'react-native';
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  View,
+  Text,
+  Image,
+  Dimensions,
+  StyleSheet,
+  useWindowDimensions,
+  type LayoutChangeEvent,
+  type TextLayoutEvent,
+} from 'react-native';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -36,6 +45,14 @@ const SPLASH_BRAND_PURPLE = LightTheme.primary;
 const SPLASH_ON_BRAND = Colors.onPrimary;
 const SPLASH_LABEL_COLOR = 'rgba(255, 255, 255, 0.7)';
 
+// The block's top edge is pinned at the y a one line tagline occupies, so a
+// wrapped second line grows downward into empty space instead of upward into
+// the mark above it (BUG-09-06). That y is derived from the block's measured
+// height at the running OS text scale; this constant is only the
+// pre-measurement fallback, the title line box plus the tagline margin plus one
+// tagline line box at the base scale.
+const TEXT_BLOCK_DESIGN_HEIGHT = 66;
+
 interface AnimatedSplashScreenProps {
   onFinish: () => void;
 }
@@ -48,6 +65,36 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
   // paints it. Clamped at zero so a degenerate window cannot yield a negative
   // width; at every real window the block is window minus two gutters.
   const textBlockWidth = Math.max(0, windowWidth - TEXT_BLOCK_GUTTER * 2);
+
+  // The block's rendered height and the tagline's own line metrics are measured
+  // so its one line height can be recovered at any OS text scale: any wrapped
+  // extra lines are subtracted from the block height. Anchoring the top edge at
+  // that one line height keeps the block in place when the tagline is one line
+  // and lets it grow downward when it is two.
+  const [blockHeight, setBlockHeight] = useState(0);
+  const [taglineLineHeight, setTaglineLineHeight] = useState(0);
+  const [taglineLineCount, setTaglineLineCount] = useState(1);
+
+  const handleBlockLayout = useCallback((event: LayoutChangeEvent) => {
+    setBlockHeight(event.nativeEvent.layout.height);
+  }, []);
+
+  const handleTaglineLayout = useCallback((event: TextLayoutEvent) => {
+    const lines = event.nativeEvent.lines;
+    if (lines.length > 0) {
+      setTaglineLineHeight(lines[0].height);
+      setTaglineLineCount(lines.length);
+    }
+  }, []);
+
+  const wrappedExtraHeight =
+    taglineLineCount > 1 ? (taglineLineCount - 1) * taglineLineHeight : 0;
+  const oneLineBlockHeight =
+    blockHeight > 0 ? blockHeight - wrappedExtraHeight : TEXT_BLOCK_DESIGN_HEIGHT;
+  // bottom: SCREEN_HEIGHT * 0.32 places the block's bottom at 0.68 of the
+  // window; pinning the top there for a one line block reproduces that position
+  // exactly and extends downward once the tagline wraps.
+  const textBlockTop = SCREEN_HEIGHT * 0.68 - oneLineBlockHeight;
 
   const logoScale = useSharedValue(0);
   const logoTranslateY = useSharedValue(50);
@@ -122,11 +169,18 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
         resizeMode="contain"
       />
 
-      <Animated.View style={[styles.textContainer, { width: textBlockWidth }, textAnimatedStyle]}>
+      <Animated.View
+        style={[styles.textContainer, { width: textBlockWidth, top: textBlockTop }, textAnimatedStyle]}
+        onLayout={handleBlockLayout}
+      >
         <Text style={styles.title} maxFontSizeMultiplier={TEXT_BLOCK_MAX_FONT_SCALE}>
           PeachSpend
         </Text>
-        <Text style={styles.subtitle} maxFontSizeMultiplier={TEXT_BLOCK_MAX_FONT_SCALE}>
+        <Text
+          style={styles.subtitle}
+          maxFontSizeMultiplier={TEXT_BLOCK_MAX_FONT_SCALE}
+          onTextLayout={handleTaglineLayout}
+        >
           Peach of mind for your spendings
         </Text>
       </Animated.View>
@@ -172,8 +226,10 @@ const styles = StyleSheet.create({
     position: 'absolute',
     // Explicit left edge plus the window derived width centres the block by
     // geometry rather than by the parent centring a shrink wrapped measurement.
+    // The vertical edge is the top, applied inline from the measured one line
+    // height, so the block stays put when the tagline is one line and grows
+    // downward into empty space when it is two.
     left: TEXT_BLOCK_GUTTER,
-    bottom: SCREEN_HEIGHT * 0.32,
     alignItems: 'center',
   },
   title: {
