@@ -23,6 +23,57 @@ const ACHIEVEMENT_THRESHOLDS = {
   bigLeague: 10_000,
 } as const;
 
+// BUG-09-11a. Every number the achievement catalogue needs, in one statement, so a
+// save no longer pays for eight awaited aggregates. The min amount pair is a scalar
+// subquery rather than a second statement, and it is served by idx_expenses_amount
+// instead of the whole table sort the old `ORDER BY amount ASC LIMIT 1` caused. The
+// detail count is deliberately the same expression as before, `note != '' OR
+// is_reimbursable = 1`, so a null note still does not count as detail.
+const ACHIEVEMENT_TOTALS_SQL = `
+  SELECT
+    COUNT(*) AS expense_count,
+    COALESCE(SUM(CASE WHEN scanned = 1 THEN 1 ELSE 0 END), 0) AS scanned_count,
+    COALESCE(SUM(amount), 0) AS total_spent,
+    COUNT(DISTINCT category) AS distinct_categories,
+    COALESCE(SUM(CASE WHEN note IS NOT NULL AND note != '' THEN 1 ELSE 0 END), 0) AS note_count,
+    COALESCE(SUM(CASE WHEN (note IS NOT NULL AND note != '') OR is_reimbursable = 1 THEN 1 ELSE 0 END), 0) AS detail_count,
+    (SELECT amount FROM expenses ORDER BY amount ASC LIMIT 1) AS min_amount,
+    (SELECT currency FROM expenses ORDER BY amount ASC LIMIT 1) AS min_currency,
+    (SELECT COUNT(*) FROM recurring_templates) AS recurring_count
+  FROM expenses
+`;
+
+interface AchievementTotals {
+  expense_count: number;
+  scanned_count: number;
+  total_spent: number;
+  distinct_categories: number;
+  note_count: number;
+  detail_count: number;
+  min_amount: number | null;
+  min_currency: string | null;
+  recurring_count: number;
+}
+
+const EMPTY_ACHIEVEMENT_TOTALS: AchievementTotals = {
+  expense_count: 0,
+  scanned_count: 0,
+  total_spent: 0,
+  distinct_categories: 0,
+  note_count: 0,
+  detail_count: 0,
+  min_amount: null,
+  min_currency: null,
+  recurring_count: 0,
+};
+
+// The stored streak read from a settings snapshot the caller already loaded. Both
+// achievement passes used to read the whole settings table a second time through
+// getStreak() for this one number.
+function streakFromSettings(settings: Record<string, string>): number {
+  return parseInt(settings.last_streak) || 0;
+}
+
 // Public settings whose values are financial or personally identifying. Their
 // values are registered for logger redaction before persistence, so an error that
 // later echoes a bound parameter cannot surface the raw amount or profile name.
@@ -62,10 +113,17 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // through init(), so they all await this one promise instead.
   private initPromise: Promise<void> | null = null;
   // Schema state captured before the migration runner advances the file. A v1
-  // file reports 'v1' here even though user_version is 6 by the time any reader
+  // file reports 'v1' here even though user_version is 7 by the time any reader
   // sees it.
   private startupSchema: ContinuitySchemaState | null = null;
   private startupUserVersion = 0;
+
+  // One aggregate read shared by both achievement passes: checkAchievements and
+  // getBadgeProgress ask for the same nine numbers.
+  private async readAchievementTotals(db: SQLite.SQLiteDatabase): Promise<AchievementTotals> {
+    const row = await db.getFirstAsync<AchievementTotals>(ACHIEVEMENT_TOTALS_SQL);
+    return row ?? EMPTY_ACHIEVEMENT_TOTALS;
+  }
 
   async getCaptureRepository(): Promise<CaptureRepository> {
     return new SqliteCaptureRepository(await this.getDb());
@@ -849,73 +907,68 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   // Achievements & Streaks
+  //
+  // BUG-09-11a. This used to cost one statement per badge in the catalogue, plus eight
+  // aggregates, plus a second settings read: 38 round trips on a save, and the count
+  // grew with the catalogue. It is now three reads, a single settings snapshot, and
+  // the earned set read once instead of probed per badge. The badge catalogue, its
+  // order, and every threshold below are unchanged, so the ids returned and the order
+  // celebrations queue in are identical.
   async checkAchievements(): Promise<string[]> {
     const db = await this.getDb();
     const allSettings = await this.getAllSettings();
     const monthlyBudget = parseStoredBudget(allSettings.monthly_budget);
-    const streak = monthlyBudget > 0 ? await this.getStreak() : 0;
+    const streak = monthlyBudget > 0 ? streakFromSettings(allSettings) : 0;
 
-    const expenseCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses'))?.count || 0;
-    const scannedCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses WHERE scanned = 1'))?.count || 0;
-    const recurringCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM recurring_templates'))?.count || 0;
+    const totals = await this.readAchievementTotals(db);
     const exportCount = parseInt(allSettings.export_count) || 0;
-    const detailCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note != '' OR is_reimbursable = 1"))?.count || 0;
-    const totalSpent = (await db.getFirstAsync<{ total: number }>('SELECT SUM(amount) as total FROM expenses'))?.total || 0;
-    const distinctCategories = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(DISTINCT category) as count FROM expenses'))?.count || 0;
-    const minExpenseRecord = await db.getFirstAsync<{ min: number; currency: string }>(
-      'SELECT amount as min, currency FROM expenses ORDER BY amount ASC LIMIT 1'
-    );
-    const minExpense = minExpenseRecord?.min || 0;
-    const noteCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note IS NOT NULL AND note != ''"))?.count || 0;
+    const minExpense = totals.min_amount || 0;
+    const earnedIds = new Set((await db.getAllAsync<{ id: string }>('SELECT id FROM achievements')).map(row => row.id));
 
-    const badgeDefs: { id: string; check: () => Promise<boolean> }[] = [
+    const badgeDefs: { id: string; check: () => boolean }[] = [
       // Existing
-      { id: 'first_step', check: async () => expenseCount >= 1 },
-      { id: 'eagle_eye', check: async () => scannedCount >= 1 },
-      { id: 'on_repeat', check: async () => recurringCount >= 1 },
-      { id: 'paper_trail', check: async () => exportCount >= 1 },
-      { id: 'detail_devil', check: async () => detailCount >= 1 },
-      { id: 'week_warrior', check: async () => streak >= 7 },
-      { id: 'month_master', check: async () => streak >= 30 },
+      { id: 'first_step', check: () => totals.expense_count >= 1 },
+      { id: 'eagle_eye', check: () => totals.scanned_count >= 1 },
+      { id: 'on_repeat', check: () => totals.recurring_count >= 1 },
+      { id: 'paper_trail', check: () => exportCount >= 1 },
+      { id: 'detail_devil', check: () => totals.detail_count >= 1 },
+      { id: 'week_warrior', check: () => streak >= 7 },
+      { id: 'month_master', check: () => streak >= 30 },
       // Expense Milestones
-      { id: 'getting-started', check: async () => expenseCount >= 5 },
-      { id: 'regular', check: async () => expenseCount >= 25 },
-      { id: 'century', check: async () => expenseCount >= 100 },
+      { id: 'getting-started', check: () => totals.expense_count >= 5 },
+      { id: 'regular', check: () => totals.expense_count >= 25 },
+      { id: 'century', check: () => totals.expense_count >= 100 },
       // Scan Milestones
-      { id: 'sneak-peek', check: async () => scannedCount >= 3 },
-      { id: 'shutterbug', check: async () => scannedCount >= 15 },
-      { id: 'scanner-king', check: async () => scannedCount >= 50 },
+      { id: 'sneak-peek', check: () => totals.scanned_count >= 3 },
+      { id: 'shutterbug', check: () => totals.scanned_count >= 15 },
+      { id: 'scanner-king', check: () => totals.scanned_count >= 50 },
       // Streak Extensions
-      { id: 'fortnight', check: async () => streak >= 14 },
-      { id: 'season', check: async () => streak >= 60 },
-      { id: 'half-year-hero', check: async () => streak >= 180 },
+      { id: 'fortnight', check: () => streak >= 14 },
+      { id: 'season', check: () => streak >= 60 },
+      { id: 'half-year-hero', check: () => streak >= 180 },
       // Category Exploration
-      { id: 'variety', check: async () => distinctCategories >= 3 },
-      { id: 'explorer', check: async () => distinctCategories >= 5 },
-      { id: 'completionist', check: async () => distinctCategories >= 8 },
+      { id: 'variety', check: () => totals.distinct_categories >= 3 },
+      { id: 'explorer', check: () => totals.distinct_categories >= 5 },
+      { id: 'completionist', check: () => totals.distinct_categories >= 8 },
       // Spending & Saving
-      { id: 'saver', check: async () => minExpense > 0 && minExpense <= ACHIEVEMENT_THRESHOLDS.saver },
-      { id: 'shopper', check: async () => totalSpent >= ACHIEVEMENT_THRESHOLDS.shopper },
-      { id: 'big-league', check: async () => totalSpent >= ACHIEVEMENT_THRESHOLDS.bigLeague },
+      { id: 'saver', check: () => minExpense > 0 && minExpense <= ACHIEVEMENT_THRESHOLDS.saver },
+      { id: 'shopper', check: () => totals.total_spent >= ACHIEVEMENT_THRESHOLDS.shopper },
+      { id: 'big-league', check: () => totals.total_spent >= ACHIEVEMENT_THRESHOLDS.bigLeague },
       // Recurring & Notes
-      { id: 'habit', check: async () => recurringCount >= 2 },
-      { id: 'loyalist', check: async () => recurringCount >= 5 },
-      { id: 'novelist', check: async () => noteCount >= 5 },
+      { id: 'habit', check: () => totals.recurring_count >= 2 },
+      { id: 'loyalist', check: () => totals.recurring_count >= 5 },
+      { id: 'novelist', check: () => totals.note_count >= 5 },
       // Budget
-      { id: 'on-track', check: async () => streak >= 7 },
-      { id: 'disciplined', check: async () => streak >= 30 },
+      { id: 'on-track', check: () => streak >= 7 },
+      { id: 'disciplined', check: () => streak >= 30 },
     ];
 
     const newBadges: string[] = [];
     for (const badge of badgeDefs) {
-      const already = await db.getFirstAsync<{ earned_at: number }>('SELECT earned_at FROM achievements WHERE id = ?', [badge.id]);
-      if (!already) {
-        const earned = await badge.check();
-        if (earned) {
-          await db.runAsync('INSERT INTO achievements (id, earned_at) VALUES (?, ?)', [badge.id, Date.now()]);
-          newBadges.push(badge.id);
-        }
-      }
+      if (earnedIds.has(badge.id)) continue;
+      if (!badge.check()) continue;
+      await db.runAsync('INSERT INTO achievements (id, earned_at) VALUES (?, ?)', [badge.id, Date.now()]);
+      newBadges.push(badge.id);
     }
 
     return newBadges;
@@ -950,23 +1003,24 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     target: number;
   }[]> {
     const db = await this.getDb();
+    // One settings read for the pass, and the streak comes out of that snapshot rather
+    // than a second read of the settings table (BUG-09-11a). The streak is
+    // unconditional here, as it was before: the profile view shows streak progress even
+    // with no budget set.
     const allSettings = await this.getAllSettings();
-    const streak = await this.getStreak();
-
-    const expenseCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses'))?.count || 0;
-    const scannedCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses WHERE scanned = 1'))?.count || 0;
-    const recurringCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM recurring_templates'))?.count || 0;
+    const streak = streakFromSettings(allSettings);
+    const totals = await this.readAchievementTotals(db);
+    const expenseCount = totals.expense_count;
+    const scannedCount = totals.scanned_count;
+    const recurringCount = totals.recurring_count;
     const exportCount = parseInt(allSettings.export_count) || 0;
-    const detailCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note != '' OR is_reimbursable = 1"))?.count || 0;
-    const totalSpent = (await db.getFirstAsync<{ total: number }>('SELECT SUM(amount) as total FROM expenses'))?.total || 0;
-    const distinctCategoriesCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(DISTINCT category) as count FROM expenses'))?.count || 0;
-    const minExpenseRecord = await db.getFirstAsync<{ min: number; currency: string }>(
-      'SELECT amount as min, currency FROM expenses ORDER BY amount ASC LIMIT 1'
-    );
-    const minExpense = minExpenseRecord?.min || 0;
+    const detailCount = totals.detail_count;
+    const totalSpent = totals.total_spent;
+    const distinctCategoriesCount = totals.distinct_categories;
+    const minExpense = totals.min_amount || 0;
     const userCurrency = resolveCurrency(undefined, allSettings.currency);
-    const saverCurrency = resolveCurrency(minExpenseRecord?.currency, userCurrency);
-    const noteCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note IS NOT NULL AND note != ''"))?.count || 0;
+    const saverCurrency = resolveCurrency(totals.min_currency, userCurrency);
+    const noteCount = totals.note_count;
 
     const achievements = await db.getAllAsync<{ id: string; earned_at: number }>('SELECT * FROM achievements');
 
@@ -1015,8 +1069,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async getStreak(): Promise<number> {
-    const allSettings = await this.getAllSettings();
-    return parseInt(allSettings.last_streak) || 0;
+    return streakFromSettings(await this.getAllSettings());
   }
 
   async incrementStreak(): Promise<number> {

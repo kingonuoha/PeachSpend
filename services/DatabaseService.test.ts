@@ -40,6 +40,56 @@ const database: MockDatabase = {
   execAsync: vi.fn(),
 };
 
+// The single aggregate row the achievement pass reads since BUG-09-11a, with the same
+// column names the statement returns. Defaults are an empty account.
+type AggregateRow = {
+  expense_count: number;
+  scanned_count: number;
+  total_spent: number;
+  distinct_categories: number;
+  note_count: number;
+  detail_count: number;
+  min_amount: number | null;
+  min_currency: string | null;
+  recurring_count: number;
+};
+
+const aggregateTotals = (overrides: Partial<AggregateRow> = {}): AggregateRow => ({
+  expense_count: 0,
+  scanned_count: 0,
+  total_spent: 0,
+  distinct_categories: 0,
+  note_count: 0,
+  detail_count: 0,
+  min_amount: null,
+  min_currency: null,
+  recurring_count: 0,
+  ...overrides,
+});
+
+// The populated fixture used by the achievement regression tests. The numbers are the
+// ones measured in docs/phases/phase-09-ui-polish/bugfix-BUG-09-11-evidence.md for a
+// real database holding six expenses in three categories with notes, two reimbursable
+// rows, two recurring templates and three income rows.
+const POPULATED_FIXTURE: AggregateRow = {
+  expense_count: 6,
+  scanned_count: 2,
+  total_spent: 2500,
+  distinct_categories: 3,
+  note_count: 3,
+  detail_count: 4,
+  min_amount: 2.5,
+  min_currency: 'GBP',
+  recurring_count: 2,
+};
+
+const POPULATED_SETTINGS = [
+  { key: 'currency', value: 'EUR' },
+  { key: 'monthly_budget', value: '4500' },
+  { key: 'export_count', value: '1' },
+  { key: 'last_streak', value: '7' },
+];
+
 beforeEach(() => {
   vi.clearAllMocks();
   fileSystemLegacy.cacheDirectory = null;
@@ -202,9 +252,7 @@ describe('DatabaseService achievement currency descriptions', () => {  it('uses 
       return [{ key: 'currency', value: 'EUR' }];
     });
     database.getFirstAsync.mockImplementation(async (sql: string) => {
-      if (sql.includes('ORDER BY amount ASC')) return { min: 2, currency: 'GBP' };
-      if (sql.includes('SUM(amount)')) return { total: 1000 };
-      if (sql.includes('COUNT(DISTINCT')) return { count: 0 };
+      if (sql.includes('min_amount')) return aggregateTotals({ min_amount: 2, min_currency: 'GBP' });
       return { count: 0 };
     });
 
@@ -221,8 +269,7 @@ describe('DatabaseService achievement currency descriptions', () => {  it('uses 
       return [];
     });
     database.getFirstAsync.mockImplementation(async (sql: string) => {
-      if (sql.includes('ORDER BY amount ASC')) return { min: 2, currency: null };
-      if (sql.includes('SUM(amount)')) return { total: 0 };
+      if (sql.includes('min_amount')) return aggregateTotals({ min_amount: 2, min_currency: null });
       return { count: 0 };
     });
 
@@ -307,28 +354,143 @@ describe('DatabaseService atomic onboarding completion', () => {
 
 // BUG-09-04a read side: the achievement gate was a fourth reader of the same stored
 // key, and its parseFloat('66,000') read a cap of 66 that no one had set.
+//
+// BUG-09-11a moved the streak out of a second settings read and into the snapshot the
+// pass already loaded, so these two cases are now asserted where the user sees the
+// difference: whether the streak badges are awarded at all.
 describe('DatabaseService reads the stored budget strictly (BUG-09-04a)', () => {
   const settingsRows = (monthlyBudget: string) => async (sql: string) =>
-    sql.includes('FROM achievements') ? [] : [{ key: 'monthly_budget', value: monthlyBudget }];
+    sql.includes('FROM achievements')
+      ? []
+      : [{ key: 'monthly_budget', value: monthlyBudget }, { key: 'last_streak', value: '9' }];
+
+  const weeklyStreakBadges = (ids: string[]) => ids.filter(id => id === 'week_warrior' || id === 'on-track');
 
   it('does not open the budget streak gate for a stored value a strict parse refuses', async () => {
     database.getAllAsync.mockImplementation(settingsRows('66,000'));
-    const streak = vi.spyOn(databaseService, 'getStreak').mockResolvedValue(9);
+    database.getFirstAsync.mockResolvedValue(aggregateTotals());
 
-    await databaseService.checkAchievements();
+    const newBadges = await databaseService.checkAchievements();
 
-    expect(streak).not.toHaveBeenCalled();
-    streak.mockRestore();
+    expect(newBadges).toEqual([]);
+    expect(weeklyStreakBadges(newBadges)).toEqual([]);
   });
 
   it('still opens the budget streak gate for a stored numeric budget', async () => {
     database.getAllAsync.mockImplementation(settingsRows('4500'));
-    const streak = vi.spyOn(databaseService, 'getStreak').mockResolvedValue(9);
+    database.getFirstAsync.mockResolvedValue(aggregateTotals());
+
+    const newBadges = await databaseService.checkAchievements();
+
+    expect(newBadges).toContain('week_warrior');
+    expect(weeklyStreakBadges(newBadges)).toEqual(['week_warrior', 'on-track']);
+  });
+});
+
+// BUG-09-11a. The fan out collapsed into one aggregate read plus one achievements read.
+// These tests hold the two things that collapse could break: the badge values
+// themselves, and the statements the pass is allowed to issue.
+describe('DatabaseService achievement pass (BUG-09-11a)', () => {
+  const usePopulatedFixture = (earned: { id: string; earned_at: number | null }[] = []) => {
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM achievements')) return earned;
+      return POPULATED_SETTINGS;
+    });
+    database.getFirstAsync.mockResolvedValue(POPULATED_FIXTURE);
+  };
+
+  it('keeps every badge current and target value for the populated fixture', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    const badges = await databaseService.getBadgeProgress();
+
+    // Derived by hand from the fixture: 6 expenses in 3 categories with 3 notes and 4
+    // detail rows, 2 scanned, 2 recurring, 2500 spent with a 2.50 minimum, streak 7,
+    // 1 export. A change to any of those numbers moves a line here.
+    const expected: [string, number, number][] = [
+      ['first_step', 1, 1],
+      ['eagle_eye', 1, 1],
+      ['on_repeat', 1, 1],
+      ['week_warrior', 7, 7],
+      ['month_master', 7, 30],
+      ['paper_trail', 1, 1],
+      ['detail_devil', 1, 1],
+      ['getting-started', 5, 5],
+      ['regular', 6, 25],
+      ['century', 6, 100],
+      ['sneak-peek', 2, 3],
+      ['shutterbug', 2, 15],
+      ['scanner-king', 2, 50],
+      ['fortnight', 7, 14],
+      ['season', 7, 60],
+      ['half-year-hero', 7, 180],
+      ['variety', 3, 3],
+      ['explorer', 3, 5],
+      ['completionist', 3, 8],
+      ['saver', 1, 1],
+      ['shopper', 10, 10],
+      ['big-league', 2, 10],
+      ['habit', 2, 2],
+      ['loyalist', 2, 5],
+      ['novelist', 3, 5],
+      ['on-track', 7, 7],
+      ['disciplined', 7, 30],
+    ];
+
+    expect(badges.map(badge => [badge.id, badge.current, badge.target])).toEqual(expected);
+    expect(badges.find(badge => badge.id === 'first_step')?.earned_at).toBe(111);
+    expect(badges.filter(badge => badge.id !== 'first_step').every(badge => badge.earned_at === null)).toBe(true);
+  });
+
+  it('awards the same badge ids in the same order for the populated fixture', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    const newBadges = await databaseService.checkAchievements();
+
+    // Catalogue order, only the unearned ids whose check now passes.
+    expect(newBadges).toEqual([
+      'eagle_eye', 'on_repeat', 'paper_trail', 'detail_devil', 'week_warrior',
+      'getting-started', 'variety', 'saver', 'shopper', 'habit', 'on-track',
+    ]);
+    expect(database.runAsync.mock.calls.map(call => (call[1] as [string])[0])).toEqual(newBadges);
+  });
+
+  it('reads the whole pass in three statements, whatever the badge catalogue size', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
 
     await databaseService.checkAchievements();
 
-    expect(streak).toHaveBeenCalledTimes(1);
-    streak.mockRestore();
+    const settingsReads = database.getAllAsync.mock.calls.filter(call => (call[0] as string).includes('FROM settings'));
+    expect(settingsReads).toHaveLength(1);
+    expect(database.getAllAsync).toHaveBeenCalledTimes(2);
+    expect(database.getFirstAsync).toHaveBeenCalledTimes(1);
+    expect(database.getFirstAsync.mock.calls[0]?.[0]).toContain('AS min_amount');
+  });
+
+  it('reads the profile badge view in three statements and never re-reads settings', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    await databaseService.getBadgeProgress();
+
+    const settingsReads = database.getAllAsync.mock.calls.filter(call => (call[0] as string).includes('FROM settings'));
+    expect(settingsReads).toHaveLength(1);
+    expect(database.getAllAsync).toHaveBeenCalledTimes(2);
+    expect(database.getFirstAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('never reads income, so income rows cannot move a badge', async () => {
+    usePopulatedFixture([]);
+
+    await databaseService.checkAchievements();
+
+    const statements = [
+      ...database.getAllAsync.mock.calls.map(call => call[0] as string),
+      ...database.getFirstAsync.mock.calls.map(call => call[0] as string),
+      ...database.runAsync.mock.calls.map(call => call[0] as string),
+    ].join(' ');
+    expect(statements).not.toMatch(/income/i);
+    expect(statements).toMatch(/FROM expenses/);
+    expect(statements).toMatch(/recurring_templates/);
   });
 });
 
@@ -426,7 +588,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v1', userVersion: 0, currentVersion: 6, hasRecords: false,
+      schema: 'v1', userVersion: 0, currentVersion: 7, hasRecords: false,
     });
   });
 
@@ -439,7 +601,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v2', userVersion: 6, currentVersion: 6, hasRecords: true,
+      schema: 'v2', userVersion: 6, currentVersion: 7, hasRecords: true,
     });
   });
 
@@ -452,7 +614,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'none', userVersion: 0, currentVersion: 6, hasRecords: false,
+      schema: 'none', userVersion: 0, currentVersion: 7, hasRecords: false,
     });
   });
 

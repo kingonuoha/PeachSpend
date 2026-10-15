@@ -28,6 +28,12 @@ const migration1: Migration = {
   name: 'legacy-schema-baseline',
   oneWayReason: 'Baseline creates tables and cannot safely remove user data during rollback.',
   async up(db) {
+    // journal_mode is repeated here for a file opened outside the runner. The
+    // matching durability setting, `PRAGMA synchronous = NORMAL`, is deliberately
+    // NOT repeated here: this runs inside the runner's transaction, and SQLite
+    // refuses to change the safety level inside one ("Safety level may not be
+    // changed inside a transaction"). It is set once per open in runMigrations,
+    // outside any transaction, which is where the trade is documented.
     await db.execAsync(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS expenses (id TEXT PRIMARY KEY NOT NULL, merchant TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', category TEXT NOT NULL, note TEXT, scanned INTEGER NOT NULL DEFAULT 0, date INTEGER NOT NULL, created_at INTEGER NOT NULL);
@@ -115,10 +121,95 @@ const migration6: Migration = {
   },
 };
 
-export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6];
+// BUG-09-11a. Reader index coverage, derived from the queries the data layer actually
+// runs rather than from the shape of the schema. One index per column a query filters
+// or sorts on, and no composite index, because a wider index would cost write time on
+// the save path without serving any query in the app:
+//
+// - expenses(date): every period read and every newest first read. Serves the range
+//   filter in getMonthlySummary, getNetBalance, getBudgetStatus, exportToCSV and
+//   getExpensesForPeriod, and the ORDER BY date DESC in getExpenses, getRecentExpenses,
+//   exportToCSV and the category drill down. The drill down also leans on it for its
+//   category predicate, because `LOWER(category) = LOWER(?)` is a different term from
+//   the column and cannot use the category index below.
+// - expenses(category): the COUNT(DISTINCT category) aggregate in the achievement
+//   pass, which the planner now answers from the index alone.
+// - expenses(scanned): the scanned filter count in the achievement pass. A 0/1 column
+//   is not selective, but the index is covering for that count, so it stops touching
+//   the table at all.
+// - expenses(is_reimbursable): getReimbursableTotal reads this flag twice, once for the
+//   sum and once for the rows.
+// - expenses(amount): the achievement pass reads the single smallest amount with
+//   ORDER BY amount ASC LIMIT 1. Without this index that statement sorted the whole
+//   table to return one row.
+// - income(date): the same period and newest first reads as expenses(date).
+// - notifications(created_at): getNotifications orders newest first.
+// - notifications(read): getUnreadNotificationCount and markAllNotificationsRead
+//   filter on the unread flag.
+// - chat_messages(created_at): getChatHistory orders oldest first.
+//
+// Reversible, so no oneWayReason is claimed: an index stores no user data, so down()
+// drops exactly the nine indexes this migration created and leaves every row intact.
+const migration7: Migration = {
+  version: 7,
+  name: 'reader-index-coverage',
+  async up(db) {
+    await db.execAsync(`
+      CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+      CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
+      CREATE INDEX IF NOT EXISTS idx_expenses_scanned ON expenses(scanned);
+      CREATE INDEX IF NOT EXISTS idx_expenses_is_reimbursable ON expenses(is_reimbursable);
+      CREATE INDEX IF NOT EXISTS idx_expenses_amount ON expenses(amount);
+      CREATE INDEX IF NOT EXISTS idx_income_date ON income(date);
+      CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at);
+      CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);
+    `);
+  },
+  async down(db) {
+    await db.execAsync(`
+      DROP INDEX IF EXISTS idx_expenses_date;
+      DROP INDEX IF EXISTS idx_expenses_category;
+      DROP INDEX IF EXISTS idx_expenses_scanned;
+      DROP INDEX IF EXISTS idx_expenses_is_reimbursable;
+      DROP INDEX IF EXISTS idx_expenses_amount;
+      DROP INDEX IF EXISTS idx_income_date;
+      DROP INDEX IF EXISTS idx_notifications_created_at;
+      DROP INDEX IF EXISTS idx_notifications_read;
+      DROP INDEX IF EXISTS idx_chat_messages_created_at;
+    `);
+  },
+};
 
+export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7];
+
+// Connection level setup, applied on every open so the settings cannot drift between
+// an install that migrated and one that opened an already current file.
+//
+// DEC-B23, the durability trade, stated here so a later reader does not have to go
+// looking for it: with WAL, `synchronous = NORMAL` stops fsyncing on every commit and
+// only syncs at checkpoints, so a sudden power loss or a battery pull can lose the
+// last commit or two instead of corrupting the file. The owner accepted that trade for
+// a local financial log, knowing it. Do not raise this back to FULL without asking
+// Kingsley, and do not lower it to OFF.
+//
+// Connection pragmas evaluated for BUG-09-11a and deliberately NOT set, each with its
+// reason:
+// - cache_size: SQLite's default 2 MiB page cache already holds the whole file for a
+//   personal expense log, and the effect of raising it is a memory and read pattern
+//   claim that cannot be measured without the device run this pass bans.
+// - mmap_size: memory mapped pages would only move the same reads off the SQLite
+//   pager onto the OS page cache, which already serves repeat reads of a file this
+//   size, and it changes WAL checkpoint behaviour in a way only a device run could
+//   clear.
+// - temp_store: forcing temp tables and sort spills into memory grows the process with
+//   the table size on exactly the low end devices that need the headroom, and the
+//   indexes added in migration 7 remove the whole table sorts that motivated it.
+// - PRAGMA optimize IS set below, because it is cheap, idempotent, and the planner
+//   needs row counts to choose between the new indexes instead of a rule of thumb.
 export async function runMigrations(db: SQLite.SQLiteDatabase, list: Migration[] = migrations): Promise<void> {
   await db.execAsync('PRAGMA journal_mode = WAL;');
+  await db.execAsync('PRAGMA synchronous = NORMAL;');
   const current = (await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version'))?.user_version ?? 0;
   for (const migration of list.filter(item => item.version > current).sort((a, b) => a.version - b.version)) {
     await db.execAsync('BEGIN');
@@ -131,4 +222,7 @@ export async function runMigrations(db: SQLite.SQLiteDatabase, list: Migration[]
       throw error;
     }
   }
+  // Analyses any table that has no statistics yet and is close to a no-op once they
+  // exist, so a first open pays for the planner's row counts and later opens do not.
+  await db.execAsync('PRAGMA optimize;');
 }
