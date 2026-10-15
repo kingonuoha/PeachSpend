@@ -35,6 +35,7 @@ import StreakSplash, { selectNextStreakBadge } from '../../components/ui/StreakS
 import { BadgeDetailModal } from '../../components/ui/BadgeDetailModal';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
 import { homeDataService } from '../../data/homeDataRepository';
+import { parseStoredBudget } from '../../data/SettingsContracts';
 import { databaseService } from '../../services/DatabaseService';
 import { profileDataService } from '../../services/DataServices';
 import { formatAmount } from '../../utils/format';
@@ -146,9 +147,9 @@ export default function HomeScreen() {
   const incomeTotal = snapshot?.hero.incomeTotal ?? 0;
 
   const budget = useMemo(() => {
-    const raw = parseFloat(settings.monthly_budget) || 0;
-    if (raw <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
-    const cap = convertAmount(raw, settings.budget_currency || currency).amount;
+    const limit = parseStoredBudget(settings.monthly_budget);
+    if (limit <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
+    const cap = convertAmount(limit, settings.budget_currency || currency).amount;
     if (cap <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
     const progress = spend / cap;
     const state = progress > 1 ? 'over' as const : progress >= 0.8 ? 'near' as const : 'on' as const;
