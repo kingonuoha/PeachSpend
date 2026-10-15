@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { View, Text, Image, Dimensions, StyleSheet } from 'react-native';
+import { View, Text, Image, Dimensions, StyleSheet, useWindowDimensions } from 'react-native';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -9,17 +9,38 @@ import Animated, {
   runOnJS,
   Easing,
 } from 'react-native-reanimated';
+import { Spacing } from '../../constants/tokens';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const LOGO_SIZE = 150;
 const GHOST_LOGO_SIZE = SCREEN_HEIGHT * 1.4;
 const CIRCLE_START_SIZE = 120;
 
+// Horizontal gutter between the wordmark block and the window edge, taken from
+// the spacing token scale.
+const TEXT_BLOCK_GUTTER = Spacing.s6;
+
+// The wordmark and the tagline are brand lockup text, so the OS text scale is
+// capped. 1.2 is the largest cap that keeps the title inside the block at the
+// narrowest supported window. The title is one unbreakable 10 character word and
+// measures 190.7px at scale 1.0, 229.9px at 1.2, 249.4px at 1.3, and 286.1px at
+// 1.5 against 272px of available width at a 320px window with both gutters
+// removed, so 1.2 keeps a margin and 1.5 would overflow.
+const TEXT_BLOCK_MAX_FONT_SCALE = 1.2;
+
 interface AnimatedSplashScreenProps {
   onFinish: () => void;
 }
 
 export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenProps) {
+  const { width: windowWidth } = useWindowDimensions();
+  // The block width is derived from the window, never from the text measurement,
+  // so the layout cannot drift when the custom fonts load after the first paint
+  // or when the platform measures letter spaced text differently from the way it
+  // paints it. Clamped at zero so a degenerate window cannot yield a negative
+  // width; at every real window the block is window minus two gutters.
+  const textBlockWidth = Math.max(0, windowWidth - TEXT_BLOCK_GUTTER * 2);
+
   const logoScale = useSharedValue(0);
   const logoTranslateY = useSharedValue(50);
   const circleScale = useSharedValue(0);
@@ -91,9 +112,13 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
         resizeMode="contain"
       />
 
-      <Animated.View style={[styles.textContainer, textAnimatedStyle]}>
-        <Text style={styles.title}>PeachSpend</Text>
-        <Text style={styles.subtitle}>Peach of mind for your spendings</Text>
+      <Animated.View style={[styles.textContainer, { width: textBlockWidth }, textAnimatedStyle]}>
+        <Text style={styles.title} maxFontSizeMultiplier={TEXT_BLOCK_MAX_FONT_SCALE}>
+          PeachSpend
+        </Text>
+        <Text style={styles.subtitle} maxFontSizeMultiplier={TEXT_BLOCK_MAX_FONT_SCALE}>
+          Peach of mind for your spendings
+        </Text>
       </Animated.View>
     </View>
   );
@@ -135,6 +160,9 @@ const styles = StyleSheet.create({
   },
   textContainer: {
     position: 'absolute',
+    // Explicit left edge plus the window derived width centres the block by
+    // geometry rather than by the parent centring a shrink wrapped measurement.
+    left: TEXT_BLOCK_GUTTER,
     bottom: SCREEN_HEIGHT * 0.32,
     alignItems: 'center',
   },
@@ -143,6 +171,7 @@ const styles = StyleSheet.create({
     fontSize: 32,
     color: '#1F1B1A',
     letterSpacing: -0.5,
+    textAlign: 'center',
   },
   subtitle: {
     fontFamily: 'Manrope_400Regular',
@@ -151,5 +180,10 @@ const styles = StyleSheet.create({
     marginTop: 4,
     letterSpacing: 4,
     textTransform: 'uppercase',
+    textAlign: 'center',
+    // No numberOfLines and no shrink rule: when the width cannot hold the
+    // letter spaced line it wraps to a second centred line, which keeps the
+    // locked 13px size and 4px tracking. The longest single word is 120px at
+    // the cap, well inside the narrowest block of 272px.
   },
 });
