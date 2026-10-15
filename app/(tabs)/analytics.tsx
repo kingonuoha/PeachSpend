@@ -39,7 +39,7 @@ import { ExpenseItem } from '../../components/expense/ExpenseItem';
 import { INSIGHT_SORT_OPTIONS, useInsights, type InsightSortKey } from '../../hooks/useInsights';
 import type { InsightTimeframe } from '../../data/InsightContracts';
 import type { Expense } from '../../types/database';
-import { formatCurrency, getCurrencyPrefix } from '../../utils/currency';
+import { formatCurrency } from '../../utils/currency';
 
 const GRADIENT_START = { x: 0.33, y: 0 };
 const GRADIENT_END = { x: 0.67, y: 1 };
@@ -129,7 +129,6 @@ export default function AnalyticsScreen() {
 
   const pricesVisible = settings.prices_visible !== 'false';
   const currency = snapshot?.currency ?? settingsCurrency;
-  const currencySymbol = getCurrencyPrefix(currency);
   const activeSort = INSIGHT_SORT_OPTIONS.find(option => option.key === sortKey) ?? INSIGHT_SORT_OPTIONS[0];
 
   const periodExpenses = useMemo(() => {
@@ -548,7 +547,7 @@ export default function AnalyticsScreen() {
               total={snapshot?.totalSpent ?? 0}
               distribution={distribution}
               pricesVisible={pricesVisible}
-              currencySymbol={currencySymbol}
+              currency={currency}
               centerTopLabel={topCategory ? 'Top' : 'No data'}
               centerLabel={topCategory?.label ?? '--'}
               centerValue={topCategory ? `${topCategory.percentage.toFixed(0)}%` : ''}
@@ -559,7 +558,7 @@ export default function AnalyticsScreen() {
                 variant="compact"
                 distribution={distribution}
                 pricesVisible={pricesVisible}
-                currencySymbol={currencySymbol}
+                currency={currency}
                 onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
               />
             </View>

@@ -38,7 +38,7 @@ import { homeDataService } from '../../data/homeDataRepository';
 import { parseStoredBudget } from '../../data/SettingsContracts';
 import { databaseService } from '../../services/DatabaseService';
 import { profileDataService } from '../../services/DataServices';
-import { formatAmount } from '../../utils/format';
+import { formatCurrency } from '../../utils/currency';
 import { formatRelativeDateWithTime } from '../../utils/dateFormat';
 import type { Expense } from '../../types/database';
 import type { HomeSnapshot } from '../../data/HomeContracts';
@@ -82,7 +82,7 @@ export default function HomeScreen() {
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
   const toast = useToast();
-  const { settings, currency, getCurrencySymbol, convertAmount, updateSetting } = useSettings();
+  const { settings, currency, convertAmount, updateSetting } = useSettings();
 
   const [load, setLoad] = useState<HomeLoad | null>(null);
   const [loading, setLoading] = useState(true);
@@ -141,7 +141,6 @@ export default function HomeScreen() {
 
   const snapshot = load?.snapshot;
   const visible = settings.prices_visible !== 'false';
-  const symbol = getCurrencySymbol();
   const currencyCode = snapshot?.hero.currency ?? currency;
   const spend = snapshot?.hero.totalSpent ?? 0;
   const incomeTotal = snapshot?.hero.incomeTotal ?? 0;
@@ -166,7 +165,7 @@ export default function HomeScreen() {
   const visibleRecent = recent.slice(0, RECENT_LIMIT);
   const categories = (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES);
 
-  const money = useCallback((value: number) => `${symbol}${formatAmount(value)}`, [symbol]);
+  const money = useCallback((value: number) => formatCurrency(value, currencyCode), [currencyCode]);
 
   const toggleVisibility = useCallback(() => {
     const next = visible ? 'false' : 'true';
@@ -467,7 +466,6 @@ export default function HomeScreen() {
                   expense={expense}
                   info={load?.categories[expense.category]}
                   visible={visible}
-                  symbol={symbol}
                   onPress={() => router.push({
                     pathname: '/expense/[id]',
                     params: { id: expense.id, origin: 'home', ids: visibleRecent.map(item => item.id).join(',') },
@@ -649,13 +647,11 @@ function TransactionRow({
   expense,
   info,
   visible,
-  symbol,
   onPress,
 }: {
   expense: Expense;
   info?: CategoryInfo;
   visible: boolean;
-  symbol: string;
   onPress: () => void;
 }) {
   const ts = useThemeStyles();
@@ -692,7 +688,7 @@ function TransactionRow({
         </View>
       </View>
       <Text style={[styles.transactionAmount, { color: ts.raw.onSurface }]} numberOfLines={1}>
-        {visible ? `-${symbol}${formatAmount(converted)}` : MASK}
+        {visible ? `-${formatCurrency(converted, currency)}` : MASK}
       </Text>
     </ScalePressable>
   );

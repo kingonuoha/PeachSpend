@@ -75,7 +75,7 @@ import type {
 import { setThemeMode } from '../../data/ThemePackContracts';
 import { aiChatService } from '../../services/AIChatService';
 import { databaseService } from '../../services/DatabaseService';
-import { getCurrencyName } from '../../utils/currency';
+import { formatCurrency, getCurrencyName } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
 import type { ProfileSnapshot } from '../../data/ProfileContracts';
 import {
@@ -388,7 +388,7 @@ export default function SettingsScreen() {
   const avatarUri = snapshot ? resolveAvatarUri(snapshot.avatarFile) : null;
   const memberSince = snapshot ? formatMemberSince(snapshot.joinDate) : null;
   const budgetLabel = settingsSnapshot.budget > 0
-    ? `${getCurrencySymbol(settingsSnapshot.budgetCurrency)}${settingsSnapshot.budget.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    ? formatCurrency(settingsSnapshot.budget, settingsSnapshot.budgetCurrency)
     : null;
 
   const startBudgetEdit = () => {

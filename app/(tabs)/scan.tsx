@@ -23,6 +23,7 @@ import { geminiService } from '../../services/GeminiService';
 import { databaseService } from '../../services/DatabaseService';
 import { notificationService } from '../../services/NotificationService';
 import { logger } from '../../utils/logger';
+import { formatCurrency } from '../../utils/currency';
 import { AIProcessingOverlay } from '../../components/capture/AIProcessingOverlay';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { VerificationSheet } from '../../components/expense/VerificationSheet';
@@ -280,7 +281,7 @@ export default function ScanScreen() {
         onExpenseSaved: checkForNewAchievements,
         onIncomeSaved: async () => undefined,
         scheduleNotification: (savedCandidate) => {
-          if ('merchant' in savedCandidate) notificationService.scheduleExpenseNotification(savedCandidate.merchant, `${savedCandidate.currency} ${savedCandidate.amount.toFixed(2)}`);
+          if ('merchant' in savedCandidate) notificationService.scheduleExpenseNotification(savedCandidate.merchant, formatCurrency(savedCandidate.amount, savedCandidate.currency));
         },
       });
     }

@@ -888,7 +888,7 @@ export default function ChatScreen() {
       onIncomeSaved: async () => undefined,
       scheduleNotification: (candidate) => {
         if ('merchant' in candidate) {
-          notificationService.scheduleExpenseNotification(candidate.merchant, `${candidate.currency} ${candidate.amount.toFixed(2)}`);
+          notificationService.scheduleExpenseNotification(candidate.merchant, formatCurrency(candidate.amount, candidate.currency));
         }
       },
     };

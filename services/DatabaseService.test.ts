@@ -259,9 +259,9 @@ describe('DatabaseService achievement currency descriptions', () => {  it('uses 
 
     const badges = await databaseService.getBadgeProgress();
 
-    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ £3.00');
-    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('€1000.00 total spent');
-    expect(badges.find(badge => badge.id === 'big-league')?.description).toBe('€10000.00 total spent');
+    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ £3');
+    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('€1,000 total spent');
+    expect(badges.find(badge => badge.id === 'big-league')?.description).toBe('€10,000 total spent');
   });
 
   it('uses NGN when user and record currencies are absent', async () => {
@@ -276,8 +276,8 @@ describe('DatabaseService achievement currency descriptions', () => {  it('uses 
 
     const badges = await databaseService.getBadgeProgress();
 
-    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ ₦3.00');
-    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('₦1000.00 total spent');
+    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ ₦3');
+    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('₦1,000 total spent');
   });
 });
 

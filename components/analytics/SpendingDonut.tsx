@@ -3,6 +3,7 @@ import { View, Text } from 'react-native';
 import Svg, { Circle, G } from 'react-native-svg';
 import { LuminousCard } from '../ui/LuminousCard';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { formatCompactCurrency } from '../../utils/currency';
 
 interface DistributionItem {
   // `name` is the stable id used for filtering. `label` is the display title when
@@ -18,7 +19,7 @@ interface SpendingDonutProps {
   total: number;
   distribution: DistributionItem[];
   pricesVisible?: boolean;
-  currencySymbol: string;
+  currency: string;
   // Canonical S-03 renders a compact donut inside a combined share card instead of
   // the stand-alone 200px card, and taps on a slice filter the list. Both are
   // optional so existing behaviour stays the default.
@@ -34,7 +35,7 @@ export const SpendingDonut: React.FC<SpendingDonutProps> = ({
   total,
   distribution,
   pricesVisible = true,
-  currencySymbol,
+  currency,
   size = 200,
   bare = false,
   centerTopLabel = 'Total',
@@ -111,7 +112,7 @@ export const SpendingDonut: React.FC<SpendingDonutProps> = ({
           className="text-primary font-manrope-semibold text-[10px] mt-0.5"
           numberOfLines={1}
         >
-          {centerValue ?? (pricesVisible ? `${currencySymbol}${total.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : '••••')}
+          {centerValue ?? (pricesVisible ? formatCompactCurrency(total, currency) : '••••')}
         </Text>
       </View>
     </View>

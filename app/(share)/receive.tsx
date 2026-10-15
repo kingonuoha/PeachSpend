@@ -305,7 +305,7 @@ export default function ShareReceiveScreen() {
             if ('merchant' in savedCandidate) {
               notificationService.scheduleExpenseNotification(
                 savedCandidate.merchant,
-                `${savedCandidate.currency} ${savedCandidate.amount.toFixed(2)}`,
+                `${formatCurrency(savedCandidate.amount, savedCandidate.currency)}`,
               );
             }
           },

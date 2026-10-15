@@ -318,8 +318,8 @@ describe('AI chat reads the stored budget strictly (BUG-09-04a)', () => {
 
     const request = providerMocks.chatWithProvider.mock.calls[0][1] as ChatProviderRequest;
     const systemMessage = request.messages[0].content as string;
-    expect(systemMessage).toContain('Monthly budget: ₦0.00 (0% used)');
-    expect(systemMessage).not.toContain('₦66.00');
+    expect(systemMessage).toContain('Monthly budget: ₦0 (0% used)');
+    expect(systemMessage).not.toContain('Monthly budget: ₦66');
   });
 
   it('passes a budget of zero to the forecast and budget slices when the stored value cannot be parsed', async () => {

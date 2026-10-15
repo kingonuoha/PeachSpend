@@ -2,6 +2,7 @@ import React from 'react';
 import { View, Text, TouchableOpacity } from 'react-native';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Radii, Spacing } from '../../constants/tokens';
+import { formatCurrency, formatMoneyNumber, getCurrencyPrefix } from '../../utils/currency';
 
 interface DistributionItem {
   // `name` is the stable id used for filtering; `label` is the display title.
@@ -15,7 +16,7 @@ interface DistributionItem {
 interface CategoryBreakdownProps {
   distribution: DistributionItem[];
   pricesVisible?: boolean;
-  currencySymbol: string;
+  currency: string;
   onCategoryPress?: (categoryName: string) => void;
   // 'cards' is the original vertical breakdown; 'compact' is the canonical S-03
   // legend that sits beside the donut inside one card. Both share this component.
@@ -25,7 +26,7 @@ interface CategoryBreakdownProps {
 export const CategoryBreakdown: React.FC<CategoryBreakdownProps> = ({
   distribution,
   pricesVisible = true,
-  currencySymbol,
+  currency,
   onCategoryPress,
   variant = 'cards',
 }) => {
@@ -70,7 +71,7 @@ export const CategoryBreakdown: React.FC<CategoryBreakdownProps> = ({
               </Text>
             </View>
             <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-xs" numberOfLines={1}>
-              {pricesVisible ? `${currencySymbol}${item.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '••••'}
+              {pricesVisible ? formatCurrency(item.amount, currency) : '••••'}
             </Text>
           </TouchableOpacity>
         ))}
@@ -103,9 +104,9 @@ export const CategoryBreakdown: React.FC<CategoryBreakdownProps> = ({
               <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-medium text-[10px] mr-2">
                 {item.percentage.toFixed(0)}%
               </Text>
-              <Text className="text-primary font-noto-serif-bold text-xs">{pricesVisible ? currencySymbol : ''}</Text>
+              <Text className="text-primary font-noto-serif-bold text-xs">{pricesVisible ? getCurrencyPrefix(currency) : ''}</Text>
               <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-lg tracking-tighter">
-                {pricesVisible ? item.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '••••'}
+                {pricesVisible ? formatMoneyNumber(item.amount) : '••••'}
               </Text>
             </View>
           </View>
