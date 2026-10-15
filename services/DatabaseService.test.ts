@@ -69,8 +69,9 @@ const aggregateTotals = (overrides: Partial<AggregateRow> = {}): AggregateRow =>
 
 // The populated fixture used by the achievement regression tests. The numbers are the
 // ones measured in docs/phases/phase-09-ui-polish/bugfix-BUG-09-11-evidence.md for a
-// real database holding six expenses in three categories with notes, two reimbursable
-// rows, two recurring templates and three income rows.
+// six-row account: three categories, three rows with a note, two reimbursable rows (one
+// of which also has a note, so the detail count is four), two scanned rows, 2500 spent
+// with a 2.50 GBP minimum, two recurring templates and three income rows.
 const POPULATED_FIXTURE: AggregateRow = {
   expense_count: 6,
   scanned_count: 2,
@@ -467,6 +468,22 @@ describe('DatabaseService achievement pass (BUG-09-11a)', () => {
     expect(database.getFirstAsync.mock.calls[0]?.[0]).toContain('AS min_amount');
   });
 
+  it('resolves the minimum amount and its currency from one row with a shared tie break', async () => {
+    usePopulatedFixture([]);
+
+    await databaseService.checkAchievements();
+
+    // The collapsed statement replaces a single row read with two scalar subqueries. A
+    // bare `ORDER BY amount ASC LIMIT 1` in each lets two rows with an equal minimum
+    // amount supply the amount and the currency separately, so the saver badge would
+    // name a currency that held no such expense. (amount, rowid) is a total order, so
+    // both subqueries must order by it and must therefore land on the same row.
+    const sql = database.getFirstAsync.mock.calls[0]?.[0] as string;
+    const sharedOrder = sql.match(/ORDER BY amount ASC, rowid ASC LIMIT 1/g) ?? [];
+    expect(sharedOrder).toHaveLength(2);
+    expect(sql).not.toMatch(/ORDER BY amount ASC LIMIT 1/);
+  });
+
   it('reads the profile badge view in three statements and never re-reads settings', async () => {
     usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
 
@@ -602,6 +619,22 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
       schema: 'v2', userVersion: 6, currentVersion: 7, hasRecords: true,
+    });
+  });
+
+  // BUG-09-11a continuity gate. Migration 7 writes user_version 7, so the state a real
+  // reader now sees on every install is version 7, not 6. The classifier must still
+  // call that a v2 owned file, and it must still call an unversioned legacy file v1.
+  it('classifies a file already at user_version 7 as a v2 account, not v1', async () => {
+    database.getAllAsync.mockResolvedValue([{ name: 'expenses' }]);
+    database.getFirstAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('user_version')) return { user_version: 7 };
+      if (sql.includes('COUNT(*)')) return { count: 12 };
+      return null;
+    });
+
+    await expect(databaseService.detectContinuity()).resolves.toEqual({
+      schema: 'v2', userVersion: 7, currentVersion: 7, hasRecords: true,
     });
   });
 

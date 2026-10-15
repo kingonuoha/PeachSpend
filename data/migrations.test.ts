@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { migrations, runMigrations } from './migrations';
-import { CURRENT_SCHEMA_VERSION } from './ContinuityService';
+import { CURRENT_SCHEMA_VERSION, classifyContinuitySchema } from './ContinuityService';
 
 class MigrationDatabase {
   userVersion = 0;
@@ -92,13 +92,13 @@ describe('SQLite migration upgrades', () => {
 
 // BUG-09-11a. Migration 7 adds reader index coverage and nothing else. These tests
 // pin the parts a later reader could quietly break: that it stays additive, that every
-// statement is idempotent so an interrupted retry cannot fail, and that it is genuinely
-// reversible because an index holds no user data.
+// statement is idempotent so an interrupted retry cannot fail, that it is genuinely
+// reversible because an index holds no user data, and that it does not carry an index
+// with no consuming query.
 describe('migration 7, reader index coverage (BUG-09-11a)', () => {
   const EXPECTED_INDEXES = [
     'idx_expenses_date',
     'idx_expenses_category',
-    'idx_expenses_scanned',
     'idx_expenses_is_reimbursable',
     'idx_expenses_amount',
     'idx_income_date',
@@ -113,7 +113,7 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
     return found;
   };
 
-  it('adds the nine reader indexes, all with IF NOT EXISTS, and changes no table', async () => {
+  it('adds the eight reader indexes, all with IF NOT EXISTS, and changes no table', async () => {
     const db = new MigrationDatabase();
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'note', 'scanned', 'date', 'created_at']));
     db.tables.set('income', new Set(['id', 'source', 'amount', 'date', 'created_at']));
@@ -125,7 +125,7 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
 
     expect(target.name).toBe('reader-index-coverage');
     expect([...db.indexes].sort()).toEqual([...EXPECTED_INDEXES].sort());
-    expect(db.indexStatements).toHaveLength(9);
+    expect(db.indexStatements).toHaveLength(8);
     db.indexStatements.forEach(statement => expect(statement).toContain('IF NOT EXISTS'));
     // Additive: no column, no table, no data write.
     expect([...(db.tables.get('expenses') ?? [])].sort()).toEqual(expensesBefore);
@@ -135,8 +135,18 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
 
     // An interrupted retry re-runs the whole body without failing or duplicating.
     await target.up(db as never);
-    expect(db.indexStatements).toHaveLength(18);
+    expect(db.indexStatements).toHaveLength(16);
     expect([...db.indexes].sort()).toEqual([...EXPECTED_INDEXES].sort());
+  });
+
+  it('does not create expenses(scanned), which has no consuming statement after the collapse', async () => {
+    const db = new MigrationDatabase();
+    const target = migration7();
+    await target.up(db as never);
+    // Pins the finding recorded in bugfix-BUG-09-11-evidence.md: the pre-collapse
+    // achievement pass was this index's only reader, and the collapsed aggregate scans
+    // the table for its other eight columns. Re-adding it needs a query that reads it.
+    expect(db.indexes.has('idx_expenses_scanned')).toBe(false);
   });
 
   it('is reversible: down drops exactly the indexes it created and claims no one way reason', async () => {
@@ -160,6 +170,18 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
     expect(CURRENT_SCHEMA_VERSION).toBe(7);
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     EXPECTED_INDEXES.forEach(index => expect(db.indexes.has(index)).toBe(true));
+  });
+
+  // Release blocking continuity guard, required by BUG-09-11a: the migration bumps
+  // user_version to 7, and the v1 to v2 classifier treats any written version as a
+  // v2 owned file. Both directions are asserted at the number this migration writes.
+  it('keeps the continuity classifier correct at user_version 7', () => {
+    expect(CURRENT_SCHEMA_VERSION).toBe(7);
+    expect(7).toBe(Math.max(...migrations.map(migration => migration.version)));
+    expect(classifyContinuitySchema(7, true)).toBe('v2');
+    expect(classifyContinuitySchema(7, false)).toBe('v2');
+    expect(classifyContinuitySchema(0, true)).toBe('v1');
+    expect(classifyContinuitySchema(0, false)).toBe('none');
   });
 
   it('sets WAL and synchronous NORMAL before any transaction and optimises last, on every open', async () => {

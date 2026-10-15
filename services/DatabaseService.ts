@@ -26,9 +26,13 @@ const ACHIEVEMENT_THRESHOLDS = {
 // BUG-09-11a. Every number the achievement catalogue needs, in one statement, so a
 // save no longer pays for eight awaited aggregates. The min amount pair is a scalar
 // subquery rather than a second statement, and it is served by idx_expenses_amount
-// instead of the whole table sort the old `ORDER BY amount ASC LIMIT 1` caused. The
-// detail count is deliberately the same expression as before, `note != '' OR
-// is_reimbursable = 1`, so a null note still does not count as detail.
+// instead of the whole table sort the old `ORDER BY amount ASC LIMIT 1` caused. Both
+// subqueries order by (amount, rowid) so they resolve to the same physical row: with a
+// bare `ORDER BY amount ASC` two rows sharing the minimum amount could supply the
+// amount from one and the currency from the other, and the saver badge would state its
+// threshold in a currency that held no such expense. The detail count is deliberately
+// the same expression as before, `note != '' OR is_reimbursable = 1`, so a null note
+// still does not count as detail.
 const ACHIEVEMENT_TOTALS_SQL = `
   SELECT
     COUNT(*) AS expense_count,
@@ -37,8 +41,8 @@ const ACHIEVEMENT_TOTALS_SQL = `
     COUNT(DISTINCT category) AS distinct_categories,
     COALESCE(SUM(CASE WHEN note IS NOT NULL AND note != '' THEN 1 ELSE 0 END), 0) AS note_count,
     COALESCE(SUM(CASE WHEN (note IS NOT NULL AND note != '') OR is_reimbursable = 1 THEN 1 ELSE 0 END), 0) AS detail_count,
-    (SELECT amount FROM expenses ORDER BY amount ASC LIMIT 1) AS min_amount,
-    (SELECT currency FROM expenses ORDER BY amount ASC LIMIT 1) AS min_currency,
+    (SELECT amount FROM expenses ORDER BY amount ASC, rowid ASC LIMIT 1) AS min_amount,
+    (SELECT currency FROM expenses ORDER BY amount ASC, rowid ASC LIMIT 1) AS min_currency,
     (SELECT COUNT(*) FROM recurring_templates) AS recurring_count
   FROM expenses
 `;
@@ -909,11 +913,12 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // Achievements & Streaks
   //
   // BUG-09-11a. This used to cost one statement per badge in the catalogue, plus eight
-  // aggregates, plus a second settings read: 38 round trips on a save, and the count
-  // grew with the catalogue. It is now three reads, a single settings snapshot, and
-  // the earned set read once instead of probed per badge. The badge catalogue, its
-  // order, and every threshold below are unchanged, so the ids returned and the order
-  // celebrations queue in are identical.
+  // aggregates, plus a second settings read: 36 round trips on a save, 37 when a budget
+  // is set and getStreak() re-reads the settings table, and the count grew with the
+  // badge catalogue. It is now three reads, a single settings snapshot, and the earned
+  // set read once instead of probed per badge. The badge catalogue, its order, and every
+  // threshold below are unchanged, so the ids returned and the order celebrations queue
+  // in are identical.
   async checkAchievements(): Promise<string[]> {
     const db = await this.getDb();
     const allSettings = await this.getAllSettings();

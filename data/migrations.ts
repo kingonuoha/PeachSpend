@@ -124,32 +124,40 @@ const migration6: Migration = {
 // BUG-09-11a. Reader index coverage, derived from the queries the data layer actually
 // runs rather than from the shape of the schema. One index per column a query filters
 // or sorts on, and no composite index, because a wider index would cost write time on
-// the save path without serving any query in the app:
+// the save path without serving any query in the app. Each line names the statement
+// that reads it, checked with EXPLAIN QUERY PLAN (see
+// bugfix-BUG-09-11-evidence.md):
 //
 // - expenses(date): every period read and every newest first read. Serves the range
-//   filter in getMonthlySummary, getNetBalance, getBudgetStatus, exportToCSV and
-//   getExpensesForPeriod, and the ORDER BY date DESC in getExpenses, getRecentExpenses,
-//   exportToCSV and the category drill down. The drill down also leans on it for its
-//   category predicate, because `LOWER(category) = LOWER(?)` is a different term from
-//   the column and cannot use the category index below.
-// - expenses(category): the COUNT(DISTINCT category) aggregate in the achievement
-//   pass, which the planner now answers from the index alone.
-// - expenses(scanned): the scanned filter count in the achievement pass. A 0/1 column
-//   is not selective, but the index is covering for that count, so it stops touching
-//   the table at all.
+//   filter in getMonthlySummary, getNetBalance, getBudgetStatus, getRecentExpensesInRange,
+//   getExpensesByCategoryInRange and exportToCSV, and the ORDER BY date DESC in
+//   getExpenses, getRecentExpenses and the category drill down. The drill down also
+//   leans on it for its category predicate, because `LOWER(category) = LOWER(?)` is a
+//   different term from the column and cannot use the category index below.
+// - expenses(category): getExpensesByCategory groups by this column, so the planner
+//   walks the index in group order instead of building a temp b-tree over the table.
 // - expenses(is_reimbursable): getReimbursableTotal reads this flag twice, once for the
 //   sum and once for the rows.
-// - expenses(amount): the achievement pass reads the single smallest amount with
-//   ORDER BY amount ASC LIMIT 1. Without this index that statement sorted the whole
-//   table to return one row.
+// - expenses(amount): the achievement totals statement reads the smallest amount with
+//   ORDER BY amount ASC, rowid ASC LIMIT 1. Without this index that scalar subquery
+//   sorted the whole table to return one row.
 // - income(date): the same period and newest first reads as expenses(date).
 // - notifications(created_at): getNotifications orders newest first.
-// - notifications(read): getUnreadNotificationCount and markAllNotificationsRead
-//   filter on the unread flag.
+// - notifications(read): getUnreadNotificationCount answers its count from the index
+//   alone, and markAllNotificationsRead filters on the same flag.
 // - chat_messages(created_at): getChatHistory orders oldest first.
 //
+// Evaluated and deliberately NOT created, with the reason:
+// - expenses(scanned): the triage named it missing because the pre-collapse achievement
+//   pass ran `SELECT COUNT(*) FROM expenses WHERE scanned = 1`, which this index made
+//   covering. The collapse in services/DatabaseService.ts folds that count into the one
+//   aggregate statement, which must scan the table for the other eight columns, and no
+//   other statement in the app filters on scanned. The index would therefore cost write
+//   time on every save and be read by nothing. Add it with the query that consumes it if
+//   a scanned predicate returns.
+//
 // Reversible, so no oneWayReason is claimed: an index stores no user data, so down()
-// drops exactly the nine indexes this migration created and leaves every row intact.
+// drops exactly the eight indexes this migration created and leaves every row intact.
 const migration7: Migration = {
   version: 7,
   name: 'reader-index-coverage',
@@ -157,7 +165,6 @@ const migration7: Migration = {
     await db.execAsync(`
       CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
       CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
-      CREATE INDEX IF NOT EXISTS idx_expenses_scanned ON expenses(scanned);
       CREATE INDEX IF NOT EXISTS idx_expenses_is_reimbursable ON expenses(is_reimbursable);
       CREATE INDEX IF NOT EXISTS idx_expenses_amount ON expenses(amount);
       CREATE INDEX IF NOT EXISTS idx_income_date ON income(date);
@@ -170,7 +177,6 @@ const migration7: Migration = {
     await db.execAsync(`
       DROP INDEX IF EXISTS idx_expenses_date;
       DROP INDEX IF EXISTS idx_expenses_category;
-      DROP INDEX IF EXISTS idx_expenses_scanned;
       DROP INDEX IF EXISTS idx_expenses_is_reimbursable;
       DROP INDEX IF EXISTS idx_expenses_amount;
       DROP INDEX IF EXISTS idx_income_date;
