@@ -318,7 +318,7 @@ describe('AI chat reads the stored budget strictly (BUG-09-04a)', () => {
 
     const request = providerMocks.chatWithProvider.mock.calls[0][1] as ChatProviderRequest;
     const systemMessage = request.messages[0].content as string;
-    expect(systemMessage).toContain('Monthly budget: ₦0 (0% used)');
+    expect(systemMessage).toContain('Monthly budget: not set');
     expect(systemMessage).not.toContain('Monthly budget: ₦66');
   });
 
@@ -338,5 +338,65 @@ describe('AI chat reads the stored budget strictly (BUG-09-04a)', () => {
     await aiChatService.sendMessage('how am I doing on budget?');
 
     expect(mocks.getBudgetStatus).toHaveBeenCalledWith(100000, expect.any(Number), expect.any(Number));
+  });
+});
+
+// BUG-09-12: with no budget set the prompt used to print a spend against a zero
+// cap with zero percent used, so the model reasoned about a limit the user never
+// set. The unset case now states the absence plainly. The set case is the exact
+// line the prompt produced before this change, so its meaning cannot have moved.
+describe('AI chat states an unset budget honestly (BUG-09-12)', () => {
+  const setStoredBudget = (monthlyBudget: string) => {
+    mocks.getAllSettings.mockResolvedValue({ monthly_budget: monthlyBudget, currency: 'NGN' });
+    mocks.getSetting.mockImplementation(async (key: string) => {
+      switch (key) {
+        case 'chat_provider': return 'gemini';
+        case 'chat_gemini_model': return 'gemini-2.5-flash';
+        case 'monthly_budget': return monthlyBudget;
+        case 'currency': return 'NGN';
+        default: return null;
+      }
+    });
+  };
+
+  // The static summary is cached for 60s on the singleton, so each read is forced
+  // the way a cold start does it.
+  const promptFor = async (monthlyBudget: string): Promise<string> => {
+    (aiChatService as unknown as { cachedSummary: null }).cachedSummary = null;
+    setStoredBudget(monthlyBudget);
+    await aiChatService.sendMessage('how am I doing on budget?');
+    const request = providerMocks.chatWithProvider.mock.calls[0][1] as ChatProviderRequest;
+    return request.messages[0].content as string;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSecret.mockResolvedValue('test-key');
+    mocks.getChatHistory.mockResolvedValue([]);
+    mocks.saveChatMessage.mockResolvedValue(undefined);
+    mocks.getMonthlySummary.mockResolvedValue({ totalSpent: 1000 });
+    mocks.getIncomeForPeriod.mockResolvedValue(0);
+    mocks.getReimbursableTotal.mockResolvedValue({ total: 0, expenses: [] });
+    mocks.getExpensesByCategory.mockResolvedValue([]);
+    mocks.getRecentExpenses.mockResolvedValue([]);
+    mocks.getBudgetStatus.mockResolvedValue({ spent: 1000, remaining: 0, usedPercent: 0, dailySpendRate: 0, daysRemaining: 0 });
+    providerMocks.chatWithProvider.mockResolvedValue({ text: 'Nothing unusual.', provider: 'gemini', model: 'm' });
+  });
+
+  it('states that no limit is set instead of a spend against a zero budget', async () => {
+    const systemMessage = await promptFor('');
+
+    expect(systemMessage).toContain('Monthly budget: not set');
+    expect(systemMessage).toContain('no monthly spending limit has been set');
+    // No spend figure against a zero limit, and no zero percent used.
+    expect(systemMessage).not.toContain('Monthly budget: ₦0');
+    expect(systemMessage).not.toContain('% used');
+  });
+
+  it('keeps the set case byte-identical to the line the prompt produced before the fix', async () => {
+    const systemMessage = await promptFor('66000');
+
+    expect(systemMessage).toContain('Monthly budget: ₦66,000 (2% used)');
+    expect(systemMessage).not.toContain('Monthly budget: not set');
   });
 });

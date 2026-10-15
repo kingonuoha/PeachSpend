@@ -516,8 +516,17 @@ class AIChatService {
     const profileName = (await databaseService.getSetting('profile_name')) || 'there';
     const currency = summary.currency;
 
+    // BUG-09-12: a budget of zero means the user never set a limit, so the prompt
+    // says that plainly instead of printing a spend against a zero cap with zero
+    // percent used, which made the model reason about a limit that does not exist.
+    // The set case is unchanged and still formats through the shared formatter, so
+    // the amount it reports cannot drift from the rest of the app.
+    const budgetLine = summary.monthlyBudget > 0
+      ? `Monthly budget: ${formatCurrency(summary.monthlyBudget, currency)} (${summary.budgetUsedPercent.toFixed(0)}% used)`
+      : 'Monthly budget: not set (no monthly spending limit has been set, so do not compare spending against a limit or assume one exists)';
+
     const staticBlock = `Total spent this month: ${formatCurrency(summary.totalSpentThisMonth, currency)}
-Monthly budget: ${formatCurrency(summary.monthlyBudget, currency)} (${summary.budgetUsedPercent.toFixed(0)}% used)
+${budgetLine}
 Days remaining in month: ${summary.daysRemaining}
 Daily spend rate: ${formatCurrency(summary.dailySpendRate, currency)}/day
 Net balance this month: ${formatCurrency(summary.netBalance, currency)} (income ${formatCurrency(summary.netBalance + summary.totalSpentThisMonth, currency)} − expenses ${formatCurrency(summary.totalSpentThisMonth, currency)})
