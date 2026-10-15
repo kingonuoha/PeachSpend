@@ -9,6 +9,7 @@ import {
 import Animated, {
   cancelAnimation,
   Easing,
+  ReduceMotion,
   useAnimatedStyle,
   useSharedValue,
   withDelay,
@@ -73,7 +74,21 @@ export function Skeleton({ width, height, borderRadius = Radii.sm, style }: Skel
   useEffect(() => {
     const duration = reduceMotion ? PULSE_REDUCED_DURATION : PULSE_DURATION;
     const min = reduceMotion ? PULSE_REDUCED_MIN_OPACITY : PULSE_MIN_OPACITY;
-    pulse.set(withRepeat(withTiming(min, { duration, easing: Easing.inOut(Easing.ease) }), -1, true));
+    pulse.set(
+      withRepeat(
+        withTiming(min, { duration, easing: Easing.inOut(Easing.ease) }),
+        -1,
+        true,
+        undefined,
+        // Required, not decorative: with the reduce-motion config omitted, Reanimated
+        // resolves it to the system setting at animation start and a reversed infinite
+        // repeat then refuses to start, holding the block at full opacity, which is the
+        // hard stop DEC-B21 replaces. The gentler, slower pace for reduce motion is
+        // already chosen above, and the sweep is dropped in its own effect, so the
+        // breathe is exempted from the setting here in order to actually run.
+        ReduceMotion.Never,
+      ),
+    );
     return () => cancelAnimation(pulse);
   }, [pulse, reduceMotion]);
 
