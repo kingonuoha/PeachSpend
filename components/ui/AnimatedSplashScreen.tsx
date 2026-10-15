@@ -45,6 +45,12 @@ const SPLASH_BRAND_PURPLE = LightTheme.primary;
 const SPLASH_ON_BRAND = Colors.onPrimary;
 const SPLASH_LABEL_COLOR = 'rgba(255, 255, 255, 0.7)';
 
+// The accent circle sits on the fixed brand purple surface, so it reads the
+// lighter primary container token to stay visible against it (DEC-B35). Without
+// this the circle shares the surface colour and its scale animation has no
+// visible result. Same token access pattern as the surface above; no new hex.
+const SPLASH_ACCENT_CIRCLE = LightTheme.primaryContainer;
+
 // The block's top edge is pinned at the y a one line tagline occupies, so a
 // wrapped second line grows downward into empty space instead of upward into
 // the mark above it (BUG-09-06). That y is derived from the block's measured
@@ -205,7 +211,7 @@ const styles = StyleSheet.create({
     width: CIRCLE_START_SIZE,
     height: CIRCLE_START_SIZE,
     borderRadius: CIRCLE_START_SIZE / 2,
-    backgroundColor: SPLASH_BRAND_PURPLE,
+    backgroundColor: SPLASH_ACCENT_CIRCLE,
     left: SCREEN_WIDTH / 2 - CIRCLE_START_SIZE / 2,
     top: SCREEN_HEIGHT / 2 - CIRCLE_START_SIZE / 2,
   },
