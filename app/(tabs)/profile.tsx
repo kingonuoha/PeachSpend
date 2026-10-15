@@ -37,6 +37,7 @@ import { EditProfileSheet } from '../../components/profile/EditProfileSheet';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { formatCurrency } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
@@ -92,6 +93,7 @@ const THEME_MODE_FAILURE_MESSAGE = 'Could not change the appearance. Please try 
 // convention.
 function ProfileSkeleton() {
   const ts = useThemeStyles();
+  const bottomClearance = useBottomClearance();
   const heroBlock = { backgroundColor: HERO_PLACEHOLDER };
 
   return (
@@ -103,7 +105,7 @@ function ProfileSkeleton() {
       style={{ backgroundColor: ts.bg.screen, flex: 1 }}
       edges={['top']}
     >
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: Spacing.s8 }}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: bottomClearance }}>
         <View style={CONTENT_WRAP}>
           {/* Top bar. The title and the 40pt settings circle drive the same 64pt row as the loaded header. */}
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingTop: Spacing.s4, paddingBottom: Spacing.s2 }}>
@@ -290,6 +292,7 @@ function ProfileSkeleton() {
 export default function ProfileScreen() {
   const ts = useThemeStyles();
   const router = useRouter();
+  const bottomClearance = useBottomClearance();
   const { refreshSettings } = useSettings();
   const { showToast } = useToast();
 
@@ -475,7 +478,7 @@ export default function ProfileScreen() {
       <ScrollView
         style={{ flex: 1 }}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: Spacing.s8 }}
+        contentContainerStyle={{ paddingBottom: bottomClearance }}
       >
         <View style={CONTENT_WRAP}>
           {/* Top bar */}

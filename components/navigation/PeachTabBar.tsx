@@ -15,7 +15,7 @@ import Svg, { Path } from 'react-native-svg';
 import { Colors, DarkTheme, Gradients, LightTheme, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
-import { computeTabRowLayout, TAB_TARGET } from './tabBarGeometry';
+import { computeTabRowLayout, TAB_BAR_HEIGHT, tabBarOccupiedHeight, TAB_TARGET } from './tabBarGeometry';
 
 type TabIcon = React.ComponentType<{ size?: number; color?: string }>;
 type Tone = 'auto' | 'light' | 'dark';
@@ -45,9 +45,10 @@ interface PeachTabBarProps {
   tone?: Tone;
 }
 
-// Chassis geometry: 90 tall container holding a 76 tall chassis whose top edge
-// sits at y 16, anchored around a fixed 56 FAB at bottom 24.
-const CONTAINER_HEIGHT = 90;
+// Chassis geometry: the exported TAB_BAR_HEIGHT container holds a 76 tall
+// chassis whose top edge sits at y 16, anchored around a fixed 56 FAB at
+// bottom 24. The container height is imported rather than restated so the bar
+// and every screen's bottom clearance read one value.
 const BAR_HEIGHT = 76;
 const SCOOP_TOP = 16;
 const FAB_SIZE = 56;
@@ -90,8 +91,8 @@ const GRADIENT_END = { x: 0.67, y: 1 };
 const GRADIENT_LOCATIONS: [number, number, number] = [0, 0.45, 1];
 
 // Chassis-relative FAB centre, derived so it stays correct if FAB_BOTTOM moves.
-const CHASSIS_TOP = CONTAINER_HEIGHT - BAR_HEIGHT;
-const FAB_CENTER_Y = CONTAINER_HEIGHT - FAB_BOTTOM - FAB_RADIUS - CHASSIS_TOP;
+const CHASSIS_TOP = TAB_BAR_HEIGHT - BAR_HEIGHT;
+const FAB_CENTER_Y = TAB_BAR_HEIGHT - FAB_BOTTOM - FAB_RADIUS - CHASSIS_TOP;
 // Cradle wall: a circle of radius FAB_RADIUS + SCOOP_GAP centred on the FAB, so
 // the ring of clearance is exactly even at the trough and at the widest point.
 const CRADLE_RADIUS = FAB_RADIUS + SCOOP_GAP;
@@ -267,7 +268,7 @@ export function PeachTabBar({
       // touches. The bar's empty surface and the callout's clearance above the
       // bar pass taps through, so the scrim behind can still dismiss the menu.
       pointerEvents="box-none"
-      style={[tabStyles.container, { height: CONTAINER_HEIGHT + bottomInset + CALL_OUT_SPACE }]}
+      style={[tabStyles.container, { height: tabBarOccupiedHeight(bottomInset) + CALL_OUT_SPACE }]}
       onLayout={handleLayout}
     >
       {width > 0 ? (

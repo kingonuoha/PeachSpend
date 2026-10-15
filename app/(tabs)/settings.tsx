@@ -45,6 +45,7 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useExpenses } from '../../hooks/useExpenses';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import {
   buildExportPreview,
@@ -216,6 +217,7 @@ function continuityTone(raw: ThemeRaw, tone: ContinuityFeedback['tone']) {
 // exposes a single busy label, matching the Home/notifications skeleton convention.
 function SettingsSkeleton() {
   const ts = useThemeStyles();
+  const bottomClearance = useBottomClearance();
   return (
     <SafeAreaView
       accessible
@@ -230,7 +232,7 @@ function SettingsSkeleton() {
         <Skeleton width={96} height={20} />
         <View style={styles.headerCircle} />
       </View>
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.content}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]}>
         {/* Account & Identity */}
         <View>
           <Skeleton width={120} height={11} style={styles.skeletonSectionLabel} />
@@ -307,6 +309,7 @@ function SettingsSkeleton() {
 export default function SettingsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
+  const bottomClearance = useBottomClearance();
   const { settings, refreshSettings, getCurrencySymbol } = useSettings();
   const { showToast } = useToast();
   const { expenses, refreshExpenses } = useExpenses();
@@ -633,7 +636,7 @@ export default function SettingsScreen() {
       ) : (
         <ScrollView
           showsVerticalScrollIndicator={false}
-          contentContainerStyle={styles.content}
+          contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]}
           keyboardShouldPersistTaps="handled"
         >
           {/* Section 1: Account & Identity */}
@@ -1324,7 +1327,6 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
     paddingHorizontal: Spacing.s5,
     paddingTop: Spacing.s4,
-    paddingBottom: 120,
     gap: Spacing.s5,
   },
   sectionLabel: {

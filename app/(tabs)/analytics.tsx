@@ -27,6 +27,7 @@ import {
 
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { ScalePressable } from '../../components/ui/ScalePressable';
@@ -88,6 +89,7 @@ export default function AnalyticsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
+  const bottomClearance = useBottomClearance();
   const { settings, currency: settingsCurrency } = useSettings();
   const params = useLocalSearchParams<{ category?: string }>();
 
@@ -260,7 +262,7 @@ export default function AnalyticsScreen() {
         contentContainerStyle={{
           paddingHorizontal: Spacing.s5,
           paddingTop: Spacing.s3,
-          paddingBottom: 100 + insets.bottom,
+          paddingBottom: bottomClearance,
           alignSelf: 'center',
           width: '100%',
           maxWidth: 640,

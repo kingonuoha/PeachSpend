@@ -8,7 +8,7 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -38,6 +38,7 @@ import Animated, {
 import { Colors, Radii, Spacing, Typography, Gradients } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
+import { useBottomClearance } from '../components/navigation/useBottomClearance';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { useToast } from '../components/ui/ToastProvider';
 import { LuminousCard } from '../components/ui/LuminousCard';
@@ -748,7 +749,11 @@ function ErrorCard({ text, retryable, code, onRetry, onOpenSettings }: {
 export default function ChatScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
-  const insets = useSafeAreaInsets();
+  // The chat screen renders in two hosts: as the chat tab, where the floating
+  // bar is mounted over it, and as a stack route pushed from elsewhere, where it
+  // is not. The hook resolves which one this is, so the composer and the provider
+  // sheet clear the bar in the tab host and gain no dead space when pushed.
+  const bottomClearance = useBottomClearance();
   const reduceMotion = useReduceMotion();
   const { height: windowHeight } = useWindowDimensions();
   // Surface 6 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
@@ -1755,7 +1760,7 @@ export default function ChatScreen() {
           style={{
             paddingHorizontal: Spacing.s3,
             paddingTop: Spacing.s2,
-            paddingBottom: Math.max(Spacing.s2, insets.bottom),
+            paddingBottom: Math.max(Spacing.s2, bottomClearance),
             borderTopWidth: 1,
             borderTopColor: ts.border.subtle,
             backgroundColor: ts.raw.surface,
@@ -1864,7 +1869,7 @@ export default function ChatScreen() {
                 borderTopWidth: 1,
                 borderColor: ts.raw.outline,
                 padding: Spacing.s5,
-                paddingBottom: Math.max(Spacing.s5, insets.bottom),
+                paddingBottom: Math.max(Spacing.s5, bottomClearance),
                 gap: Spacing.s3,
               }}
             >

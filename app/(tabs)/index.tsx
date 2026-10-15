@@ -26,6 +26,7 @@ import {
 
 import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { PeachButton } from '../../components/ui/PeachButton';
@@ -81,6 +82,7 @@ export default function HomeScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
+  const bottomClearance = useBottomClearance();
   const toast = useToast();
   const { settings, currency, convertAmount, updateSetting } = useSettings();
 
@@ -205,7 +207,7 @@ export default function HomeScreen() {
     <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: 90 + insets.bottom + Spacing.s6 }}
+        contentContainerStyle={{ paddingBottom: bottomClearance + Spacing.s6 }}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -531,6 +533,7 @@ const SKELETON_RECENT_COUNT = 4;
 function HomeSkeleton() {
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
+  const bottomClearance = useBottomClearance();
   const heroTint = { backgroundColor: HERO_PLACEHOLDER };
 
   return (
@@ -543,7 +546,7 @@ function HomeSkeleton() {
     >
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: 90 + insets.bottom + Spacing.s6 }}
+        contentContainerStyle={{ paddingBottom: bottomClearance + Spacing.s6 }}
       >
         <LinearGradient
           colors={ts.isDark ? Gradients.dark : Gradients.light}
