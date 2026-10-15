@@ -9,7 +9,7 @@ import Animated, {
   runOnJS,
   Easing,
 } from 'react-native-reanimated';
-import { Spacing } from '../../constants/tokens';
+import { Colors, LightTheme, Spacing } from '../../constants/tokens';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const LOGO_SIZE = 150;
@@ -27,6 +27,14 @@ const TEXT_BLOCK_GUTTER = Spacing.s6;
 // 1.5 against 272px of available width at a 320px window with both gutters
 // removed, so 1.2 keeps a margin and 1.5 would overflow.
 const TEXT_BLOCK_MAX_FONT_SCALE = 1.2;
+
+// The splash surface is one fixed brand purple in light, dark, and across every
+// theme pack (DEC-B06), so it reads the locked light-theme primary token rather
+// than a fresh literal (DEC-B05). Content on a purple surface is white, and the
+// tagline label sits at 70 percent, per the design system contrast rule.
+const SPLASH_BRAND_PURPLE = LightTheme.primary;
+const SPLASH_ON_BRAND = Colors.onPrimary;
+const SPLASH_LABEL_COLOR = 'rgba(255, 255, 255, 0.7)';
 
 interface AnimatedSplashScreenProps {
   onFinish: () => void;
@@ -103,12 +111,14 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
       <Image
         source={require('../../assets/images/splash-logo-full.png')}
         style={styles.ghostLogo}
+        tintColor={SPLASH_ON_BRAND}
         resizeMode="contain"
       />
 
       <Animated.Image
         source={require('../../assets/images/splash-logo-full.png')}
         style={[styles.logo, logoAnimatedStyle]}
+        tintColor={SPLASH_ON_BRAND}
         resizeMode="contain"
       />
 
@@ -127,21 +137,21 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
 const styles = StyleSheet.create({
   container: {
     ...StyleSheet.absoluteFill,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: SPLASH_BRAND_PURPLE,
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 100,
   },
   background: {
     ...StyleSheet.absoluteFill,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: SPLASH_BRAND_PURPLE,
   },
   circle: {
     position: 'absolute',
     width: CIRCLE_START_SIZE,
     height: CIRCLE_START_SIZE,
     borderRadius: CIRCLE_START_SIZE / 2,
-    backgroundColor: '#FFD2C4',
+    backgroundColor: SPLASH_BRAND_PURPLE,
     left: SCREEN_WIDTH / 2 - CIRCLE_START_SIZE / 2,
     top: SCREEN_HEIGHT / 2 - CIRCLE_START_SIZE / 2,
   },
@@ -169,14 +179,14 @@ const styles = StyleSheet.create({
   title: {
     fontFamily: 'NotoSerif_700Bold',
     fontSize: 32,
-    color: '#1F1B1A',
+    color: SPLASH_ON_BRAND,
     letterSpacing: -0.5,
     textAlign: 'center',
   },
   subtitle: {
     fontFamily: 'Manrope_400Regular',
     fontSize: 13,
-    color: '#85736E',
+    color: SPLASH_LABEL_COLOR,
     marginTop: 4,
     letterSpacing: 4,
     textTransform: 'uppercase',

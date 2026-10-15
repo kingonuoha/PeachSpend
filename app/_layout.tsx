@@ -290,7 +290,7 @@ export default function RootLayout() {
                 </StreakGate>
               </BiometricGate>
             {showSplash && <AnimatedSplashScreen onFinish={handleSplashFinish} />}
-            <StatusBar style={showSplash ? 'dark' : 'light'} />
+            <StatusBar style="light" />
           </View>
             </AchievementProvider>
         </ToastProvider>
