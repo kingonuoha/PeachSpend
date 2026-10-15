@@ -8,13 +8,13 @@ import Animated, {
   withRepeat,
   withTiming,
 } from 'react-native-reanimated';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import { CameraView, useCameraPermissions, type BarcodeScanningResult, type BarcodeType } from 'expo-camera';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Camera, CameraOff, Image as ImageIcon, Pencil, X, Zap } from 'lucide-react-native';
+import { Barcode, Camera, CameraOff, Image as ImageIcon, Pencil, X, Zap } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 
@@ -55,10 +55,49 @@ const OFFLINE_TOP_OFFSET = 64;
 // 44pt touch floor vertically through hitSlop without changing its look.
 const MODE_OPTION_HIT_SLOP = { top: 10, bottom: 10 } as const;
 
+// Barcode decoding is the product mode affordance the pair names at
+// code.html:543-545 ("UPC item matcher switch") and switches on at :780-785.
+// The installed expo-camera derives native scanning from the presence of
+// onBarcodeScanned (node_modules/expo-camera/build/utils/props.js sets
+// barcodeScannerEnabled from it), so receipt mode passes undefined for both
+// props and never runs the scanner at all. The types are the retail codes the
+// pair means by UPC or EAN.
+const BARCODE_TYPES: BarcodeType[] = ['upc_a', 'upc_e', 'ean13', 'ean8'];
+const BARCODE_SCANNER_SETTINGS = { barcodeTypes: BARCODE_TYPES };
+// The decoded code pill uses the same safe-area anchor as the offline notice
+// (pair code.html:486 places that notice at top-16), and the notice moves down
+// by this much when both are on screen, which the offline product state can
+// produce because decoding happens on the device.
+const BARCODE_PILL_CLEARANCE = Spacing.s9;
+
 type ScanMode = 'receipt' | 'product';
 type ProcessingContext = 'receipt' | 'gallery' | 'product';
 
 const isIllegibleCode = (code: string): boolean => code === 'illegible_image' || code === 'invalid_response';
+
+// A decoded code is accepted as product context only: product mode, a camera
+// that is live, and no scan already in flight. Receipt mode can never accept
+// one, so a receipt scan can never carry a barcode even if one were in state.
+export function acceptBarcodeScan(
+  gate: { mode: ScanMode; isScanning: boolean; cameraActive: boolean },
+  scanned: string,
+): string | null {
+  if (gate.mode !== 'product' || gate.isScanning || !gate.cameraActive) return null;
+  const code = scanned.trim();
+  return code.length > 0 ? code : null;
+}
+
+// The decoded code reaches the provider as product context only. The provider
+// call is the single channel into the product prompt in
+// services/GeminiService.ts, so receipt context never carries one.
+export function productScanOptions(
+  context: ProcessingContext,
+  barcode: string | null,
+  signal: AbortSignal,
+): { signal: AbortSignal; barcode?: string } {
+  if (context !== 'product' || !barcode) return { signal };
+  return { signal, barcode };
+}
 
 const hasRequiredReceiptFields = (item: ScannedReceipt): boolean => (
   item.merchant.trim().length > 0 &&
@@ -199,6 +238,11 @@ export default function ScanScreen() {
   const [pendingBatch, setPendingBatch] = useState<ScannedReceipt[] | null>(null);
   const [ownedImageUri, setOwnedImageUri] = useState<string | null>(null);
   const [frameHeight, setFrameHeight] = useState(0);
+  // The code the device decoded in product mode. Held until the result is
+  // dismissed or the mode changes, so a stale code can never be attached to a
+  // later photograph of something else.
+  const [decodedBarcode, setDecodedBarcode] = useState<string | null>(null);
+  const lastBarcodeRef = useRef<string | null>(null);
 
   useEffect(() => {
     const checkApiKey = async () => {
@@ -262,10 +306,33 @@ export default function ScanScreen() {
   }), [conversionRates, settings.currency]);
 
   const resolveItems = useCallback(async (base64: string, context: ProcessingContext, signal: AbortSignal): Promise<ScannedReceipt[]> => {
-    const rawItems = await geminiService.scanReceipt(base64, context === 'product' ? 'product' : 'receipt', { signal });
+    const mode = context === 'product' ? 'product' : 'receipt';
+    const rawItems = await geminiService.scanReceipt(base64, mode, productScanOptions(context, decodedBarcode, signal));
     if (!rawItems || !Array.isArray(rawItems)) throw new AiError('invalid_response', 'gemini', 'AI response did not match the receipt contract');
     return convertToUserCurrency(rawItems);
-  }, [convertToUserCurrency]);
+  }, [convertToUserCurrency, decodedBarcode]);
+
+  const clearDecodedBarcode = useCallback(() => {
+    lastBarcodeRef.current = null;
+    setDecodedBarcode(null);
+  }, []);
+
+  // The scanner reports the same code for as long as it stays in frame, so an
+  // identical read is dropped instead of re-rendering the HUD. The guard is the
+  // same one the props use, kept here so receipt mode cannot decode even if a
+  // handler were reached.
+  const handleBarcodeScanned = useCallback((result: BarcodeScanningResult) => {
+    const code = acceptBarcodeScan({ mode: scanMode, isScanning, cameraActive }, result.data);
+    if (!code || code === lastBarcodeRef.current) return;
+    lastBarcodeRef.current = code;
+    setDecodedBarcode(code);
+    void Haptics.selectionAsync();
+  }, [cameraActive, isScanning, scanMode]);
+
+  const handleModeChange = useCallback((mode: ScanMode) => {
+    setScanMode(mode);
+    clearDecodedBarcode();
+  }, [clearDecodedBarcode]);
 
   const handleFailure = useCallback((error: unknown, logMessage: string) => {
     const normalized = normalizeAiError(error, 'gemini');
@@ -467,9 +534,10 @@ export default function ScanScreen() {
 
   const resetCamera = useCallback(() => {
     setCameraActive(true);
+    clearDecodedBarcode();
     void deleteOwnedReceiptImage(ownedImageUri ?? undefined);
     setOwnedImageUri(null);
-  }, [ownedImageUri]);
+  }, [clearDecodedBarcode, ownedImageUri]);
 
   const handleCloseSheet = useCallback(() => {
     setIsSheetVisible(false);
@@ -494,11 +562,19 @@ export default function ScanScreen() {
   const canCapture = granted && !isOffline && !isScanning;
   const instruction = scanMode === 'product' ? 'Point at barcode or grocery item' : 'Align receipt within the frame';
   const processing = PROCESSING_COPY[processingContext];
+  const showBarcode = scanMode === 'product' && decodedBarcode !== null;
 
   return (
     <View style={styles.screen}>
       {granted && cameraActive ? (
-        <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={flash === 'on'} />
+        <CameraView
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          facing="back"
+          enableTorch={flash === 'on'}
+          barcodeScannerSettings={scanMode === 'product' ? BARCODE_SCANNER_SETTINGS : undefined}
+          onBarcodeScanned={scanMode === 'product' ? handleBarcodeScanned : undefined}
+        />
       ) : (
         <LinearGradient colors={[Gradients.dark[0], Colors.black]} style={StyleSheet.absoluteFill} />
       )}
@@ -513,7 +589,7 @@ export default function ScanScreen() {
             <View style={styles.modePill}>
               <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
               <Pressable
-                onPress={() => { void Haptics.selectionAsync(); setScanMode('receipt'); }}
+                onPress={() => { void Haptics.selectionAsync(); handleModeChange('receipt'); }}
                 hitSlop={MODE_OPTION_HIT_SLOP}
                 accessibilityRole="button"
                 accessibilityLabel="Receipt mode"
@@ -523,7 +599,7 @@ export default function ScanScreen() {
                 <Text style={[styles.modeLabel, scanMode === 'receipt' && styles.modeLabelActive]}>Receipt</Text>
               </Pressable>
               <Pressable
-                onPress={() => { void Haptics.selectionAsync(); setScanMode('product'); }}
+                onPress={() => { void Haptics.selectionAsync(); handleModeChange('product'); }}
                 hitSlop={MODE_OPTION_HIT_SLOP}
                 accessibilityRole="button"
                 accessibilityLabel="Product mode"
@@ -553,7 +629,7 @@ export default function ScanScreen() {
 
           {/* Offline banner */}
           {isOffline ? (
-            <View accessibilityLiveRegion="polite" style={[styles.offlineBanner, { top: insets.top + OFFLINE_TOP_OFFSET }]}>
+            <View accessibilityLiveRegion="polite" style={[styles.offlineBanner, { top: insets.top + OFFLINE_TOP_OFFSET + (showBarcode ? BARCODE_PILL_CLEARANCE : 0) }]}>
               <View style={styles.offlineDot} />
               <Text style={styles.offlineText}>Offline. OCR needs a connection.</Text>
               <Pressable onPress={() => router.push('/expense/manual')} accessibilityRole="button" accessibilityLabel="Enter expense manually" style={styles.offlineAction}>
@@ -637,6 +713,21 @@ export default function ScanScreen() {
         onConfirm={handleConfirm}
         onCancel={handleCloseSheet}
       />
+
+      {/* The code the device decoded, product mode only. It is rendered after the
+          verification sheet so it stays visible alongside the result, which is
+          what DEC-B18 asks for and what the sheet, a shared locked-pair
+          component this row may not extend, cannot show itself. It is
+          information, not a control, so it never takes a touch. */}
+      {showBarcode ? (
+        <View pointerEvents="none" style={[styles.barcodeLayer, { top: insets.top + OFFLINE_TOP_OFFSET }]}>
+          <View accessible accessibilityLabel={`Scanned barcode ${decodedBarcode}`} style={styles.barcodePill}>
+            <BlurView intensity={30} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
+            <Barcode size={16} color={Colors.primaryContainer} />
+            <Text numberOfLines={1} style={styles.barcodeText}>{decodedBarcode}</Text>
+          </View>
+        </View>
+      ) : null}
 
       {duplicateWarning && pendingBatch && pendingBatch[0] ? (
         <DuplicateWarningModal
@@ -807,4 +898,22 @@ const styles = StyleSheet.create({
   illegibleTitle: { ...Typography.headlineMd, color: Colors.white, marginBottom: Spacing.s1 },
   illegibleBody: { ...Typography.labelMd, color: 'rgba(255,255,255,0.75)', textAlign: 'center', alignSelf: 'center', maxWidth: 260, marginBottom: Spacing.s5 },
   illegibleSecondary: { marginTop: Spacing.s2 },
+  // The decoded-code pill is the pair's instruction pill idiom (code.html:204-208)
+  // on the safe-area anchor the offline notice uses. It is not a touch target and
+  // adds no motion; the text shrinks and ellipsises rather than overflowing.
+  barcodeLayer: { position: 'absolute', left: 0, right: 0, alignItems: 'center', paddingHorizontal: Spacing.s6, zIndex: 20 },
+  barcodePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    maxWidth: '100%',
+    paddingHorizontal: Spacing.s4,
+    paddingVertical: Spacing.s2,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    overflow: 'hidden',
+  },
+  barcodeText: { ...Typography.labelMd, color: Colors.white, flexShrink: 1 },
 });

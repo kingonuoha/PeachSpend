@@ -39,6 +39,16 @@ function coerceUnits(value: unknown): number {
   return Number.isInteger(parsed) && parsed >= 1 ? parsed : 1;
 }
 
+// The barcode the device decoded in product mode. It is device data rather than
+// model output, but it is still interpolated into a prompt, so only a plausible
+// retail code survives: digits with optional grouping separators, bounded in
+// length. Anything else is dropped rather than passed through (DEC-B41).
+function normalizeBarcode(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const digits = value.replace(/[\s-]/g, '');
+  return /^\d{4,18}$/.test(digits) ? digits : '';
+}
+
 // Product parse. Returns the same CaptureCandidate shape the receipt parse
 // returns, so the caller maps both through one code path, but with the product
 // scenario's own tolerances: merchant and price are optional, a text price is
@@ -97,7 +107,7 @@ function parseProductResponse(text: string, provider: AiProvider = 'gemini'): { 
 }
 
 class GeminiService {
-  async scanReceipt(base64Image: string, mode: 'receipt' | 'product' = 'receipt', options: { signal?: AbortSignal } = {}): Promise<ScannedReceipt[]> {
+  async scanReceipt(base64Image: string, mode: 'receipt' | 'product' = 'receipt', options: { signal?: AbortSignal; barcode?: string } = {}): Promise<ScannedReceipt[]> {
     const apiKey = await databaseService.getSecret('gemini_api_key');
     if (!apiKey) throw new AiError('missing_key', 'gemini', 'AI provider key is not configured');
 
@@ -134,9 +144,17 @@ class GeminiService {
       }
     `;
 
+    // The decoded code is product context only: it is appended to the product
+    // prompt and nowhere else, so the receipt prompt and the receipt path are
+    // byte identical to before this change (DEC-B41).
+    const scannedBarcode = mode === 'product' ? normalizeBarcode(options.barcode) : '';
+    const productBarcodeLine = scannedBarcode
+      ? `\n      The package barcode read on this device is ${scannedBarcode}. Use it to identify the product, and never invent a different code.`
+      : '';
+
     const productPrompt = `
       You are a product identification assistant.
-      Identify the product shown in the image.
+      Identify the product shown in the image.${productBarcodeLine}
 
       FIRST, assess the legibility of the image. Set "legibility" to "poor" ONLY when no product can be identified at all, for example the image is too blurry, too dark, or shows no product.
       A product photo normally has no store name in it, and a price is often not visible. Neither of those makes the image illegible, so never set "legibility" to "poor" because a merchant or a price is missing.
