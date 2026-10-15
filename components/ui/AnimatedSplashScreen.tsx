@@ -38,18 +38,23 @@ const TEXT_BLOCK_GUTTER = Spacing.s6;
 const TEXT_BLOCK_MAX_FONT_SCALE = 1.2;
 
 // The splash surface is one fixed brand purple in light, dark, and across every
-// theme pack (DEC-B06), so it reads the locked light-theme primary token rather
-// than a fresh literal (DEC-B05). Content on a purple surface is white, and the
-// tagline label sits at 70 percent, per the design system contrast rule.
-const SPLASH_BRAND_PURPLE = LightTheme.primary;
+// theme pack (DEC-B06), so it reads a locked light-theme token rather than a
+// fresh literal (DEC-B05). This fill is the lighter primary container shade: the
+// accent circle below grows to cover the viewport, so the circle, not this fill,
+// is the surface the text is finally read against (DEC-B38).
+const SPLASH_BRAND_PURPLE = LightTheme.primaryContainer;
 const SPLASH_ON_BRAND = Colors.onPrimary;
-const SPLASH_LABEL_COLOR = 'rgba(255, 255, 255, 0.7)';
 
-// The accent circle sits on the fixed brand purple surface, so it reads the
-// lighter primary container token to stay visible against it (DEC-B35). Without
-// this the circle shares the surface colour and its scale animation has no
-// visible result. Same token access pattern as the surface above; no new hex.
-const SPLASH_ACCENT_CIRCLE = LightTheme.primaryContainer;
+// The accent circle carries the brand primary, the darker of the two shades
+// (DEC-B38). Because it covers the viewport as it scales it is the settled
+// surface, so it is the fill the tagline contrast is measured against. The two
+// fills keep the same separation DEC-B35 introduced, now read the other way
+// round, so the expanding accent stays visible against the surface. Same token
+// access pattern as the surface above; no new hex. The tagline is full white
+// rather than the 70 percent label treatment, a splash only departure from the
+// design system label rule taken because the tagline is the only text on the
+// screen (DEC-B38).
+const SPLASH_ACCENT_CIRCLE = LightTheme.primary;
 
 // The block's top edge is pinned at the y a one line tagline occupies, so a
 // wrapped second line grows downward into empty space instead of upward into
@@ -248,7 +253,7 @@ const styles = StyleSheet.create({
   subtitle: {
     fontFamily: 'Manrope_400Regular',
     fontSize: 13,
-    color: SPLASH_LABEL_COLOR,
+    color: SPLASH_ON_BRAND,
     marginTop: 4,
     letterSpacing: 4,
     textTransform: 'uppercase',
