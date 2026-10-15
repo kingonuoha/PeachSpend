@@ -399,10 +399,15 @@ class AIChatService {
     if (/\b(at|from) \w/i.test(lower) || /merchant/.test(lower)) matches.push('merchant_query');
     if (/last week|this month|in (january|february|march|april|may|june|july|august|september|october|november|december)|between|this year|last month|this week/.test(lower)) matches.push('date_range_query');
     if (/recent|latest|last few|what did I spend|recent expenses/.test(lower)) matches.push('recent_expenses');
-    if (/when will I|at this rate|how much will|project|forecast|predict/.test(lower)) matches.push('forecast');
+    // `lower` is already lowercased at :395, so every literal here must be lowercase
+    // or it can never match (BUG-09-13). `when will i` was written with an uppercase
+    // `I` and was dead against this input.
+    if (/when will i|at this rate|how much will|project|forecast|predict/.test(lower)) matches.push('forecast');
     if (/log|add|record|save|spent \d|enter .* expense/.test(lower)) matches.push('log_expense');
     if (/owe me|reimbursable|get paid back|reimburse/.test(lower)) matches.push('reimbursable');
-    if (/on track|budget|how am I doing|limit|under budget|over budget/.test(lower)) matches.push('budget_check');
+    // Same defect as the forecast pattern above: `how am I doing` kept an uppercase
+    // `I` and could not match the lowercased message (BUG-09-13).
+    if (/on track|budget|how am i doing|limit|under budget|over budget/.test(lower)) matches.push('budget_check');
 
     if (matches.length === 0) return ['general'];
     if (matches.length <= 2) return matches;

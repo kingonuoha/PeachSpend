@@ -400,3 +400,52 @@ describe('AI chat states an unset budget honestly (BUG-09-12)', () => {
     expect(systemMessage).not.toContain('Monthly budget: not set');
   });
 });
+
+// BUG-09-13: `classifyIntent` lowercases the message into `lower` and then tested
+// patterns that still carried an uppercase `I`, so `when will I` and `how am I
+// doing` could never match. Both alternatives are now lowercase, aligned with the
+// normalised input. `classifyIntent` is pure, so these call it directly.
+describe('AI chat intent alternatives match the lowercased message (BUG-09-13)', () => {
+  it('classifies "when will I ..." as forecast', () => {
+    expect(aiChatService.classifyIntent('when will I run out of money')).toEqual(['forecast']);
+  });
+
+  it('classifies "how am I doing" as budget_check', () => {
+    expect(aiChatService.classifyIntent('how am I doing')).toEqual(['budget_check']);
+  });
+
+  it('keeps the other forecast alternatives matching', () => {
+    for (const phrase of [
+      'forecast my spending',
+      'predict next month',
+      'project my expenses',
+      'how much will i spend next month',
+    ]) {
+      expect(aiChatService.classifyIntent(phrase)).toContain('forecast');
+    }
+  });
+
+  it('keeps the other budget_check alternatives matching', () => {
+    for (const phrase of ['budget', 'am I on track', 'under budget', 'over budget', 'what is my limit']) {
+      expect(aiChatService.classifyIntent(phrase)).toContain('budget_check');
+    }
+  });
+
+  it('keeps the neighbouring intents classifying as before', () => {
+    expect(aiChatService.classifyIntent('recent expenses')).toEqual(['recent_expenses']);
+    expect(aiChatService.classifyIntent('latest expenses')).toEqual(['recent_expenses']);
+    expect(aiChatService.classifyIntent('log coffee 5')).toEqual(['log_expense']);
+    expect(aiChatService.classifyIntent('how much did i spend on food')).toEqual(['category_query']);
+    expect(aiChatService.classifyIntent('merchant total')).toEqual(['merchant_query']);
+    expect(aiChatService.classifyIntent('what is the weather')).toEqual(['general']);
+  });
+
+  // Characterisation, not a requirement. `what did I spend` in the recent_expenses
+  // pattern carries the same uppercase-I defect. It is named in the evidence and
+  // escalated rather than fixed here, so this pins today's behaviour and will fail
+  // loudly (as intended) if that third alternative is ever corrected.
+  it('records the unfixed third uppercase-I alternative for the escalation', () => {
+    expect(aiChatService.classifyIntent('what did I spend')).toEqual(['general']);
+    expect(aiChatService.classifyIntent('what did i spend')).toEqual(['general']);
+  });
+});
