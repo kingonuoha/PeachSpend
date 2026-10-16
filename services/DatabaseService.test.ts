@@ -335,13 +335,14 @@ describe('DatabaseService imported amount reads its true value (BUG-09-15)', () 
     database.getAllAsync.mockResolvedValue([
       { id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining', note: '', scanned: 0, date: 1710000000000 },
       { id: 'b', merchant: 'Mall', amount: 2900, currency: 'NGN', category: 'shopping', note: 'Sale', scanned: 1, date: 1710000000000 },
+      { id: 'c', merchant: 'Kiosk', amount: 12.345, currency: 'NGN', category: 'other', note: 'Converted', scanned: 0, date: 1710000000000 },
     ]);
 
     const csv = await databaseService.exportToCSV(0, Date.now());
     const result = databaseService.parseImportData(csv);
 
     expect(result.errors).toEqual([]);
-    expect(result.expenses.map(expense => expense.amount)).toEqual([1250.5, 2900]);
+    expect(result.expenses.map(expense => expense.amount)).toEqual([1250.5, 2900, 12.345]);
   });
 });
 
@@ -353,9 +354,17 @@ describe('parseMoneyAmount reads a grouped or decimal amount and refuses the res
     expect(parseMoneyAmount('1250,50')).toEqual({ valid: true, value: 1250.5 });
     expect(parseMoneyAmount('1.250,50')).toEqual({ valid: true, value: 1250.5 });
     expect(parseMoneyAmount(' 1,250.50 ')).toEqual({ valid: true, value: 1250.5 });
-    expect(parseMoneyAmount('1.500')).toEqual({ valid: true, value: 1500 });
     expect(parseMoneyAmount('1250.505')).toEqual({ valid: true, value: 1250.505 });
     expect(parseMoneyAmount('.5')).toEqual({ valid: true, value: 0.5 });
+  });
+
+  it('keeps the dot as the decimal separator so an exported three decimal amount survives', () => {
+    // `String(amount)` is what the export writer emits, so these are real file values.
+    expect(parseMoneyAmount(String(12.345))).toEqual({ valid: true, value: 12.345 });
+    expect(parseMoneyAmount('1.500')).toEqual({ valid: true, value: 1.5 });
+    expect(parseMoneyAmount(String(0.1 + 0.2))).toEqual({ valid: true, value: 0.1 + 0.2 });
+    // A repeated separator cannot be a decimal, so dot grouping still reads.
+    expect(parseMoneyAmount('1.250.000')).toEqual({ valid: true, value: 1250000 });
   });
 
   it('refuses an amount it cannot read unambiguously instead of truncating it', () => {

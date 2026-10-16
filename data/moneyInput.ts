@@ -16,21 +16,26 @@
 // because an imported cell may legitimately be grouped.
 //
 // Reading rules, each chosen so a real file reads correctly:
-// - A final separator followed by exactly three digits, with one separator character
-//   used throughout, is a thousands group: `2,900` is 2900, `1,250.50` is 1250.5 and
-//   `1.250.000` is 1250000.
+// - A trailing group of exactly three digits is a thousands group when one separator
+//   character is used throughout and that separator is either the comma this app's CSV
+//   convention uses for grouping, or a separator repeated in the value so it cannot be
+//   a decimal at all: `2,900` is 2900, `1,250.50` is 1250.5 and `1.250.000` is 1250000.
 // - Any other trailing run is the decimal part: `1250,50` is 1250.5, `1.250,50` is
-//   1250.5 and `1250.505` is 1250.505.
+//   1250.5, and `1250.505` is 1250.505. A single dot with three digits after it stays a
+//   decimal, because the export writer emits `String(amount)` and writes `12.345` for
+//   12.345, which must not come back as 12345.
 // - Anything else is refused: a currency symbol, a letter, a space, or a malformed
 //   separator run such as `1,25,0`. Refused means the caller skips the row and says
 //   so. It never means a truncated value, and it never means zero, which would be a
 //   different lie about the same row.
 //
-// One residual ambiguity is stated rather than hidden: `12,345` is read as 12345,
-// the thousands reading, because the file shape this app writes is the US-style
-// comma CSV the export writer emits. A European file meaning 12.345 with three
-// decimal places would be read as 12345 instead. That trade is deliberate: the row
-// requires `2,900` to read as 2900, so the thousands reading has to win.
+// One residual ambiguity is stated rather than hidden: `12,345` is read as 12345, the
+// thousands reading, because the file shape this app writes is the US-style comma CSV
+// the export writer emits. A European file meaning 12.345 written with a comma would be
+// read as 12345 instead, and an integer written with dot grouping and no decimal part,
+// `1.250`, is read as 1.25. That trade is deliberate: the row requires `2,900` to read
+// as 2900, so the comma grouping reading has to win, and the dot stays the decimal
+// separator the app itself uses.
 
 export type MoneyParse = { valid: true; value: number } | { valid: false };
 
@@ -77,8 +82,16 @@ export function parseMoneyAmount(raw: string | null | undefined): MoneyParse {
   } else {
     const separator = unsigned[lastSeparator];
     const trailing = unsigned.slice(lastSeparator + 1);
-    const uniformSeparator = new Set(unsigned.match(/[.,]/g) ?? []).size === 1;
-    if (uniformSeparator && trailing.length === 3 && GROUPED_DIGITS.test(unsigned)) {
+    const separators = unsigned.match(/[.,]/g) ?? [];
+    // The comma groups thousands in the CSV convention this app writes, and a separator
+    // repeated inside one value cannot be a decimal at all. A single dot with three
+    // digits after it is therefore left as a decimal, which keeps an exported 12.345
+    // reading back as 12.345 rather than as 12345.
+    const isThousandsGroup = new Set(separators).size === 1
+      && trailing.length === 3
+      && GROUPED_DIGITS.test(unsigned)
+      && (separator === ',' || separators.length > 1);
+    if (isThousandsGroup) {
       wholeDigits = unsigned.replace(/[.,]/g, '');
     } else {
       fraction = trailing;
