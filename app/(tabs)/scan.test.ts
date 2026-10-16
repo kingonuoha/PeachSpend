@@ -78,11 +78,15 @@ import {
   scanFailureDialogCopy,
   acceptBarcodeScan,
   productScanOptions,
+  reduceBarcode,
   evaluateCaptureGate,
   firstBlockedCaptureMessage,
 } from './scan';
+// eslint-disable-next-line import/first
+import type { BarcodeGate, BarcodeScanEvent, ScanOutcome } from './scan';
 
 const UPC_A = '0123456789012';
+const UPC_B = '4006381333931';
 const IDLE_PRODUCT = { mode: 'product' as const, isScanning: false, cameraActive: true };
 
 describe('scan screen barcode guard', () => {
@@ -127,6 +131,59 @@ describe('scan screen barcode plumbing', () => {
 
   it('sends no code when nothing was decoded', () => {
     expect(productScanOptions('product', null, signal).barcode).toBeUndefined();
+  });
+});
+
+// The decoded code's lifecycle. The screen renders native UI and cannot be rendered here, so these
+// pin the pure reducer the screen uses for both the decode event and the scan-end event: a code must
+// not survive a scan that ended without a confirmed result, and a repeated event for one code must
+// not count as a second scan.
+describe('scan decoded-code lifecycle', () => {
+  const decode = (data: string, gate: BarcodeGate = IDLE_PRODUCT): BarcodeScanEvent => ({ kind: 'decoded', gate, data });
+  const ended = (outcome: ScanOutcome): BarcodeScanEvent => ({ kind: 'ended', outcome });
+
+  it('drops the decoded code when the scan is cancelled', () => {
+    expect(reduceBarcode(UPC_A, ended('cancelled'))).toBeNull();
+  });
+
+  it('drops the decoded code when the scan fails', () => {
+    expect(reduceBarcode(UPC_A, ended('failed'))).toBeNull();
+  });
+
+  it('drops the decoded code when the result is abandoned', () => {
+    expect(reduceBarcode(UPC_A, ended('abandoned'))).toBeNull();
+  });
+
+  it('keeps the decoded code when the result is confirmed, because the code belongs to that result', () => {
+    expect(reduceBarcode(UPC_A, ended('confirmed'))).toBe(UPC_A);
+  });
+
+  it('lets a later frame decode its own code after a scan that ended without a result', () => {
+    // Without the drop, the ended scan's code would be shown against, and sent with, this frame.
+    for (const held of [reduceBarcode(UPC_A, ended('cancelled')), reduceBarcode(UPC_A, ended('failed')), reduceBarcode(UPC_A, ended('abandoned'))]) {
+      expect(reduceBarcode(held, decode(UPC_B))).toBe(UPC_B);
+    }
+  });
+
+  it('still accepts a different code within the same scan, so the dedupe is per code and not per scan', () => {
+    expect(reduceBarcode(UPC_A, decode(UPC_B))).toBe(UPC_B);
+  });
+
+  it('keeps one barcode to one scan, so the drop at the scan end cannot turn a repeated event into a second provider request', () => {
+    // The scanner repeats the code on every frame it stays in view, and the provider call runs once
+    // per capture and reads the held code. Every repeat must therefore be dropped, so the held code
+    // stays the one code the capture sends. The drop at the scan end runs after the frames, never
+    // between them, so it cannot reset the dedupe mid scan and produce a second request.
+    let held: string | null = null;
+    const accepted: string[] = [];
+    for (let frame = 0; frame < 6; frame += 1) {
+      const next = reduceBarcode(held, decode(UPC_A));
+      if (next !== held) accepted.push(next as string);
+      held = next;
+    }
+    expect(accepted).toEqual([UPC_A]);
+    expect(productScanOptions('product', held, new AbortController().signal).barcode).toBe(UPC_A);
+    expect(reduceBarcode(held, ended('failed'))).toBeNull();
   });
 });
 

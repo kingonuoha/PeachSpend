@@ -119,16 +119,42 @@ export function resolveScanFailure(code: AiErrorCode, mode: ScanMode): ScanFailu
   return { kind: 'toast', message: getAiErrorMessage(code, mode) };
 }
 
+export interface BarcodeGate {
+  mode: ScanMode;
+  isScanning: boolean;
+  cameraActive: boolean;
+}
+
 // A decoded code is accepted as product context only: product mode, a camera
 // that is live, and no scan already in flight. Receipt mode can never accept
 // one, so a receipt scan can never carry a barcode even if one were in state.
-export function acceptBarcodeScan(
-  gate: { mode: ScanMode; isScanning: boolean; cameraActive: boolean },
-  scanned: string,
-): string | null {
+export function acceptBarcodeScan(gate: BarcodeGate, scanned: string): string | null {
   if (gate.mode !== 'product' || gate.isScanning || !gate.cameraActive) return null;
   const code = scanned.trim();
   return code.length > 0 ? code : null;
+}
+
+// How a scan ends. A confirmed result is the only outcome that keeps the code, because the
+// code belongs to the result the user just saved (DEC-B18). Every other outcome drops it, so a
+// stale code can never be shown against, or sent with, a later frame.
+export type ScanOutcome = 'cancelled' | 'failed' | 'abandoned' | 'confirmed';
+
+export type BarcodeScanEvent =
+  | { kind: 'decoded'; gate: BarcodeGate; data: string }
+  | { kind: 'ended'; outcome: ScanOutcome };
+
+// The decoded code's lifecycle, one pure reducer so the screen and its tests share the same rules.
+// `decoded` is one barcode event: the scanner reports a code on every frame it stays in view, so a
+// repeat of the code already held is dropped and one barcode produces one scan rather than one per
+// frame. `ended` is any terminal outcome that is not a confirmed result (see ScanOutcome) and drops
+// the code, because it no longer belongs to any frame. The screen sends that event for a cancel, a
+// failure and an abandoned result, and never for a confirmed save: a confirmed code belongs to the
+// result the user just saved and the screen navigates away.
+export function reduceBarcode(held: string | null, event: BarcodeScanEvent): string | null {
+  if (event.kind === 'ended') return event.outcome === 'confirmed' ? held : null;
+  const code = acceptBarcodeScan(event.gate, event.data);
+  if (code === null || code === held) return held;
+  return code;
 }
 
 // The decoded code reaches the provider as product context only. The provider
@@ -329,11 +355,18 @@ export default function ScanScreen() {
   const [pendingBatch, setPendingBatch] = useState<ScannedReceipt[] | null>(null);
   const [ownedImageUri, setOwnedImageUri] = useState<string | null>(null);
   const [frameHeight, setFrameHeight] = useState(0);
-  // The code the device decoded in product mode. Held until the result is
-  // dismissed or the mode changes, so a stale code can never be attached to a
-  // later photograph of something else.
+  // The code the device decoded in product mode, held for the frame currently being scanned. It is
+  // dropped when the scan ends without a confirmed result, so a stale code can never be shown
+  // against, or sent with, a later frame. The ref and the state are kept in step by
+  // applyDecodedBarcode so the scan handler and the pill can never disagree, and the dedupe lives in
+  // the ref so a repeated event cannot re-render.
   const [decodedBarcode, setDecodedBarcode] = useState<string | null>(null);
   const lastBarcodeRef = useRef<string | null>(null);
+
+  const applyDecodedBarcode = useCallback((next: string | null) => {
+    lastBarcodeRef.current = next;
+    setDecodedBarcode(next);
+  }, []);
 
   useEffect(() => {
     const checkApiKey = async () => {
@@ -403,27 +436,29 @@ export default function ScanScreen() {
     return convertToUserCurrency(rawItems);
   }, [convertToUserCurrency, decodedBarcode]);
 
-  const clearDecodedBarcode = useCallback(() => {
-    lastBarcodeRef.current = null;
-    setDecodedBarcode(null);
-  }, []);
+  // The scan ended without a confirmed result: a cancel, a failure, or a result the user
+  // abandoned. The decoded code no longer belongs to any frame, so it is dropped here rather than
+  // left to be shown against, or sent with, a later one.
+  const endDecodedBarcode = useCallback((outcome: ScanOutcome) => {
+    applyDecodedBarcode(reduceBarcode(lastBarcodeRef.current, { kind: 'ended', outcome }));
+  }, [applyDecodedBarcode]);
 
   // The scanner reports the same code for as long as it stays in frame, so an
   // identical read is dropped instead of re-rendering the HUD. The guard is the
   // same one the props use, kept here so receipt mode cannot decode even if a
   // handler were reached.
   const handleBarcodeScanned = useCallback((result: BarcodeScanningResult) => {
-    const code = acceptBarcodeScan({ mode: scanMode, isScanning, cameraActive }, result.data);
-    if (!code || code === lastBarcodeRef.current) return;
-    lastBarcodeRef.current = code;
-    setDecodedBarcode(code);
+    const held = lastBarcodeRef.current;
+    const next = reduceBarcode(held, { kind: 'decoded', gate: { mode: scanMode, isScanning, cameraActive }, data: result.data });
+    if (next === held) return;
+    applyDecodedBarcode(next);
     void Haptics.selectionAsync();
-  }, [cameraActive, isScanning, scanMode]);
+  }, [applyDecodedBarcode, cameraActive, isScanning, scanMode]);
 
   const handleModeChange = useCallback((mode: ScanMode) => {
     setScanMode(mode);
-    clearDecodedBarcode();
-  }, [clearDecodedBarcode]);
+    endDecodedBarcode('abandoned');
+  }, [endDecodedBarcode]);
 
   // The real mode of the operation that failed is passed in, so receipt mode gets receipt copy and
   // product mode gets product copy rather than the receipt context being hardcoded.
@@ -538,12 +573,13 @@ export default function ScanScreen() {
         await deleteOwnedReceiptImage(ownedImageUri ?? undefined);
         setOwnedImageUri(null);
         setCameraActive(true);
+        endDecodedBarcode('failed');
       }
     } finally {
       if (scanAbortRef.current === controller) scanAbortRef.current = null;
       setIsScanning(false);
     }
-  }, [handleFailure, ownedImageUri, resolveItems]);
+  }, [endDecodedBarcode, handleFailure, ownedImageUri, resolveItems]);
 
   const cancelProcessing = useCallback(async () => {
     scanAbortRef.current?.abort();
@@ -551,7 +587,8 @@ export default function ScanScreen() {
     await deleteOwnedReceiptImage(ownedImageUri ?? undefined);
     setOwnedImageUri(null);
     setCameraActive(true);
-  }, [ownedImageUri]);
+    endDecodedBarcode('cancelled');
+  }, [endDecodedBarcode, ownedImageUri]);
 
   const handleGalleryPick = useCallback(async () => {
     if (isScanning) return;
@@ -574,8 +611,9 @@ export default function ScanScreen() {
       handleFailure(error, 'Failed to scan gallery image', 'gallery');
       await deleteOwnedReceiptImage(copiedUri ?? ownedImageUri ?? undefined);
       setOwnedImageUri(null);
+      endDecodedBarcode('failed');
     }
-  }, [ensureOnline, handleFailure, isScanning, ownedImageUri, runScan, showToast]);
+  }, [endDecodedBarcode, ensureOnline, handleFailure, isScanning, ownedImageUri, runScan, showToast]);
 
   const handleCapture = useCallback(async () => {
     if (isScanning) return;
@@ -603,8 +641,9 @@ export default function ScanScreen() {
       await deleteOwnedReceiptImage(copiedUri ?? ownedImageUri ?? undefined);
       setOwnedImageUri(null);
       setCameraActive(true);
+      endDecodedBarcode('failed');
     }
-  }, [ensureOnline, handleFailure, isScanning, ownedImageUri, runScan, scanMode, showToast]);
+  }, [endDecodedBarcode, ensureOnline, handleFailure, isScanning, ownedImageUri, runScan, scanMode, showToast]);
 
   const handleRetryScan = useCallback(async () => {
     if (!ownedImageUri || isScanning) return;
@@ -631,10 +670,10 @@ export default function ScanScreen() {
 
   const resetCamera = useCallback(() => {
     setCameraActive(true);
-    clearDecodedBarcode();
+    endDecodedBarcode('abandoned');
     void deleteOwnedReceiptImage(ownedImageUri ?? undefined);
     setOwnedImageUri(null);
-  }, [clearDecodedBarcode, ownedImageUri]);
+  }, [endDecodedBarcode, ownedImageUri]);
 
   const handleCloseSheet = useCallback(() => {
     setIsSheetVisible(false);
