@@ -23,6 +23,13 @@ const MAX_HISTORY_MESSAGES = 50;
 const TRIM_HISTORY_TO = 40;
 const MAX_DYNAMIC_TOKENS = 300;
 
+// BUG-09-16: one wording for a budget the user never set, so no budget figure in
+// the prompt states a spend, a percent used, or a remaining amount against a
+// limit that does not exist. It is the phrase the static summary line already
+// uses (BUG-09-12), reused rather than restated so the prompt cannot tell the
+// model two different things about the same state.
+const NO_BUDGET_FIGURE = 'not set (no monthly spending limit has been set, so do not compare spending against a limit or assume one exists)';
+
 class AIChatService {
   private cachedSummary: StaticSummary | null = null;
   private activeCurrency = 'NGN';
@@ -486,7 +493,15 @@ class AIChatService {
           const budget = parseStoredBudget(await databaseService.getSetting('monthly_budget'));
           const budgetStatus = await databaseService.getBudgetStatus(budget, startOfMonth, endOfMonth);
           const projectedTotal = budgetStatus.dailySpendRate * budgetStatus.daysRemaining + budgetStatus.spent;
-          data = `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${this.fmt(budgetStatus.remaining)}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`;
+          // BUG-09-16: `getBudgetStatus` returns remaining 0 for a zero budget, so
+          // an unguarded line stated a remaining budget against a limit the user
+          // never set, right beside a line telling the model not to assume one.
+          // With no limit set the line says so in the static summary line's own
+          // wording. The spend so far and the projection do not depend on a limit,
+          // so they stay real data either way. The set case is unchanged.
+          data = budget > 0
+            ? `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${this.fmt(budgetStatus.remaining)}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`
+            : `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${NO_BUDGET_FIGURE}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`;
           break;
         }
         case 'reimbursable': {
@@ -497,7 +512,16 @@ class AIChatService {
         case 'budget_check': {
           const budget = parseStoredBudget(await databaseService.getSetting('monthly_budget'));
           const budgetStatus = await databaseService.getBudgetStatus(budget, startOfMonth, endOfMonth);
-          data = `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${this.fmt(budgetStatus.remaining)}\nUsed: ${budgetStatus.usedPercent.toFixed(1)}%\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`;
+          // BUG-09-16: `getBudgetStatus` returns remaining 0 and usedPercent 0 for a
+          // zero budget, so an unguarded slice stated a remaining amount and a
+          // percent used against a limit the user never set. With no limit set the
+          // remaining line says so in the static summary line's own wording, and the
+          // percent line is dropped rather than reworded, because a share of a limit
+          // that does not exist has no meaning. The spend and the daily rate are
+          // real data either way. The set case is unchanged.
+          data = budget > 0
+            ? `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${this.fmt(budgetStatus.remaining)}\nUsed: ${budgetStatus.usedPercent.toFixed(1)}%\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`
+            : `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${NO_BUDGET_FIGURE}\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`;
           break;
         }
         default:

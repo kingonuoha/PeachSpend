@@ -401,6 +401,92 @@ describe('AI chat states an unset budget honestly (BUG-09-12)', () => {
   });
 });
 
+// BUG-09-16: the static budget line stopped stating a spend against an unset
+// budget (BUG-09-12), but the `budget_check` and `forecast` slices still stated
+// `Remaining: ₦0`, `Remaining budget: ₦0` and `Used: 0.0%` from a budget status
+// that returns zero for both. Every budget figure in the prompt now says the
+// limit is not set, in that same static line's wording. The set case is the exact
+// text the prompt produced before this change, pinned here so its bytes cannot
+// move.
+describe('AI chat states an unset budget honestly in the dynamic slices (BUG-09-16)', () => {
+  const setStoredBudget = (monthlyBudget: string) => {
+    mocks.getAllSettings.mockResolvedValue({ monthly_budget: monthlyBudget, currency: 'NGN' });
+    mocks.getSetting.mockImplementation(async (key: string) => {
+      switch (key) {
+        case 'chat_provider': return 'gemini';
+        case 'chat_gemini_model': return 'gemini-2.5-flash';
+        case 'monthly_budget': return monthlyBudget;
+        case 'currency': return 'NGN';
+        default: return null;
+      }
+    });
+  };
+
+  // The static summary is cached for 60s on the singleton, so each read is forced
+  // the way a cold start does it. `forecast my budget` classifies as both of the
+  // slices this row changes, so one prompt carries both of them.
+  const promptFor = async (monthlyBudget: string): Promise<string> => {
+    (aiChatService as unknown as { cachedSummary: null }).cachedSummary = null;
+    setStoredBudget(monthlyBudget);
+    await aiChatService.sendMessage('forecast my budget');
+    const request = providerMocks.chatWithProvider.mock.calls[0][1] as ChatProviderRequest;
+    return request.messages[0].content as string;
+  };
+
+  const noLimit = 'not set (no monthly spending limit has been set, so do not compare spending against a limit or assume one exists)';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSecret.mockResolvedValue('test-key');
+    mocks.getChatHistory.mockResolvedValue([]);
+    mocks.saveChatMessage.mockResolvedValue(undefined);
+    mocks.getMonthlySummary.mockResolvedValue({ totalSpent: 1000 });
+    mocks.getIncomeForPeriod.mockResolvedValue(0);
+    mocks.getReimbursableTotal.mockResolvedValue({ total: 0, expenses: [] });
+    mocks.getExpensesByCategory.mockResolvedValue([]);
+    mocks.getRecentExpenses.mockResolvedValue([]);
+    providerMocks.chatWithProvider.mockResolvedValue({ text: 'Nothing unusual.', provider: 'gemini', model: 'm' });
+  });
+
+  it('states that no limit is set in every budget figure instead of a figure against a zero budget', async () => {
+    // What the data layer really returns for a zero budget: remaining 0 and
+    // usedPercent 0 (services/DatabaseService.ts:1320 and :1321).
+    mocks.getBudgetStatus.mockResolvedValue({ spent: 1000, remaining: 0, usedPercent: 0, dailySpendRate: 25, daysRemaining: 12 });
+
+    const prompt = await promptFor('');
+
+    // Both slices rendered, so the absence assertions below cannot be vacuous.
+    expect(prompt).toContain('[forecast]');
+    expect(prompt).toContain('[budget_check]');
+    expect(prompt).toContain('Daily spend rate: ₦25/day');
+    expect(prompt).toContain('Spent: ₦1,000');
+    expect(prompt).toContain('Daily rate: ₦25/day');
+
+    // The new lines, in the static budget line's own wording, and that line
+    // itself, which this row does not change.
+    expect(prompt).toContain(`Remaining: ${noLimit}`);
+    expect(prompt).toContain(`Remaining budget: ${noLimit}`);
+    expect(prompt).toContain('Monthly budget: not set');
+
+    // The old figures, and any percent used, are gone.
+    expect(prompt).not.toContain('Remaining: ₦0');
+    expect(prompt).not.toContain('Remaining budget: ₦0');
+    expect(prompt).not.toContain('Used:');
+    expect(prompt).not.toContain('%');
+  });
+
+  it('keeps the set case byte-identical to the slices the prompt produced before the fix', async () => {
+    mocks.getBudgetStatus.mockResolvedValue({ spent: 1000, remaining: 56000, usedPercent: 1.5, dailySpendRate: 25, daysRemaining: 12 });
+
+    const prompt = await promptFor('66000');
+
+    expect(prompt).toContain('[budget_check]\nSpent: ₦1,000\nRemaining: ₦56,000\nUsed: 1.5%\nDaily rate: ₦25/day');
+    expect(prompt).toContain('[forecast]\nDaily spend rate: ₦25/day\nDays remaining: 12\nSpent so far: ₦1,000\nRemaining budget: ₦56,000\nProjected month end at current rate: ₦1,300');
+    expect(prompt).not.toContain('Remaining: not set');
+    expect(prompt).not.toContain('Remaining budget: not set');
+  });
+});
+
 // BUG-09-13: `classifyIntent` lowercases the message into `lower` and then tested
 // patterns that still carried an uppercase `I`, so `when will I` and `how am I
 // doing` could never match. Both alternatives are now lowercase, aligned with the
