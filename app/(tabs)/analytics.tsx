@@ -1,10 +1,10 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  FlatList,
   Modal,
   Pressable,
   RefreshControl,
-  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -186,6 +186,28 @@ export default function AnalyticsScreen() {
     ? categoryMeta[categoryFilter]?.title ?? categoryFilter
     : null;
 
+  // The detail pager receives the visible order of the list it was opened from, so
+  // the list and the pager agree about swiping. Built once per change to the
+  // visible list rather than once per row: the previous per-row rebuild handed
+  // every row a brand new array, which defeated ExpenseItem's React.memo and made
+  // the render cost grow with the square of the list length.
+  const detailOrderIds = useMemo(() => visibleExpenses.map(expense => expense.id), [visibleExpenses]);
+
+  // One row renderer for the virtualized list. It carries no layout of its own:
+  // ExpenseItem owns its card, its margin and its press behaviour, exactly as it
+  // did when this list was a ScrollView child.
+  const renderExpenseRow = useCallback(
+    ({ item }: { item: Expense }) => (
+      <ExpenseItem
+        expense={item}
+        searchQuery={searchQuery}
+        detailOrigin="insights"
+        detailOrderIds={detailOrderIds}
+      />
+    ),
+    [searchQuery, detailOrderIds],
+  );
+
   const onSelectTimeframe = useCallback((timeframe: InsightTimeframe) => {
     if (timeframe === 'custom') {
       setDatePickerVisible(true);
@@ -257,7 +279,13 @@ export default function AnalyticsScreen() {
         </View>
       </View>
 
-      <ScrollView
+      {/* BUG-09-11b. The transaction history can grow without bound, so it is a
+          virtualized list rather than a ScrollView that built every row up front.
+          Its header is the unchanged Insights content above the list, so the
+          screen's structure, spacing and copy are identical; only the rows below
+          the fold stop being rendered. */}
+      <FlatList
+        style={{ flex: 1 }}
         showsVerticalScrollIndicator={false}
         contentContainerStyle={{
           paddingHorizontal: Spacing.s5,
@@ -270,7 +298,11 @@ export default function AnalyticsScreen() {
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={retry} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
         }
-      >
+        data={visibleExpenses}
+        keyExtractor={expense => expense.id}
+        renderItem={renderExpenseRow}
+        ListHeaderComponent={
+          <>
         {/* Timeframe selector (FR-03.5) */}
         <View style={[styles.timeframeBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
           {TIMEFRAMES.map(timeframe => {
@@ -609,8 +641,9 @@ export default function AnalyticsScreen() {
             <PeachButton title="Retry" variant="destructive" size="xs" onPress={retry} />
           </LuminousCard>
         ) : null}
-
-        {visibleExpenses.length === 0 ? (
+          </>
+        }
+        ListEmptyComponent={
           <LuminousCard style={[styles.emptyCard, { borderColor: ts.raw.outline }]}>
             <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
               <Search size={18} color={ts.raw.primary} />
@@ -634,20 +667,8 @@ export default function AnalyticsScreen() {
               </ScalePressable>
             ) : null}
           </LuminousCard>
-        ) : (
-          <View style={styles.transactionList}>
-            {visibleExpenses.map(expense => (
-              <ExpenseItem
-                key={expense.id}
-                expense={expense}
-                searchQuery={searchQuery}
-                detailOrigin="insights"
-                detailOrderIds={visibleExpenses.map(item => item.id)}
-              />
-            ))}
-          </View>
-        )}
-      </ScrollView>
+        }
+      />
 
       <SortSheet
         visible={sortVisible}
@@ -876,7 +897,6 @@ const styles = StyleSheet.create({
   errorRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 },
   errorText: { ...Typography.micro, flexShrink: 1 },
 
-  transactionList: { gap: 0 },
   emptyCard: { borderRadius: Radii.md, padding: Spacing.s5, borderWidth: 1, borderStyle: 'dashed', alignItems: 'center' },
   emptyIcon: { width: 40, height: 40, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', marginBottom: Spacing.s2 },
   emptyTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', textAlign: 'center' },

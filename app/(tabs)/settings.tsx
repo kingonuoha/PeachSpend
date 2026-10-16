@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   Image,
   Modal,
@@ -43,8 +43,8 @@ import { EditProfileSheet } from '../../components/profile/EditProfileSheet';
 import { CurrencyConversionModal } from '../../components/settings/CurrencyConversionModal';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
-import { useExpenses } from '../../hooks/useExpenses';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useTokenReload } from '../../hooks/useDataFreshness';
 import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import {
@@ -79,6 +79,7 @@ import { databaseService } from '../../services/DatabaseService';
 import { formatCurrency, getCurrencyName } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
 import type { ProfileSnapshot } from '../../data/ProfileContracts';
+import type { Expense } from '../../types/database';
 import {
   describeContinuityFileReadFailure,
   describeContinuityMigration,
@@ -95,6 +96,13 @@ import {
 const MAX_CONTENT_WIDTH = 640;
 const ICON_CHIP = 32;
 const ROW_MIN_HEIGHT = 56;
+// BUG-09-11b. The ledger rows this screen reads on demand feed the export and the
+// currency conversion dialogs, so a read failure has to be stated rather than
+// leaving a dialog showing nothing.
+const EXPORT_READ_FAILURE_MESSAGE = 'Could not read your records. Please try again.';
+// BUG-09-11b. The profile snapshot and the two metadata counts both read the
+// ledger, so a ledger write is the only external change that invalidates them.
+const SETTINGS_FRESHNESS_DOMAINS = ['ledger'] as const;
 // Reference currency list for the SH-06a candidate options. Shared reference data
 // only, the same set onboarding offers; symbols and names come from utils/currency.
 const SUPPORTED_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'NGN', 'CAD', 'AUD'] as const;
@@ -312,10 +320,16 @@ export default function SettingsScreen() {
   const bottomClearance = useBottomClearance();
   const { settings, refreshSettings, getCurrencySymbol } = useSettings();
   const { showToast } = useToast();
-  const { expenses, refreshExpenses } = useExpenses();
 
   const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(null);
   const [reloading, setReloading] = useState(false);
+  // BUG-09-11b. The export and currency-conversion flows are the only readers of
+  // the full ledger on this screen, and both only when the user opens them. This
+  // screen used to call useExpenses() on mount, which read the whole expense table
+  // on every visit to Settings for a count and for two dialogs that may never be
+  // opened. The rows are now read when a dialog opens, which also means they can
+  // never be a stale copy of the ledger.
+  const [ledgerRows, setLedgerRows] = useState<Expense[]>([]);
   const [categoryCount, setCategoryCount] = useState<number | null>(null);
   const [recurringCount, setRecurringCount] = useState<number | null>(null);
   const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
@@ -342,49 +356,48 @@ export default function SettingsScreen() {
 
   const settingsSnapshot: SettingsSnapshot = useMemo(() => buildSettingsSnapshot(settings), [settings]);
 
-  const loadSnapshot = useCallback(async () => {
-    const next = await profileDataService.getSnapshot();
-    setSnapshot(next);
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-    void profileDataService.getSnapshot().then((next) => {
-      if (active) setSnapshot(next);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  // Secondary metadata loads independently; each failure only hides its own value
-  // instead of blanking the screen or inventing a default.
-  useEffect(() => {
-    let active = true;
-    void Promise.allSettled([
+  // One mount path for everything this screen reads, issued as a single wave
+  // instead of the profile snapshot followed by the metadata. Each secondary read
+  // keeps its own failure behaviour: a failure only hides its own value instead of
+  // blanking the screen or inventing a default.
+  const loadAll = useCallback(async () => {
+    const results = await Promise.allSettled([
+      profileDataService.getSnapshot(),
       categoryService.list(),
       recurringDataService.list(),
       aiChatService.getProviderKeyState(),
-    ]).then(([categories, recurring, keys]) => {
-      if (!active) return;
-      if (categories.status === 'fulfilled') setCategoryCount(categories.value.length);
-      if (recurring.status === 'fulfilled') {
-        setRecurringCount(recurring.value.status === 'ready' ? recurring.value.templates.length : 0);
-      }
-      if (keys.status === 'fulfilled') {
-        setProviderConfigured(
-          keys.value.gemini.status === 'configured' || keys.value.openrouter.status === 'configured',
-        );
-      }
-    });
-    return () => {
-      active = false;
-    };
+    ]);
+    const [profile, categories, recurring, keys] = results;
+    if (profile.status === 'fulfilled') setSnapshot(profile.value);
+    if (categories.status === 'fulfilled') setCategoryCount(categories.value.length);
+    if (recurring.status === 'fulfilled') {
+      setRecurringCount(recurring.value.status === 'ready' ? recurring.value.templates.length : 0);
+    }
+    if (keys.status === 'fulfilled') {
+      setProviderConfigured(
+        keys.value.gemini.status === 'configured' || keys.value.openrouter.status === 'configured',
+      );
+    }
+  }, []);
+
+  // BUG-09-11b. Re-reads on first mount and when the ledger changed while this
+  // screen was mounted, not on a focus event or a re-render. Category and recurring
+  // edits are ledger writes, so those metadata counts refresh with the snapshot
+  // instead of needing their own effect.
+  useTokenReload(SETTINGS_FRESHNESS_DOMAINS, loadAll);
+
+  // The export and currency conversion flows read the ledger rows on open, so the
+  // rows they act on are the current ones rather than a copy taken when Settings
+  // mounted.
+  const loadLedgerRows = useCallback(async (): Promise<Expense[]> => {
+    const rows = await databaseService.getExpenses();
+    setLedgerRows(rows);
+    return rows;
   }, []);
 
   const retry = async () => {
     setReloading(true);
-    await loadSnapshot();
+    await loadAll();
     setReloading(false);
   };
 
@@ -440,10 +453,27 @@ export default function SettingsScreen() {
     await refreshSettings();
   };
 
-  const openExport = () => {
-    setExportPreview(buildExportPreview(expenses, { start: 0, end: Date.now() }, 3));
+  // Both dialogs read the ledger rows at open time. The read is one table scan
+  // behind an explicit user action instead of one on every visit to Settings, and
+  // it means the rows the dialog works on are the current ones.
+  const openExport = async () => {
     setExportError(null);
-    setExportOpen(true);
+    try {
+      const rows = await loadLedgerRows();
+      setExportPreview(buildExportPreview(rows, { start: 0, end: Date.now() }, 3));
+      setExportOpen(true);
+    } catch {
+      showToast(EXPORT_READ_FAILURE_MESSAGE, 'error');
+    }
+  };
+
+  const openCurrencyConversion = async () => {
+    try {
+      await loadLedgerRows();
+      setCurrencyOpen(true);
+    } catch {
+      showToast(EXPORT_READ_FAILURE_MESSAGE, 'error');
+    }
   };
 
   // The contract keeps the CSV body in the data layer and the file/share UI on
@@ -491,19 +521,20 @@ export default function SettingsScreen() {
 
   const handleCurrencyConverted = useCallback(
     async (outcome: BulkConversionOutcome) => {
+      // The conversion writes the expense rows, which publishes the ledger change
+      // token, so this screen's own snapshot re-reads through the same path as any
+      // other ledger write. Only the settings mirror needs refreshing here.
       if (outcome.status === 'converted') {
-        await refreshExpenses();
         await refreshSettings();
         showToast(`Base currency changed to ${outcome.toCurrency}`, 'success');
       } else if (outcome.status === 'partial') {
-        await refreshExpenses();
         await refreshSettings();
         showToast(`Converted ${outcome.convertedCount}, skipped ${outcome.skippedCount}: missing rate for ${outcome.missingRates.join(', ')}`, 'error');
       } else {
         showToast(`Missing conversion rate for ${outcome.missingRates.join(', ')}`, 'error');
       }
     },
-    [refreshExpenses, refreshSettings, showToast],
+    [refreshSettings, showToast],
   );
 
   const confirmStewardship = async () => {
@@ -523,7 +554,8 @@ export default function SettingsScreen() {
       showToast('That action could not be completed.', 'error');
       return;
     }
-    await refreshExpenses();
+    // Clearing the ledger publishes the ledger token, so the record count above
+    // refreshes from the same path as any other write.
     await refreshSettings();
     if (result.action === 'reset_app') {
       showToast('App reset. Returning to onboarding.', 'success');
@@ -552,7 +584,8 @@ export default function SettingsScreen() {
       const feedback = describeContinuityMigration(result);
       setRestoreFeedback(feedback);
       if (result.status === 'imported' || result.status === 'partially_imported' || result.status === 'already_current') {
-        await refreshExpenses();
+        // The restore publishes the ledger token, so the count above refreshes
+        // from the same path as any other write.
         await refreshSettings();
       }
       showToast(feedback.title, feedback.tone === 'success' ? 'success' : feedback.tone === 'error' ? 'error' : 'info');
@@ -561,7 +594,7 @@ export default function SettingsScreen() {
     } finally {
       setRestoreBusy(false);
     }
-  }, [restoreBusy, refreshExpenses, refreshSettings, showToast]);
+  }, [restoreBusy, refreshSettings, showToast]);
 
   if (!snapshot) {
     return <SettingsSkeleton />;
@@ -797,7 +830,7 @@ export default function SettingsScreen() {
 
               {/* Base Currency -> SH-06a */}
               <ScalePressable
-                onPress={() => setCurrencyOpen(true)}
+                onPress={() => void openCurrencyConversion()}
                 accessibilityRole="button"
                 accessibilityLabel="Base currency"
                 style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}
@@ -981,12 +1014,12 @@ export default function SettingsScreen() {
                 <View style={styles.rowText}>
                   <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Export Financial Ledger</Text>
                   <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
-                    {expenses.length === 1 ? '1 record' : `${expenses.length} records`}
+                    {(snapshot?.stats.transactionCount ?? 0) === 1 ? '1 record' : `${snapshot?.stats.transactionCount ?? 0} records`}
                   </Text>
                 </View>
                 <PeachButton
                   title="Export"
-                  onPress={openExport}
+                  onPress={() => void openExport()}
                   variant="secondary"
                   size="xs"
                   icon={<Download size={14} color={ts.raw.primary} />}
@@ -1283,7 +1316,7 @@ export default function SettingsScreen() {
         visible={currencyOpen}
         onClose={() => setCurrencyOpen(false)}
         fromCurrency={settingsSnapshot.currency}
-        expenses={expenses}
+        expenses={ledgerRows}
         candidateCurrencies={SUPPORTED_CURRENCIES}
         rates={settings.conversion_rates ?? null}
         onConverted={handleCurrencyConverted}

@@ -7,7 +7,7 @@ import { CURRENT_SCHEMA_VERSION, readContinuitySchema, runV1ExportMigration } fr
 import type { ContinuityContract, ContinuityDetection, ContinuityFileInput, ContinuityImportPort, ContinuityMigrationResult, ContinuityRowMatch, ContinuitySchemaPort, ContinuitySchemaState } from '../data/ContinuityContracts';
 import { deleteSecret, getSecret, isSecretSettingKey, migrateLegacySecrets, setSecret, SECRET_SETTING_KEYS, type SecretSettingKey } from '../data/secrets';
 import { SqliteCaptureRepository } from '../data/CaptureRepository';
-import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSettings, type CaptureCandidate, type CaptureRepository, type OnboardingSettings, type OnboardingSettingsStore } from '../data/contracts';
+import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSettings, type CaptureCandidate, type CaptureEventInput, type CaptureEventQuery, type CaptureRepository, type CaptureSource, type IncomeCandidate, type OnboardingSettings, type OnboardingSettingsStore, type RecurringTemplateHandoff } from '../data/contracts';
 import { deleteOwnedReceiptImage, isOwnedReceiptImage } from '../utils/ownedReceiptImage';
 import { formatCurrency, resolveCurrency } from '../utils/currency';
 import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense, parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
@@ -17,6 +17,7 @@ import { CategoryService } from '../data/CategoryService';
 import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../data/RecurringDataService';
 import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
 import { eraseOwnedMediaForScope } from './MediaErasureService';
+import { markDataChanged } from '../hooks/useDataFreshness';
 
 const DATABASE_NAME = 'peachspend.db';
 const ACHIEVEMENT_THRESHOLDS = {
@@ -108,6 +109,92 @@ function escapeCsv(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+// BUG-09-11b freshness signal for the ledger. Every expense and income write in
+// the app goes through the capture repository, whether the caller is manual entry,
+// the scan confirm flow, the share intake, the expense review sheet, the auto
+// capture host, the chat action handler or the import commit, so the change token
+// is published here rather than at each of those call sites, where a later writer
+// could forget it. Only the three saving methods publish; every read and every
+// non ledger write is delegated unchanged, so no existing behaviour or return
+// shape moves.
+class PublishingCaptureRepository implements CaptureRepository {
+  constructor(private readonly inner: CaptureRepository) {}
+
+  private publish<T>(operation: Promise<T>): Promise<T> {
+    return operation.then(result => {
+      markDataChanged('ledger');
+      return result;
+    });
+  }
+
+  findDuplicate(candidate: Pick<CaptureCandidate, 'merchant' | 'amount' | 'date'>) {
+    return this.inner.findDuplicate(candidate);
+  }
+
+  findBatchDuplicates(candidates: CaptureCandidate[]) {
+    return this.inner.findBatchDuplicates(candidates);
+  }
+
+  save(candidate: CaptureCandidate, allowDuplicate?: boolean) {
+    return this.publish(this.inner.save(candidate, allowDuplicate));
+  }
+
+  saveBatch(candidates: CaptureCandidate[], allowDuplicates?: boolean) {
+    return this.publish(this.inner.saveBatch(candidates, allowDuplicates));
+  }
+
+  findIncomeDuplicate(candidate: Pick<IncomeCandidate, 'sourceName' | 'amount' | 'date'>) {
+    return this.inner.findIncomeDuplicate(candidate);
+  }
+
+  saveIncome(candidate: IncomeCandidate, allowDuplicate?: boolean) {
+    return this.publish(this.inner.saveIncome(candidate, allowDuplicate));
+  }
+
+  withTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    return this.inner.withTransaction(operation);
+  }
+
+  getRecurringTemplateHandoff(): RecurringTemplateHandoff {
+    return this.inner.getRecurringTemplateHandoff();
+  }
+
+  rememberCategory(merchant: string, category: string, source: CaptureSource) {
+    return this.inner.rememberCategory(merchant, category, source);
+  }
+
+  getRememberedCategory(merchant: string) {
+    return this.inner.getRememberedCategory(merchant);
+  }
+
+  recordEvent(event: CaptureEventInput) {
+    return this.inner.recordEvent(event);
+  }
+
+  listEvents(query?: CaptureEventQuery) {
+    return this.inner.listEvents(query);
+  }
+
+  enqueueAutoCapture(payload: CaptureCandidate) {
+    return this.inner.enqueueAutoCapture(payload);
+  }
+
+  claimQueuedAutoCaptures(now?: number) {
+    return this.inner.claimQueuedAutoCaptures(now);
+  }
+
+  completeQueuedAutoCapture(id: string) {
+    return this.inner.completeQueuedAutoCapture(id);
+  }
+
+  failQueuedAutoCapture(id: string, errorCode: string, retryAt: number) {
+    return this.inner.failQueuedAutoCapture(id, errorCode, retryAt);
+  }
+
+  discardQueuedAutoCaptures() {
+    return this.inner.discardQueuedAutoCaptures();
+  }
+}
 class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   private db: SQLite.SQLiteDatabase | null = null;
   // Single-flight handle for the first open. The open is async, so several
@@ -132,7 +219,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async getCaptureRepository(): Promise<CaptureRepository> {
-    return new SqliteCaptureRepository(await this.getDb());
+    return new PublishingCaptureRepository(new SqliteCaptureRepository(await this.getDb()));
   }
 
   // The single accessor for the open handle. The init() call inside is
@@ -226,7 +313,14 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async migrateV1Export(input: ContinuityFileInput): Promise<ContinuityMigrationResult> {
-    return runV1ExportMigration(await this.getContinuityImportPort(), input);
+    const result = await runV1ExportMigration(await this.getContinuityImportPort(), input);
+    // The continuity restore is its own writer class: it lands through the
+    // capture repository like any other save, but it is driven by a bulk port,
+    // so it publishes once for the whole restore as well.
+    if (result.status === 'imported' || result.status === 'partially_imported' || result.status === 'already_current') {
+      markDataChanged('ledger');
+    }
+    return result;
   }
 
   private continuitySchemaPort(db: SQLite.SQLiteDatabase): ContinuitySchemaPort {
@@ -339,6 +433,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
         'INSERT OR REPLACE INTO expenses (id, merchant, amount, currency, category, note, scanned, date, created_at, image_uri, is_reimbursable, unit_price, units, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         params
       );
+      markDataChanged('ledger');
       logger.info(`Expense saved: ${expense.id}`);
     } catch (error) {
       logger.error('DatabaseService.saveExpense failed', 'expense_save_failed');
@@ -363,12 +458,14 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     }
 
     await db.runAsync('DELETE FROM expenses WHERE id = ?', [id]);
+    markDataChanged('ledger');
     logger.info(`Expense deleted: ${id}`);
   }
 
   async updateExpenseNote(id: string, note: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET note = ? WHERE id = ?', [note, id]);
+    markDataChanged('ledger');
   }
 
   // Single write boundary for an S-08 category correction. The learning-loop
@@ -377,11 +474,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async updateExpenseCategory(id: string, category: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET category = ? WHERE id = ?', [category, id]);
+    markDataChanged('ledger');
   }
 
   async updateExpenseReimbursable(id: string, isReimbursable: boolean): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET is_reimbursable = ? WHERE id = ?', [isReimbursable ? 1 : 0, id]);
+    markDataChanged('ledger');
   }
 
   async getExpensesByCategory(): Promise<{ category: string; total: number }[]> {
@@ -416,6 +515,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const rates = await this.getSetting('conversion_rates');
     const outcome = await executeBulkCurrencyConversion(this, expenses, targetCurrency, rates);
     if (outcome.status === 'refused') throw new CurrencyConversionError(outcome.missingRates);
+    markDataChanged('ledger');
     logger.info(`Converted ${outcome.convertedCount} expense row(s) to ${targetCurrency}`);
     return outcome;
   }
@@ -423,6 +523,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async updateExpenseCurrency(id: string, amount: number, currency: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET amount = ?, currency = ? WHERE id = ?', [amount, currency, id]);
+    markDataChanged('ledger');
   }
 
   // Categories
@@ -440,6 +541,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO categories (id, title, icon_name, color, is_default) VALUES (?, ?, ?, ?, 0)',
       [id, title, icon, color]
     );
+    markDataChanged('ledger');
     return id;
   }
 
@@ -449,16 +551,19 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'UPDATE categories SET title = ? WHERE id = ?',
       [newTitle, id]
     );
+    markDataChanged('ledger');
   }
 
   async updateCategoryColor(id: string, color: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE categories SET color = ? WHERE id = ?', [color, id]);
+    markDataChanged('ledger');
   }
 
   async updateCategoryIcon(id: string, iconName: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE categories SET icon_name = ? WHERE id = ?', [iconName, id]);
+    markDataChanged('ledger');
   }
 
   // Settings
@@ -494,6 +599,10 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
       [key, value]
     );
+    // One publisher for the settings table: updateSetting, completeOnboarding and
+    // the auto capture settings write all funnel through here, so a settings
+    // change cannot reach the table without waking the screens that read it.
+    markDataChanged('settings');
   }
 
   async updateSetting(key: string, value: string) {
@@ -562,6 +671,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO notifications (id, title, body, type, data, read, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)',
       [notification.id, notification.title, notification.body, notification.type || 'expense', notification.data || null, Date.now()]
     );
+    markDataChanged('notifications');
   }
 
   async getNotifications(): Promise<Notification[]> {
@@ -578,21 +688,25 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async markNotificationRead(id: string) {
     const db = await this.getDb();
     await db.runAsync('UPDATE notifications SET read = 1 WHERE id = ?', [id]);
+    markDataChanged('notifications');
   }
 
   async markAllNotificationsRead() {
     const db = await this.getDb();
     await db.runAsync('UPDATE notifications SET read = 1 WHERE read = 0');
+    markDataChanged('notifications');
   }
 
   async deleteNotification(id: string) {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM notifications WHERE id = ?', [id]);
+    markDataChanged('notifications');
   }
 
   async clearAllNotifications() {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM notifications');
+    markDataChanged('notifications');
   }
 
   async runAsync(sql: string, params: SQLite.SQLiteBindParams = []) {
@@ -620,6 +734,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO recurring_templates (id, merchant, amount, currency, category, note, interval, recurrence_days, next_due_date, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [template.id, template.merchant, template.amount, currency, template.category, template.note || '', template.interval, template.recurrence_days || null, template.next_due_date, template.type || 'expense', template.created_at]
     );
+    markDataChanged('ledger');
   }
 
   async getRecurringTemplates(type?: string): Promise<RecurringTemplate[]> {
@@ -645,11 +760,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'UPDATE recurring_templates SET next_due_date = ? WHERE id = ?',
       [nextDue, id]
     );
+    markDataChanged('ledger');
   }
 
   async deleteRecurringTemplate(id: string) {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM recurring_templates WHERE id = ?', [id]);
+    markDataChanged('ledger');
   }
 
   async getNextDueDate(interval: string, recurrence_days?: string, fromDate?: number): Promise<number> {
@@ -676,6 +793,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'UPDATE recurring_templates SET merchant = ?, amount = ?, currency = ?, category = ?, note = ?, interval = ?, recurrence_days = ?, next_due_date = ?, type = ? WHERE id = ?',
       [patch.merchant, patch.amount, currency, patch.category, patch.note || '', patch.interval, patch.recurrence_days || null, patch.next_due_date, patch.type || 'expense', id]
     );
+    markDataChanged('ledger');
   }
 
   // Income
@@ -698,6 +816,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO income (id, source, amount, currency, category, note, is_recurring, recurrence_interval, next_due_date, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [income.id, income.source, income.amount, currency, income.category, income.note || '', income.is_recurring || 0, income.recurrence_interval || null, income.next_due_date || null, income.date, income.created_at]
     );
+    markDataChanged('ledger');
   }
 
   async getIncome(startDate?: number, endDate?: number): Promise<Income[]> {
@@ -711,6 +830,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async deleteIncome(id: string) {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM income WHERE id = ?', [id]);
+    markDataChanged('ledger');
   }
 
   async getNetBalance(startDate?: number, endDate?: number): Promise<number> {
@@ -1086,6 +1206,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       await db.runAsync('INSERT INTO achievements (id, earned_at) VALUES (?, ?)', [badge.id, Date.now()]);
       newBadges.push(badge.id);
     }
+    if (newBadges.length > 0) markDataChanged('ledger');
 
     return newBadges;
   }
@@ -1391,6 +1512,8 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       const media = await eraseOwnedMediaForScope(CLEAR_ALL_DATA_MEDIA_SCOPE, receiptImageUris);
       if (media.failed > 0) logger.warn('Some cleared receipt images could not be erased', 'clear_all_data_media_partial');
       await db.execAsync('COMMIT');
+      markDataChanged('ledger');
+      markDataChanged('notifications');
     } catch (error) {
       await db.execAsync('ROLLBACK');
       logger.error('Failed to clear transaction data', 'clear_all_data_failed');
@@ -1415,6 +1538,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     `);
     await Promise.all(SECRET_SETTING_KEYS.map(deleteSecret));
     await this.seedCategories();
+    markDataChanged('ledger');
+    markDataChanged('settings');
+    markDataChanged('notifications');
     // D9 / S-06R-01: reset is the widest boundary, so it also removes every media
     // file the app wrote: receipt images, profile avatars, and export CSVs.
     const media = await eraseOwnedMediaForScope(RESET_APP_MEDIA_SCOPE);

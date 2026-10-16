@@ -822,39 +822,43 @@ export default function ChatScreen() {
   useEffect(() => {
     let active = true;
     const bootstrap = async () => {
+      // Best effort maintenance first: the expiry sweep can remove retained
+      // messages, so it runs before the history read rather than beside it.
       try {
         await aiChatService.checkAutoExpiry();
-        const history = await aiChatService.getHistory();
-        if (active) setEntries(entriesFromHistory(history));
       } catch {
-        if (active) setEntries([]);
-      } finally {
-        if (active) setLoadingHistory(false);
+        // A failed sweep must not stop the history from loading.
       }
 
-      try {
-        const stored = (await databaseService.getSetting('chat_provider')) === 'openrouter' ? 'openrouter' : 'gemini';
-        const model = stored === 'openrouter'
-          ? (await databaseService.getSetting('chat_openrouter_model')) || ''
-          : (await databaseService.getSetting('chat_gemini_model')) || '';
-        const display = stored === 'openrouter'
-          ? (await databaseService.getSetting('chat_openrouter_model_display')) || model
-          : (await databaseService.getSetting('chat_gemini_model_display')) || model;
-        if (active) {
-          setProvider(stored);
-          setActiveModelId(model);
-          setActiveModelLabel(display || model);
-        }
-      } catch {
-        // Provider defaults remain; the sheet shows the honest empty state.
+      // BUG-09-11b. These reads are independent, so they are issued together
+      // instead of one after another. The stored provider decides which model
+      // setting to read, so that pair stays a second wave; the statement count is
+      // unchanged, the number of round trip waves drops from five to three.
+      const [history, storedProvider] = await Promise.all([
+        aiChatService.getHistory().catch(() => []),
+        databaseService.getSetting('chat_provider').catch(() => null),
+      ]);
+      if (active) {
+        setEntries(entriesFromHistory(history));
+        setLoadingHistory(false);
       }
 
-      try {
-        const nextKeyState = await aiChatService.getProviderKeyState();
-        if (active) setKeyState(nextKeyState);
-      } catch {
-        if (active) setKeyState(null);
-      }
+      const stored = storedProvider === 'openrouter' ? 'openrouter' : 'gemini';
+      if (active) setProvider(stored);
+
+      const [model, display, nextKeyState] = await Promise.all([
+        databaseService.getSetting(stored === 'openrouter' ? 'chat_openrouter_model' : 'chat_gemini_model').catch(() => null),
+        databaseService
+          .getSetting(stored === 'openrouter' ? 'chat_openrouter_model_display' : 'chat_gemini_model_display')
+          .catch(() => null),
+        aiChatService.getProviderKeyState().catch(() => null),
+      ]);
+      if (!active) return;
+
+      const resolvedModel = model || '';
+      setActiveModelId(resolvedModel);
+      setActiveModelLabel(display || resolvedModel);
+      setKeyState(nextKeyState);
     };
     void bootstrap();
     return () => {

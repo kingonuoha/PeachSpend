@@ -27,6 +27,7 @@ import { PeachButton } from '../components/ui/PeachButton';
 import { ScalePressable } from '../components/ui/ScalePressable';
 import { Skeleton } from '../components/ui/Skeleton';
 import { useToast } from '../components/ui/ToastProvider';
+import { useDataFreshness } from '../hooks/useDataFreshness';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
@@ -47,6 +48,8 @@ import { formatRelativeDate } from '../utils/dateFormat';
 // amounts are hidden, matching the v1 read-state behavior (FR-14.1).
 
 const MAX_CONTENT_WIDTH = 640;
+// BUG-09-11b. Only a write to the notifications table can make this list wrong.
+const NOTIFICATION_FRESHNESS_DOMAINS = ['notifications'] as const;
 const BACK_SIZE = 40;
 const BACK_HIT_SLOP = { top: 2, bottom: 2, left: 2, right: 2 };
 const ICON_CHIP_SIZE = 44;
@@ -322,6 +325,11 @@ export default function NotificationsScreen() {
     [filter, records],
   );
 
+  // The notifications list is its own stale domain. A write from any other surface
+  // (a capture, an import, a recurring run) cannot make this list wrong, so it does
+  // not wake it.
+  const { isStale, markFresh } = useDataFreshness(NOTIFICATION_FRESHNESS_DOMAINS);
+
   const load = useCallback(async () => {
     try {
       const state = await notificationDataService.list();
@@ -335,13 +343,22 @@ export default function NotificationsScreen() {
     // Read-state behavior unchanged from v1: the loaded snapshot drives the
     // visible unread treatment, then the persisted rows are marked read so the
     // next visit shows them as read. A failure here is non-blocking.
-    void notificationDataService.markAllRead().catch(() => undefined);
-  }, []);
+    await notificationDataService.markAllRead().catch(() => undefined);
+    // BUG-09-11b. The read and the read-state write it triggers are the revision
+    // this screen is now current with. Recording it after the write is what stops
+    // the next focus from re-reading the same rows, and it is why the read-state
+    // writes are not allowed to invalidate this screen on their own.
+    markFresh();
+  }, [markFresh]);
 
+  // Refetch discipline: a focus re-reads only when something was written since the
+  // last read. Today's behaviour re-ran the list query and the mark-all-read write
+  // on every focus, including a focus that followed no change at all.
   useFocusEffect(
     useCallback(() => {
+      if (!isStale()) return;
       void load();
-    }, [load]),
+    }, [isStale, load]),
   );
 
   const retry = useCallback(() => {

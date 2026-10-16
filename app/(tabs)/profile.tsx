@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
   Image,
@@ -38,6 +38,7 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useBottomClearance } from '../../components/navigation/useBottomClearance';
+import { useTokenReload } from '../../hooks/useDataFreshness';
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { formatCurrency } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
@@ -83,6 +84,11 @@ const SKELETON_SETTINGS_ROW_COUNT = 2;
 
 const THEME_PACK_FAILURE_MESSAGE = 'Could not change the theme pack. Please try again.';
 const THEME_MODE_FAILURE_MESSAGE = 'Could not change the appearance. Please try again.';
+
+// BUG-09-11b. The profile snapshot reads the ledger (expenses, streak, badges), so
+// only a ledger write invalidates it. Theme and appearance writes go straight to
+// this screen's own state and must not cause a re-read.
+const PROFILE_FRESHNESS_DOMAINS = ['ledger'] as const;
 
 // Loading placeholder. Mirrors the loaded screen section by section: the same
 // content wrap, hero gradient card, stat cards, recap row, badge grid, theme card
@@ -347,15 +353,10 @@ export default function ProfileScreen() {
     setSnapshot(next);
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    void profileDataService.getSnapshot().then((next) => {
-      if (active) setSnapshot(next);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
+  // BUG-09-11b. The profile snapshot reads the ledger, so it re-reads on first
+  // mount and when the ledger changed while this screen was mounted. It is not
+  // re-run by a focus event or by a re-render.
+  useTokenReload(PROFILE_FRESHNESS_DOMAINS, load);
 
   // Focus return once no modal is open. Best effort, matching the import screen:
   // setAccessibilityFocus takes the captured node id, and ScalePressable does not
@@ -422,15 +423,22 @@ export default function ProfileScreen() {
     }
   };
 
+  // Memoized on the achievements they are derived from: this used to re-filter and
+  // clone-sort the catalogue on every render, including renders caused by a press,
+  // a toast or a modal opening. Declared above the loading guard because a hook
+  // cannot be called conditionally; the empty account is what the guard renders.
+  const achievements = useMemo(() => snapshot?.achievements ?? [], [snapshot]);
+  const earnedCount = useMemo(() => achievements.filter((badge) => badge.earned).length, [achievements]);
+  const newestEarned = useMemo(
+    () => achievements
+      .filter((badge) => badge.earned && badge.earnedAt !== null)
+      .sort((a, b) => (b.earnedAt ?? 0) - (a.earnedAt ?? 0))[0] ?? null,
+    [achievements],
+  );
+
   if (!snapshot) {
     return <ProfileSkeleton />;
   }
-
-  const achievements = snapshot.achievements;
-  const earnedCount = achievements.filter((badge) => badge.earned).length;
-  const newestEarned = achievements
-    .filter((badge) => badge.earned && badge.earnedAt !== null)
-    .sort((a, b) => (b.earnedAt ?? 0) - (a.earnedAt ?? 0))[0] ?? null;
 
   const avatarUri = resolveAvatarUri(snapshot.avatarFile);
   const initial = snapshot.displayName.trim() ? snapshot.displayName.trim().charAt(0).toUpperCase() : null;

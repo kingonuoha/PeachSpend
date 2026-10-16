@@ -28,6 +28,12 @@ vi.mock('expo-file-system', () => ({ getInfoAsync: vi.fn(), deleteAsync: vi.fn()
 vi.mock('expo-file-system/legacy', () => fileSystemLegacy);
 vi.mock('../data/migrations', async (importOriginal) => ({ ...(await importOriginal<typeof import('../data/migrations')>()), runMigrations: vi.fn() }));
 
+// BUG-09-11b. The freshness publishers. Mocked rather than spied so the assertion
+// is on what this service published, and so the module under test does not have to
+// carry a React import into a node test.
+const freshness = vi.hoisted(() => ({ markDataChanged: vi.fn() }));
+vi.mock('../hooks/useDataFreshness', () => freshness);
+
 type MockDatabase = {
   getAllAsync: ReturnType<typeof vi.fn>;
   getFirstAsync: ReturnType<typeof vi.fn>;
@@ -1376,5 +1382,125 @@ describe('DatabaseService single-flight initialization', () => {
     await expect(databaseService.init()).resolves.toBeUndefined();
     expect(openDatabaseAsync).toHaveBeenCalledTimes(2);
     restore();
+  });
+});
+
+// BUG-09-11b. The invalidation path, one case per writer class the row's evidence
+// names. A write publishes the domain its screens read; a read publishes nothing.
+// The screens themselves never publish, so a missed publisher here is a screen
+// that silently keeps showing stale money.
+describe('DatabaseService freshness publishers', () => {
+  const candidate = {
+    merchant: 'Cafe',
+    amount: 12.5,
+    currency: 'USD',
+    category: 'dining',
+    date: 1_700_000_000_000,
+    source: 'manual' as const,
+  };
+
+  beforeEach(() => {
+    // Earlier cases in this file replace getCaptureRepository with a partial stub
+    // and never restore it, so the real decorated repository is put back before the
+    // publishers are exercised. Nothing after this block depends on those stubs.
+    vi.restoreAllMocks();
+    freshness.markDataChanged.mockClear();
+    (databaseService as unknown as { db: MockDatabase }).db = database;
+    database.getAllAsync.mockResolvedValue([]);
+    // Null rather than a row: the capture boundary reads the currency setting and
+    // probes for a duplicate through getFirstAsync, and a truthy stub would make
+    // every probe look like a duplicate.
+    database.getFirstAsync.mockResolvedValue(null);
+    database.runAsync.mockResolvedValue(undefined);
+  });
+
+  it('publishes the ledger token for a manual save through the capture repository', async () => {
+    const repository = await databaseService.getCaptureRepository();
+
+    await repository.save(candidate);
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+    expect(freshness.markDataChanged).not.toHaveBeenCalledWith('settings');
+  });
+
+  it('publishes the ledger token for an auto capture confirmed through the same boundary', async () => {
+    const repository = await databaseService.getCaptureRepository();
+
+    await repository.save({ ...candidate, source: 'auto_capture' });
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token once for a batch save', async () => {
+    const repository = await databaseService.getCaptureRepository();
+
+    await repository.saveBatch([candidate, { ...candidate, merchant: 'Shop', date: candidate.date + 1 }]);
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token for an import commit', async () => {
+    await databaseService.importExpenses([
+      { merchant: 'Cafe', amount: 12.5, currency: 'USD', category: 'dining', date: candidate.date },
+    ]);
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token for a continuity row restore', async () => {
+    const port = await databaseService.getContinuityImportPort();
+
+    await port.saveRow({
+      merchant: 'Cafe',
+      amount: 12.5,
+      currency: 'USD',
+      category: 'dining',
+      date: candidate.date,
+      note: '',
+      scanned: 0,
+    });
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token for a ledger edit and a category write', async () => {
+    await databaseService.updateExpenseNote('expense-1', 'note');
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+
+    freshness.markDataChanged.mockClear();
+    await databaseService.addCategory('Travel', 'plane', '#FFFFFF');
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the settings token for a settings change and not the ledger token', async () => {
+    await databaseService.updateSetting('currency', 'USD');
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+    expect(freshness.markDataChanged).not.toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the settings token for an onboarding completion', async () => {
+    await databaseService.completeOnboarding({ currency: 'USD', monthlyBudget: '1200', profileName: 'Peach' });
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+  });
+
+  it('publishes the notifications token for an inserted notification and a mark-all-read', async () => {
+    await databaseService.insertNotification({ id: 'n1', title: 'Title', body: 'Body' });
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('notifications');
+
+    freshness.markDataChanged.mockClear();
+    await databaseService.markAllNotificationsRead();
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('notifications');
+  });
+
+  it('publishes nothing for a read', async () => {
+    database.getAllAsync.mockResolvedValue([]);
+
+    await databaseService.getExpenses();
+    await databaseService.getNotifications();
+    await databaseService.getAllSettings();
+
+    expect(freshness.markDataChanged).not.toHaveBeenCalled();
   });
 });

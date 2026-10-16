@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   Pressable,
   RefreshControl,
@@ -27,6 +27,7 @@ import {
 import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useBottomClearance } from '../../components/navigation/useBottomClearance';
+import { useTokenReload } from '../../hooks/useDataFreshness';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { PeachButton } from '../../components/ui/PeachButton';
@@ -48,6 +49,11 @@ import type { AchievementState } from '../../data/ProfileContracts';
 const MASK = '••••••';
 const MAX_CATEGORIES = 4;
 const RECENT_LIMIT = 5;
+
+// BUG-09-11b. Home reads expenses, income, the unread notification count and the
+// settings that decide its currency and visibility, so a write to any of those is
+// a real invalidation of its snapshot. Nothing else asks it to re-read.
+const HOME_FRESHNESS_DOMAINS = ['ledger', 'settings', 'notifications'] as const;
 
 interface CategoryInfo {
   title: string;
@@ -94,10 +100,14 @@ export default function HomeScreen() {
   const [selectedBadge, setSelectedBadge] = useState<AchievementState | null>(null);
 
   // Income total and every other hero value come from the single typed snapshot.
-  // The screen no longer issues a separate income query.
+  // The screen no longer issues a separate income query. The category dictionary
+  // is independent of the snapshot, so both reads are issued together rather than
+  // one after the other: one round trip wave instead of two.
   const fetchHome = useCallback(async (): Promise<HomeLoad> => {
-    const snapshot = await homeDataService.getSnapshot();
-    const list = await databaseService.getCategories();
+    const [snapshot, list] = await Promise.all([
+      homeDataService.getSnapshot(),
+      databaseService.getCategories(),
+    ]);
     const categories: Record<string, CategoryInfo> = {};
     for (const category of list) {
       categories[category.id] = { title: category.title, icon_name: category.icon_name };
@@ -110,20 +120,20 @@ export default function HomeScreen() {
     setRefreshError(next.snapshot.state === 'offline' || next.snapshot.state === 'failure');
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      try {
-        const next = await fetchHome();
-        if (active) applyLoad(next);
-      } finally {
-        if (active) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-    };
+  // One read path for the screen: on first mount, and again only when local data
+  // changed. It is not re-run by a focus event, a tab switch or a re-render, which
+  // is what the earlier mount effect did on every navigation back to Home.
+  const reload = useCallback(async () => {
+    try {
+      applyLoad(await fetchHome());
+    } catch {
+      setRefreshError(true);
+    } finally {
+      setLoading(false);
+    }
   }, [fetchHome, applyLoad]);
+
+  useTokenReload(HOME_FRESHNESS_DOMAINS, reload);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -163,9 +173,11 @@ export default function HomeScreen() {
   const streakDays = snapshot?.streak.days ?? 0;
   const unread = snapshot?.unreadNotificationCount ?? 0;
 
-  const recent = snapshot?.recentTransactions ?? [];
-  const visibleRecent = recent.slice(0, RECENT_LIMIT);
-  const categories = (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES);
+  // Derived slices are memoized on the snapshot they come from: without this they
+  // were rebuilt on every render, so each row received a new array identity.
+  const recent = useMemo(() => snapshot?.recentTransactions ?? [], [snapshot]);
+  const visibleRecent = useMemo(() => recent.slice(0, RECENT_LIMIT), [recent]);
+  const categories = useMemo(() => (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES), [snapshot]);
 
   const money = useCallback((value: number) => formatCurrency(value, currencyCode), [currencyCode]);
 
