@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import { ChevronLeft, ChevronRight } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
-import { format, addMonths, subMonths, startOfMonth, endOfMonth, startOfWeek, endOfWeek, eachDayOfInterval, isSameMonth, isSameDay, isBefore, isAfter } from 'date-fns';
+import { format, addMonths, subMonths, startOfMonth, endOfMonth, startOfWeek, endOfWeek, startOfDay, endOfDay, eachDayOfInterval, isSameMonth, isSameDay, isBefore, isAfter } from 'date-fns';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { Colors } from '../../constants/tokens';
@@ -55,6 +55,23 @@ function refusalFeedback() {
 // uses for an absolute date (`app/expense/[id].tsx`), never a literal.
 function spokenDate(day: Date): string {
   return format(day, 'd MMMM yyyy');
+}
+
+// This component's contract is the days it shows, not the instants behind them, so
+// the two Dates it hands `onApply` are resolved to whole days here: the first instant
+// of the start day and the last instant of the end day. Both of its existing
+// consumers compare with an inclusive `date >= start && date <= end` (the Insights
+// list filter in `app/(tabs)/analytics.tsx`, the period filter in
+// `data/InsightDataService.ts`), and both bounds used to arrive at local midnight,
+// either from an `eachDayOfInterval` day cell or from the seeded `new Date()`. That
+// excluded every record made after midnight on the last selected day, so a custom
+// range silently lost its final day and the one day range this unit made reachable
+// matched nothing at all. Resolving the bounds here rather than at the call site
+// keeps a future caller from repeating it: a consumer of this component treats the
+// two values as the days they name, adds no extra day, and its inclusive comparison
+// is already correct.
+export function customRangeBounds(start: Date, end: Date): { start: Date; end: Date } {
+  return { start: startOfDay(start), end: endOfDay(end) };
 }
 
 export function DateRangePicker({ visible, startDate: initialStart, endDate: initialEnd, onApply, onClose }: DateRangePickerProps) {
@@ -135,7 +152,8 @@ export function DateRangePicker({ visible, startDate: initialStart, endDate: ini
   const handleApply = useCallback(() => {
     if (!startDate || !endDate) return;
     commitFeedback();
-    onApply(startDate, endDate);
+    const bounds = customRangeBounds(startDate, endDate);
+    onApply(bounds.start, bounds.end);
   }, [endDate, onApply, startDate]);
 
   const startValueLabel = startDate ? `Start date, ${spokenDate(startDate)}` : 'Start date, none chosen';
