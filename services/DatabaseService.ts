@@ -809,6 +809,15 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       return parseMoneyAmount(typeof raw === 'number' || typeof raw === 'string' ? String(raw) : null);
     };
 
+    // BUG-09-20. JSON is keyed, so a field count cannot shift a value into the wrong
+    // column the way a CSV row can; what a JSON file can get wrong is the shape of the
+    // item itself. A string, number, array or null is not a row. A null item used to
+    // throw on its first property read, so the whole file was refused as `Invalid JSON
+    // format. Check for syntax errors.` even though its syntax was fine. The item is
+    // named and skipped instead, and that is the whole of the JSON shape check.
+    const isRowObject = (value: unknown): boolean =>
+      value !== null && typeof value === 'object' && !Array.isArray(value);
+
     // Try JSON first
     if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
       try {
@@ -819,6 +828,10 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const expErrors: string[] = [];
+           if (!isRowObject(item)) {
+             errors.push(`item ${i + 1}: the row is not a JSON object, so the row was skipped`);
+             continue;
+           }
            if (typeof item.merchant !== 'string' || !item.merchant.trim()) expErrors.push(`item ${i + 1}: missing merchant`);
            // A JSON amount is a number in the documented shape, and it is read through the
            // same shared parse as a CSV cell. Any other JSON type is refused rather than
@@ -889,6 +902,11 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     }
 
     const header = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    // BUG-09-20. The field count the header declares, read with the same CSV reader as
+    // the data rows below, so a quoted comma is one field on both sides. For a plain
+    // header, which is every header this app or the v1 export writes, this equals
+    // `header.length`, the token count the column lookups just below come from.
+    const headerFieldCount = parseCsvLine(lines[0]).length;
     const dateIdx = header.indexOf('date');
     const merchantIdx = header.indexOf('merchant');
     const amountIdx = header.indexOf('amount');
@@ -905,6 +923,17 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const expenses: Partial<Expense>[] = [];
     for (let i = 1; i < lines.length; i++) {
       const cols = parseCsvLine(lines[i]);
+      // BUG-09-20. A row whose field count differs from the header's shifts every
+      // column after the differing one, so an unquoted grouped amount such as `2,900`
+      // in a hand-edited file used to store amount 2 against a currency of `900` with
+      // no error and no warning. The count is of parsed fields on both sides, so a
+      // quoted field containing a comma is one field and a trailing empty field is a
+      // field rather than a mismatch. The row is reported and skipped here, before any
+      // column is read, so a shifted row can never be imported with shifted values.
+      if (cols.length !== headerFieldCount) {
+        errors.push(`CSV row ${i}: the row has ${cols.length} fields where the header declares ${headerFieldCount}, so the row was skipped`);
+        continue;
+      }
       const merchant = (cols[merchantIdx] || '').trim();
       const amountValue = cols[amountIdx]?.trim() || '';
       // BUG-09-15. `parseFloat` read `1,250.50` as 1 and `2,900` as 2, so a grouped cell

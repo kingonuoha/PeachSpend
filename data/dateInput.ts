@@ -47,9 +47,16 @@
 // - A date string of digits such as `1710000000000`. Every CSV cell is a string,
 //   so a bare number is not distinguishable from a malformed date there. A JSON
 //   number is accepted above because its type already says what it is.
-// - A JSON number that is zero or negative. That is 1970 or earlier as a
-//   timestamp, which cannot be an expense date the user wrote and is the usual way
-//   a file writes "no date", so reading it would store an epoch date instead.
+// - A JSON number whose millisecond reading falls in 1970 or earlier, which is
+//   where zero, a negative value and a Unix seconds value all land. That cannot be
+//   an expense date the user wrote and is the usual way a file writes "no date", so
+//   reading it would store an epoch date instead. BUG-09-20: `1767571200` is
+//   2026-01-05 in seconds and 1970-01-21 in milliseconds, so a seconds value used to
+//   be stored as a date in the wrong year with no error. It is refused and named,
+//   like every other date this module cannot read, rather than multiplied by 1000: a
+//   conversion would be a second guess about a value the file never labelled, and
+//   every Unix seconds value a plausible expense date can carry, around 1e9 to 2e9
+//   for the years 2001 to 2033, is inside the refused range as milliseconds anyway.
 // - A JSON number whose digits also read as a partial or whole compact calendar
 //   date, `20260105` for example, which is both 2026-01-05 and 1970-08-23 as a
 //   timestamp. Two readings are real, so it is refused rather than guessed at,
@@ -68,6 +75,10 @@ const ISO_DATE_TIME =
 const COMPACT_DATE = /^\d{4}(?:\d{2})?(?:\d{2})?$/;
 const MS_PER_MINUTE = 60_000;
 const MS_PER_HOUR = 60 * MS_PER_MINUTE;
+// The first millisecond instant this module accepts as a date a user wrote:
+// 1971-01-01T00:00:00Z. Zero, a negative value and a Unix seconds value all read as
+// an instant before it, and none of them is an expense date, see the header above.
+const FIRST_READABLE_INSTANT = Date.UTC(1971, 0, 1);
 
 // A real calendar date as UTC midnight, or null. `Date.UTC` rolls an impossible
 // day forward into the next month, so the result is read back and compared, which
@@ -95,11 +106,12 @@ function readsAsCompactDate(value: number): boolean {
   return readCalendarDate(year, month, Number(digits.slice(6, 8))) !== null;
 }
 
-// A JSON number as the Unix millisecond instant it declares. Zero, a negative
-// value, a compact date shape and an out of range value are refused, each for the
-// reason stated in the header above.
+// A JSON number as the Unix millisecond instant it declares. A reading before 1971,
+// a compact date shape and an out of range value are refused, each for the reason
+// stated in the header above. A Unix seconds value falls in the first of those, so
+// it is refused rather than multiplied by 1000.
 function readEpochMilliseconds(value: number): number | null {
-  if (!Number.isFinite(value) || value <= 0) return null;
+  if (!Number.isFinite(value) || value < FIRST_READABLE_INSTANT) return null;
   if (readsAsCompactDate(value)) return null;
   return Number.isFinite(new Date(value).getTime()) ? value : null;
 }

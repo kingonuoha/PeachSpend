@@ -662,6 +662,160 @@ describe('parseImportDate reads an ISO date and refuses the rest (BUG-09-19)', (
   });
 });
 
+// BUG-09-20. A CSV row whose field count does not match the header used to be imported
+// with its columns shifted, so an unquoted `2,900` in a hand-edited file stored amount 2
+// against a currency of `900` with no error: silent corruption of the user's money. The
+// row is now reported and skipped, before any column is read. JSON is keyed, so a value
+// cannot shift between columns there; what a JSON file can get wrong is the shape of the
+// item itself, and an item that is not an object is named and skipped rather than
+// failing the whole file. A Unix seconds date is refused instead of becoming 1970, the
+// same decision the amount and date fixes make for a value that cannot be read.
+describe('DatabaseService imported row shape matches the header (BUG-09-20)', () => {
+  // The header and column order the export writer emits, so the rows below are the file
+  // shape the app itself produces and not a synthetic one.
+  const HEADER = 'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image';
+  const parseRows = (...rows: string[]): ReturnType<typeof databaseService.parseImportData> =>
+    databaseService.parseImportData([HEADER, ...rows].join('\n'));
+
+  it('reads a well formed row the export writer produces', () => {
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining,,,0,no');
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses).toHaveLength(1);
+    expect(result.expenses[0]?.merchant).toBe('Cafe');
+    expect(result.expenses[0]?.amount).toBe(1250.5);
+    expect(result.expenses[0]?.currency).toBe('NGN');
+    expect(result.expenses[0]?.category).toBe('dining');
+  });
+
+  it('skips a row whose unquoted grouped amount shifts every column after it', () => {
+    // The shape the defect was found on: `2,900` unquoted, so the file holds ten fields
+    // where the header declares nine and amount, currency and category all shift.
+    const result = parseRows('2026-01-05,Cafe,2,900,NGN,dining,,,0,no');
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual([
+      'CSV row 1: the row has 10 fields where the header declares 9, so the row was skipped',
+    ]);
+    // The exact regression: this row used to import amount 2 against a currency of 900.
+    expect(result.expenses.some(row => row.amount === 2)).toBe(false);
+    expect(result.expenses.some(row => row.currency === '900')).toBe(false);
+  });
+
+  it('skips a row that is missing a trailing field', () => {
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining,,,0');
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual([
+      'CSV row 1: the row has 8 fields where the header declares 9, so the row was skipped',
+    ]);
+  });
+
+  it('skips a short row even when the field it omits is optional', () => {
+    // `note`, `tags`, `scanned` and `has_receipt_image` are all optional, but the rule
+    // compares the declared field count, so a short row is refused rather than read with
+    // the missing cells treated as empty: an omitted trailing column and a row the file
+    // never finished writing are the same shape, and the importer refuses rather than
+    // guesses which of the two it is.
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining');
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual([
+      'CSV row 1: the row has 5 fields where the header declares 9, so the row was skipped',
+    ]);
+  });
+
+  it('counts a quoted field containing a comma as one field', () => {
+    const result = parseRows('2026-01-05,"Cafe, Inc","1,250.50",NGN,dining,"Lunch, with team",,0,no');
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses).toHaveLength(1);
+    expect(result.expenses[0]?.merchant).toBe('Cafe, Inc');
+    expect(result.expenses[0]?.amount).toBe(1250.5);
+    expect(result.expenses[0]?.note).toBe('Lunch, with team');
+  });
+
+  it('counts a trailing empty field as a field rather than a mismatch', () => {
+    // The header's last column is empty in this row, which is a real row shape and not a
+    // short row, so it still imports.
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining,,,0,');
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses).toHaveLength(1);
+    expect(result.expenses[0]?.amount).toBe(1250.5);
+  });
+
+  it('keeps reading a file the export writer produced, end to end', async () => {
+    database.getAllAsync.mockResolvedValue([
+      { id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining', note: '', scanned: 0, date: Date.UTC(2026, 0, 5) },
+    ]);
+
+    const csv = await databaseService.exportToCSV(0, Date.now());
+    const result = databaseService.parseImportData(csv);
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses.map(expense => expense.amount)).toEqual([1250.5]);
+  });
+
+  it('refuses a JSON epoch seconds date instead of storing a date in 1970', () => {
+    // `1767571200` is 2026-01-05 in seconds and 1970-01-21 in milliseconds. The module's
+    // rule is that a 1970 instant cannot be a date the user wrote, so it is refused and
+    // named rather than multiplied by 1000.
+    const result = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: 1767571200 }]),
+    );
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['item 1: the date "1767571200" could not be read, so the row was skipped']);
+    // The exact regression: nothing may be stored as a 1970 instant.
+    expect(result.expenses.some(row => (row.date ?? 0) < Date.UTC(1971, 0, 1))).toBe(false);
+  });
+
+  it('keeps reading a JSON epoch milliseconds date', () => {
+    const result = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: 1767571200000 }]),
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses[0]?.date).toBe(Date.UTC(2026, 0, 5));
+  });
+
+  it('refuses a millisecond reading before 1971 at the boundary and keeps 1971 onward', () => {
+    // The refused range is every instant before 1971-01-01, which is where a Unix
+    // seconds value lands as milliseconds. The boundary is tested on both sides.
+    expect(parseImportDate(31_535_999_999)).toEqual({ valid: false });
+    expect(parseImportDate(31_536_000_000)).toEqual({ valid: true, value: 31_536_000_000 });
+    expect(parseImportDate(Number.NaN)).toEqual({ valid: false });
+    expect(parseImportDate(1767571200)).toEqual({ valid: false });
+    expect(parseImportDate(12345678)).toEqual({ valid: false });
+  });
+
+  it('names a JSON item that is not an object instead of failing the whole file', () => {
+    // A null item used to throw on its first property read, so the whole file was refused
+    // as `Invalid JSON format. Check for syntax errors.` even though its syntax was fine.
+    for (const item of ['"Cafe"', '12', '[1,2]', 'null', 'true']) {
+      const result = databaseService.parseImportData(`[${item}]`);
+
+      expect(result.expenses).toEqual([]);
+      expect(result.errors).toEqual(['item 1: the row is not a JSON object, so the row was skipped']);
+    }
+  });
+
+  it('still reads an object row that omits optional keys or carries unexpected ones', () => {
+    const minimal = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining' }]),
+    );
+    expect(minimal.errors).toEqual([]);
+    expect(minimal.expenses).toHaveLength(1);
+
+    const extraKey = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', unexpected: 'x' }]),
+    );
+    expect(extraKey.errors).toEqual([]);
+    expect(extraKey.expenses).toHaveLength(1);
+  });
+});
+
 describe('DatabaseService achievement currency descriptions', () => {  it('uses user currency for aggregate spending thresholds and record currency for saver', async () => {
     database.getAllAsync.mockImplementation(async (sql: string) => {
       if (sql.includes('FROM achievements')) return [];
