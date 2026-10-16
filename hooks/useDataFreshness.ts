@@ -112,7 +112,14 @@ export function useDataToken(domains: readonly DataDomain[]): string {
 export function useTokenReload(domains: readonly DataDomain[], reload: () => void | Promise<void>): void {
   const token = useDataToken(domains);
   const reloadRef = useRef(reload);
-  reloadRef.current = reload;
+  // The latest `reload` is copied into the ref after commit, not during render, so
+  // a render does not write a ref and a discarded render cannot leave the ref
+  // holding a callback from a render React never committed. This effect is
+  // declared before the load effect, and effects run in declaration order, so the
+  // ref is always current for the commit that runs the read.
+  useEffect(() => {
+    reloadRef.current = reload;
+  });
   const inFlightRef = useRef(false);
   const pendingRef = useRef(false);
   const [nonce, setNonce] = useState(0);
@@ -143,9 +150,12 @@ export function useTokenReload(domains: readonly DataDomain[], reload: () => voi
 // effect instead.
 export function useDataFreshness(domains: readonly DataDomain[]): FreshnessTracker & { token: string } {
   const token = useDataToken(domains);
-  const trackerRef = useRef<FreshnessTracker | null>(null);
-  if (trackerRef.current === null) trackerRef.current = createFreshnessTracker(domains);
-  const tracker = trackerRef.current;
+  // The tracker is a per-mount record of the last read token. Its identity must
+  // survive every render, so it is created once in state rather than in a ref:
+  // state is the primitive a render may legitimately read, so no ref is written
+  // or read during render. It captures `domains` at first render, which is the
+  // same contract the ref version had.
+  const [tracker] = useState<FreshnessTracker>(() => createFreshnessTracker(domains));
   return {
     token,
     isStale: tracker.isStale,
