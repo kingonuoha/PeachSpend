@@ -32,9 +32,12 @@ import {
 import Animated, {
   FadeIn,
   FadeInUp,
+  KeyboardState,
   useAnimatedKeyboard,
+  useAnimatedReaction,
   useAnimatedStyle,
 } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import { Colors, Radii, Spacing, Typography, Gradients } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
@@ -749,11 +752,6 @@ function ErrorCard({ text, retryable, code, onRetry, onOpenSettings }: {
 export default function ChatScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
-  // The chat screen renders in two hosts: as the chat tab, where the floating
-  // bar is mounted over it, and as a stack route pushed from elsewhere, where it
-  // is not. The hook resolves which one this is, so the composer and the provider
-  // sheet clear the bar in the tab host and gain no dead space when pushed.
-  const bottomClearance = useBottomClearance();
   const reduceMotion = useReduceMotion();
   const { height: windowHeight } = useWindowDimensions();
   // Surface 6 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
@@ -767,6 +765,28 @@ export default function ChatScreen() {
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
   }));
+  // DEC-B58: while the keyboard is open the bar sits behind it and cannot be seen, so
+  // the composer must not also reserve the bar's height. React state rather than a
+  // shared value, because this flips twice per keyboard session and not once per frame,
+  // so it adds no per-frame layout work. A floating iPad keyboard reports CLOSED and
+  // keeps the bar clearance, which is right because it does not cover the bar.
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  useAnimatedReaction(
+    () => keyboard.state.get() === KeyboardState.OPENING || keyboard.state.get() === KeyboardState.OPEN,
+    (open) => {
+      scheduleOnRN(setKeyboardOpen, open);
+    },
+  );
+  // The chat screen renders in two hosts: as the chat tab, where the floating
+  // bar is mounted over it, and as a stack route pushed from elsewhere, where it
+  // is not. The hook resolves which one this is, so the composer and the provider
+  // sheet clear the bar in the tab host and gain no dead space when pushed.
+  const bottomClearance = useBottomClearance();
+  // The composer's own clearance, which is the safe area alone while the keyboard is
+  // open. The provider sheet below keeps the host clearance: it is anchored to the
+  // screen's bottom edge, so its bottom padding raises the sheet's own top edge and
+  // shows more of the model list above the keyboard instead of reserving dead space.
+  const composerClearance = useBottomClearance(keyboardOpen);
   const { settings, updateSetting } = useSettings();
   const toast = useToast();
   const { checkForNewAchievements } = useAchievements();
@@ -1760,7 +1780,7 @@ export default function ChatScreen() {
           style={{
             paddingHorizontal: Spacing.s3,
             paddingTop: Spacing.s2,
-            paddingBottom: Math.max(Spacing.s2, bottomClearance),
+            paddingBottom: Math.max(Spacing.s2, composerClearance),
             borderTopWidth: 1,
             borderTopColor: ts.border.subtle,
             backgroundColor: ts.raw.surface,

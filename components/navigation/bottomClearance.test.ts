@@ -24,6 +24,33 @@ describe('bottom clearance for the floating tab bar', () => {
     expect(resolveBottomClearance(true, 34)).toBeGreaterThan(resolveBottomClearance(false, 34));
   });
 
+  it('drops the bar clearance while the keyboard is open, so no dead space sits above it', () => {
+    for (const inset of [0, 24, 34, 48]) {
+      // The bar is behind the keyboard and cannot be seen, so only the safe area
+      // is reserved, which is the value a pushed screen already resolves to.
+      expect(resolveBottomClearance(true, inset, true)).toBe(inset);
+      expect(resolveBottomClearance(true, inset, true)).toBe(resolveBottomClearance(false, inset));
+    }
+    expect(resolveBottomClearance(true, 34, true)).toBe(34);
+  });
+
+  it('keeps the bar clearance while the keyboard is closed, so the reported defect stays fixed', () => {
+    for (const inset of [0, 24, 34, 48]) {
+      expect(resolveBottomClearance(true, inset, false)).toBe(TAB_BAR_HEIGHT + inset);
+      // The default is the closed keyboard, so a caller that passes nothing is
+      // the one the composer's reported defect needed.
+      expect(resolveBottomClearance(true, inset)).toBe(TAB_BAR_HEIGHT + inset);
+    }
+    expect(resolveBottomClearance(true, 34, false)).toBe(124);
+  });
+
+  it('leaves a screen outside the tabs group on the safe area with the keyboard open or closed', () => {
+    for (const inset of [0, 24, 34, 48]) {
+      expect(resolveBottomClearance(false, inset, true)).toBe(inset);
+      expect(resolveBottomClearance(false, inset, false)).toBe(inset);
+    }
+  });
+
   it('reads the group from the segment list, which is how the two chat hosts differ', () => {
     // The chat tab: the tab bar pushes its grouped href, so the group is present.
     expect(isInTabsGroup(['(tabs)', 'chat'])).toBe(true);
