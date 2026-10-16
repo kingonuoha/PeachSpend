@@ -84,16 +84,17 @@ export const isScanDialogCode = (code: string): code is ScanDialogCode =>
 // The recovery dialog names the object being scanned in the active mode and the failure class, and
 // its body is the settled sentence from ai/contracts.ts. Neither asserts a photographic cause (blur,
 // dim light): the app only ever knows what the provider returned, which is the defect BUG-09-09
-// removes. `invalid_response` is a response the app could not use, not an unreadable photo, so it
-// gets its own title rather than borrowing the illegible one.
+// removes. Each code also names its own failure class in the title: `illegible_image` is the case
+// where the photograph was the problem, and `invalid_response` is a response the app could not use,
+// so that title names the response rather than borrowing the reading class the photo failure owns.
 const SCAN_DIALOG_TITLE: Record<ScanMode, Record<ScanDialogCode, string>> = {
   receipt: {
     illegible_image: 'Receipt Unclear',
-    invalid_response: 'Receipt Could Not Be Read',
+    invalid_response: 'Receipt Response Unusable',
   },
   product: {
     illegible_image: 'Product Unclear',
-    invalid_response: 'Product Could Not Be Read',
+    invalid_response: 'Product Response Unusable',
   },
 };
 

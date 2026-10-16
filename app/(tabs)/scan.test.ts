@@ -188,8 +188,9 @@ describe('scan decoded-code lifecycle', () => {
 });
 
 // The screen renders native UI, so these exercise the pure copy selection rather than the rendered
-// dialog. They prove the real mode reaches the copy, that the two modes never share nouns, and that
-// no sentence asserts a photographic cause the app never establishes.
+// dialog. They prove the real mode reaches the copy, that the two modes never share nouns, that no
+// sentence asserts a photographic cause the app never establishes, and that a response the app could
+// not use is titled by its own class rather than as a read failure.
 describe('scan failure mode resolution', () => {
   it('maps each processing context to the mode the pipeline actually ran in', () => {
     expect(processingMode('receipt')).toBe('receipt');
@@ -232,6 +233,24 @@ describe('scan failure mode resolution', () => {
           expect(sentence).not.toContain('dim');
           expect(sentence).not.toContain('lighting');
         }
+      }
+    }
+  });
+
+  it('names the response class in the titles for a response the app could not use', () => {
+    expect(scanFailureDialogCopy('invalid_response', 'receipt').title).toBe('Receipt Response Unusable');
+    expect(scanFailureDialogCopy('invalid_response', 'product').title).toBe('Product Response Unusable');
+  });
+
+  it('keeps the two dialog codes distinguishable and never names the reading class for an unusable response', () => {
+    for (const mode of ['receipt', 'product'] as const) {
+      const responseTitle = scanFailureDialogCopy('invalid_response', mode).title;
+      // The reading class belongs to `illegible_image`, the case where the photograph really was the
+      // problem, so the two codes must not end up with one shared title.
+      expect(responseTitle).not.toBe(scanFailureDialogCopy('illegible_image', mode).title);
+      const words = responseTitle.toLowerCase();
+      for (const readingClass of ['read', 'unclear', 'blur', 'dim', 'lighting']) {
+        expect(words).not.toContain(readingClass);
       }
     }
   });
