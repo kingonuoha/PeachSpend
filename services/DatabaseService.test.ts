@@ -3,6 +3,7 @@ import { databaseService } from './DatabaseService';
 import * as SQLite from 'expo-sqlite';
 import { logger } from '../utils/logger';
 import { CurrencyConversionError } from '../data/SettingsContracts';
+import { parseMoneyAmount } from '../data/moneyInput';
 
 vi.mock('react-native', () => ({ Platform: { OS: 'test' } }));
 
@@ -244,6 +245,131 @@ describe('DatabaseService CSV export validation', () => {
     expect(warn).toHaveBeenCalledWith('[WARN]:', 'Skipped invalid expense row 2: merchant', 'database_export_row_skipped');
     expect(warn).toHaveBeenCalledWith('[WARN]:', 'Skipped invalid expense row 3: amount', 'database_export_row_skipped');
     warn.mockRestore();
+  });
+});
+
+// BUG-09-15. The CSV amount cell was read with `parseFloat`, which stops at the first
+// character it cannot use, so `1,250.50` imported as 1 and `2,900` as 2. Both passed the
+// row's own validity check, because 1 and 2 are finite positive numbers, so a wrong
+// amount reached the user's records with no error and no warning. Every case below
+// asserts the value that reaches the record, or that nothing was imported and the row
+// was reported. No existing expectation was loosened to make the fix pass.
+describe('DatabaseService imported amount reads its true value (BUG-09-15)', () => {
+  // The header and column order the export writer emits, so these rows are the file
+  // shape the app itself produces and not a synthetic one. The amount cell is quoted
+  // because that is how a CSV carries a value containing a comma: a third-party, bank
+  // or hand-edited file quotes it, and `parseCsvLine` hands the raw `1,250.50` to the
+  // parse. An unquoted `2,900` would split into two columns and misalign the row.
+  const csvWithAmount = (amountCell: string): string => [
+    'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image',
+    `2026-01-05,Cafe,"${amountCell}",NGN,dining,,,0,no`,
+  ].join('\n');
+
+  const readAmount = (amountCell: string): number => {
+    const result = databaseService.parseImportData(csvWithAmount(amountCell));
+    expect(result.errors).toEqual([]);
+    const [row] = result.expenses;
+    expect(row).toBeDefined();
+    return row?.amount ?? Number.NaN;
+  };
+
+  it('reads a raw amount the way the export writer writes it', () => {
+    expect(readAmount('1250.5')).toBe(1250.5);
+    expect(readAmount('1250000.75')).toBe(1250000.75);
+  });
+
+  it('reads a grouped amount as its true value and not as its first digit', () => {
+    const amount = readAmount('2,900');
+    expect(amount).toBe(2900);
+    expect(amount).not.toBe(2);
+  });
+
+  it('reads a grouped amount with decimals as its true value and not as its first digit', () => {
+    const amount = readAmount('1,250.50');
+    expect(amount).toBe(1250.5);
+    expect(amount).not.toBe(1);
+    expect(readAmount('12,345,678.90')).toBe(12345678.9);
+  });
+
+  it('reads an amount that uses a decimal comma', () => {
+    expect(readAmount('1250,50')).toBe(1250.5);
+    expect(readAmount('1.250,50')).toBe(1250.5);
+  });
+
+  it('skips an amount it cannot read, reports the row, and imports no number at all', () => {
+    const result = databaseService.parseImportData(csvWithAmount('1,25,0'));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: the amount "1,25,0" could not be read, so the row was skipped']);
+  });
+
+  it('refuses a cell carrying a currency symbol instead of importing part of it', () => {
+    const result = databaseService.parseImportData(csvWithAmount('₦2,900'));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: the amount "₦2,900" could not be read, so the row was skipped']);
+  });
+
+  it('skips an empty amount without turning it into zero', () => {
+    const result = databaseService.parseImportData(csvWithAmount(''));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: skipped invalid entry']);
+  });
+
+  it('reads a grouped JSON amount and refuses a JSON type it would otherwise coerce', () => {
+    const grouped = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: '1,250.50', currency: 'NGN', category: 'dining' }]),
+    );
+    expect(grouped.errors).toEqual([]);
+    expect(grouped.expenses[0]?.amount).toBe(1250.5);
+
+    const coerced = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: true, currency: 'NGN', category: 'dining' }]),
+    );
+    expect(coerced.expenses).toEqual([]);
+    expect(coerced.errors).toEqual(['item 1: invalid amount']);
+  });
+
+  it('keeps reading a file the export writer produced, end to end', async () => {
+    database.getAllAsync.mockResolvedValue([
+      { id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining', note: '', scanned: 0, date: 1710000000000 },
+      { id: 'b', merchant: 'Mall', amount: 2900, currency: 'NGN', category: 'shopping', note: 'Sale', scanned: 1, date: 1710000000000 },
+    ]);
+
+    const csv = await databaseService.exportToCSV(0, Date.now());
+    const result = databaseService.parseImportData(csv);
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses.map(expense => expense.amount)).toEqual([1250.5, 2900]);
+  });
+});
+
+describe('parseMoneyAmount reads a grouped or decimal amount and refuses the rest (BUG-09-15)', () => {
+  it('reads grouped, decimal and plain amounts as their true value', () => {
+    expect(parseMoneyAmount('1250.50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('2,900')).toEqual({ valid: true, value: 2900 });
+    expect(parseMoneyAmount('1,250.50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('1250,50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('1.250,50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount(' 1,250.50 ')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('1.500')).toEqual({ valid: true, value: 1500 });
+    expect(parseMoneyAmount('1250.505')).toEqual({ valid: true, value: 1250.505 });
+    expect(parseMoneyAmount('.5')).toEqual({ valid: true, value: 0.5 });
+  });
+
+  it('refuses an amount it cannot read unambiguously instead of truncating it', () => {
+    expect(parseMoneyAmount('1,25,0')).toEqual({ valid: false });
+    expect(parseMoneyAmount('abc')).toEqual({ valid: false });
+    expect(parseMoneyAmount('₦2,900')).toEqual({ valid: false });
+    expect(parseMoneyAmount('1,250 kr')).toEqual({ valid: false });
+    expect(parseMoneyAmount('')).toEqual({ valid: false });
+    expect(parseMoneyAmount(null)).toEqual({ valid: false });
+    expect(parseMoneyAmount('.')).toEqual({ valid: false });
+  });
+
+  it('still reads a value the app itself writes in exponential form', () => {
+    expect(parseMoneyAmount('1e-7')).toEqual({ valid: true, value: 1e-7 });
   });
 });
 

@@ -11,6 +11,7 @@ import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSet
 import { deleteOwnedReceiptImage, isOwnedReceiptImage } from '../utils/ownedReceiptImage';
 import { formatCurrency, resolveCurrency } from '../utils/currency';
 import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense, parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
+import { parseMoneyAmount } from '../data/moneyInput';
 import { CategoryService } from '../data/CategoryService';
 import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../data/RecurringDataService';
 import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
@@ -790,7 +791,15 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
           const item = items[i];
           const expErrors: string[] = [];
            if (typeof item.merchant !== 'string' || !item.merchant.trim()) expErrors.push(`item ${i + 1}: missing merchant`);
-           if (item.amount === undefined || item.amount === null || !Number.isFinite(Number(item.amount)) || Number(item.amount) <= 0) expErrors.push(`item ${i + 1}: invalid amount`);
+           // A JSON amount is a number in the documented shape, and it is read through the
+           // same shared parse as a CSV cell. Any other JSON type is refused rather than
+           // coerced, because `Number(true)` is 1 and `Number("0x10")` is 16, both of which
+           // used to be imported as a wrong amount with no message. The fallback zero is
+           // only ever produced for a row the guard below skips, so an unreadable amount
+           // never reaches the database as zero.
+           const amountParse = parseMoneyAmount(typeof item.amount === 'number' || typeof item.amount === 'string' ? String(item.amount) : null);
+           const amount = amountParse.valid ? amountParse.value : 0;
+           if (!amountParse.valid || amount <= 0) expErrors.push(`item ${i + 1}: invalid amount`);
 
             const currency = typeof item.currency === 'string' ? item.currency.trim() : '';
             const category = typeof item.category === 'string' ? item.category.trim().toLowerCase() : '';
@@ -803,7 +812,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
            expenses.push({
             id: Math.random().toString(36).substring(2, 15),
             merchant: String(item.merchant),
-            amount: Number(item.amount),
+            amount,
              currency,
              category,
             note: item.note || '',
@@ -847,22 +856,34 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     for (let i = 1; i < lines.length; i++) {
       const cols = parseCsvLine(lines[i]);
       const merchant = (cols[merchantIdx] || '').trim();
-       const amountValue = cols[amountIdx]?.trim() || '';
-       const amount = parseFloat(amountValue);
-       const currency = cols[currencyIdx]?.trim() || '';
-       const category = cols[categoryIdx]?.toLowerCase().trim() || '';
+      const amountValue = cols[amountIdx]?.trim() || '';
+      // BUG-09-15. `parseFloat` read `1,250.50` as 1 and `2,900` as 2, so a grouped cell
+      // was imported as its first digit with no error and no warning. The shared parse
+      // reads a grouped amount as its true value, and a cell it cannot read is reported
+      // below instead of being written as a truncated number or as zero.
+      const amount = parseMoneyAmount(amountValue);
+      const currency = cols[currencyIdx]?.trim() || '';
+      const category = cols[categoryIdx]?.toLowerCase().trim() || '';
 
-       if (!merchant || !amountValue || isNaN(amount) || amount <= 0 || !currency || !category) {
+      if (!merchant || !amountValue || !currency || !category) {
+        errors.push(`CSV row ${i}: skipped invalid entry`);
+        continue;
+      }
+      if (!amount.valid) {
+        errors.push(`CSV row ${i}: the amount "${amountValue}" could not be read, so the row was skipped`);
+        continue;
+      }
+      if (amount.value <= 0) {
         errors.push(`CSV row ${i}: skipped invalid entry`);
         continue;
       }
 
-       expenses.push({
+      expenses.push({
         id: Math.random().toString(36).substring(2, 15),
         merchant,
-        amount,
-         currency,
-         category,
+        amount: amount.value,
+        currency,
+        category,
         note: noteIdx !== -1 ? (cols[noteIdx] || '').replace(/""/g, '"') : '',
         scanned: scannedIdx !== -1 ? parseInt(cols[scannedIdx] || '0') || 0 : 0,
         date: dateIdx !== -1 ? toTimestamp(cols[dateIdx]) : Date.now(),
