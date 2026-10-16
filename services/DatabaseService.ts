@@ -11,7 +11,8 @@ import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSet
 import { deleteOwnedReceiptImage, isOwnedReceiptImage } from '../utils/ownedReceiptImage';
 import { formatCurrency, resolveCurrency } from '../utils/currency';
 import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense, parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
-import { parseMoneyAmount } from '../data/moneyInput';
+import { parseMoneyAmount, type MoneyParse } from '../data/moneyInput';
+import { parseImportDate } from '../data/dateInput';
 import { CategoryService } from '../data/CategoryService';
 import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../data/RecurringDataService';
 import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
@@ -774,10 +775,38 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const errors: string[] = [];
     const trimmed = input.trim();
 
-    const toTimestamp = (dateStr: string): number => {
-      if (!dateStr) return Date.now();
-      const d = new Date(dateStr);
-      return isNaN(d.getTime()) ? Date.now() : d.getTime();
+    // BUG-09-19. A date is read through the shared parse in ../data/dateInput.
+    // `new Date(value)` used to be reached with anything, and an unreadable value
+    // silently became `Date.now()`, so a row the file dated wrongly was stored as if
+    // it had happened today: no error, no warning, and a wrong month, which moves an
+    // expense between budget periods. A value the file supplies that cannot be read
+    // now refuses the row, which is the decision BUG-09-15 made for an amount it
+    // cannot read.
+    //
+    // A date the file does not supply at all is a different case and is not a
+    // refusal. The import's documented default for an unknown date is the import
+    // time: `EXTERNAL_IMPORT_PROMPT` tells the source to use today when the date is
+    // unknown, the JSON shape in ../data/ImportContracts.ts marks `date` optional,
+    // and a pinned test asserts that a JSON row without a date is not an error. That
+    // default is stated here rather than left to a `||` a reader has to notice.
+    const dateIsSupplied = (raw: unknown): boolean => {
+      if (raw === undefined || raw === null) return false;
+      return typeof raw === 'string' ? raw.trim() !== '' : true;
+    };
+
+    const dateErrorMessage = (prefix: string, raw: unknown): string =>
+      `${prefix}: the date "${String(raw)}" could not be read, so the row was skipped`;
+
+    // An absent, null or blank JSON numeric field stays absent, the same rule an
+    // absent or blank date gets below, because both fields are optional in the
+    // documented shape (`unit_price` and `units` are optional in `Expense` and in
+    // `CaptureCandidate`). Every other JSON type is read through the shared parse,
+    // which refuses a boolean, an array, a hex string or any other value `Number()`
+    // would have coerced into a number the user never wrote.
+    const readOptionalNumber = (raw: unknown): MoneyParse | null => {
+      if (raw === undefined || raw === null) return null;
+      if (typeof raw === 'string' && raw.trim() === '') return null;
+      return parseMoneyAmount(typeof raw === 'number' || typeof raw === 'string' ? String(raw) : null);
     };
 
     // Try JSON first
@@ -801,6 +830,27 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
            const amount = amountParse.valid ? amountParse.value : 0;
            if (!amountParse.valid || amount <= 0) expErrors.push(`item ${i + 1}: invalid amount`);
 
+           // BUG-09-19. The date is read on the same terms as the amount above, and
+           // a value the file supplies that cannot be read refuses the row instead of
+           // becoming today. A date the file does not supply keeps the documented
+           // import default, so an item without one is not an error.
+           const dateParse = parseImportDate(item.date);
+           if (!dateParse.valid && dateIsSupplied(item.date)) expErrors.push(dateErrorMessage(`item ${i + 1}`, item.date));
+
+           // `unit_price` and `units` used to be passed straight through, so a JSON
+           // string, boolean or array reached the repository and was stored as
+           // whatever SQLite coerced it to. Each keeps its own field rule: `units` is
+           // a whole count of at least one, the rule the receipt parser already
+           // applies (`ai/parsing.ts`), and `unit_price` is a money amount that is not
+           // negative. The parser's further check that `unit_price * units` equals the
+           // amount is not applied here, because the import's `amount` is the row
+           // total and a file may legitimately carry a pair that does not multiply to
+           // it, so that check would refuse honest rows.
+           const unitPriceParse = readOptionalNumber(item.unit_price);
+           const unitsParse = readOptionalNumber(item.units);
+           if (unitPriceParse && (!unitPriceParse.valid || unitPriceParse.value < 0)) expErrors.push(`item ${i + 1}: invalid unit_price`);
+           if (unitsParse && (!unitsParse.valid || !Number.isInteger(unitsParse.value) || unitsParse.value < 1)) expErrors.push(`item ${i + 1}: invalid units`);
+
             const currency = typeof item.currency === 'string' ? item.currency.trim() : '';
             const category = typeof item.category === 'string' ? item.category.trim().toLowerCase() : '';
             if (!currency) expErrors.push(`item ${i + 1}: missing currency`);
@@ -817,11 +867,11 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
              category,
             note: item.note || '',
             scanned: item.scanned || 0,
-            date: toTimestamp(item.date),
+            date: dateParse.valid ? dateParse.value : Date.now(),
             created_at: Date.now(),
             is_reimbursable: item.is_reimbursable || 0,
-            unit_price: item.unit_price ?? undefined,
-            units: item.units ?? undefined,
+            unit_price: unitPriceParse && unitPriceParse.valid ? unitPriceParse.value : undefined,
+            units: unitsParse && unitsParse.valid ? unitsParse.value : undefined,
           });
         }
         return { expenses, errors };
@@ -847,8 +897,8 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const noteIdx = header.indexOf('note');
     const scannedIdx = header.indexOf('scanned');
 
-     if (merchantIdx === -1 || amountIdx === -1 || currencyIdx === -1 || categoryIdx === -1) {
-       errors.push('CSV must have "merchant", "amount", "currency", and "category" columns.');
+     if (merchantIdx === -1 || amountIdx === -1 || currencyIdx === -1 || categoryIdx === -1 || dateIdx === -1) {
+       errors.push('CSV must have "merchant", "amount", "currency", "category", and "date" columns.');
       return { expenses: [], errors };
     }
 
@@ -864,13 +914,24 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       const amount = parseMoneyAmount(amountValue);
       const currency = cols[currencyIdx]?.trim() || '';
       const category = cols[categoryIdx]?.toLowerCase().trim() || '';
+      // BUG-09-19. The header carries a date column, so a row whose date cell is
+      // empty or unreadable is a row this file did not date. It is skipped and named
+      // rather than stored as today, which used to move the expense into the current
+      // month with no error and no warning. An empty date cell is treated exactly as
+      // an empty amount cell is above, with the same wording.
+      const dateValue = (cols[dateIdx] || '').trim();
+      const date = parseImportDate(dateValue);
 
-      if (!merchant || !amountValue || !currency || !category) {
+      if (!merchant || !amountValue || !currency || !category || !dateValue) {
         errors.push(`CSV row ${i}: skipped invalid entry`);
         continue;
       }
       if (!amount.valid) {
         errors.push(`CSV row ${i}: the amount "${amountValue}" could not be read, so the row was skipped`);
+        continue;
+      }
+      if (!date.valid) {
+        errors.push(`CSV row ${i}: the date "${dateValue}" could not be read, so the row was skipped`);
         continue;
       }
       if (amount.value <= 0) {
@@ -886,7 +947,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
         category,
         note: noteIdx !== -1 ? (cols[noteIdx] || '').replace(/""/g, '"') : '',
         scanned: scannedIdx !== -1 ? parseInt(cols[scannedIdx] || '0') || 0 : 0,
-        date: dateIdx !== -1 ? toTimestamp(cols[dateIdx]) : Date.now(),
+        date: date.value,
         created_at: Date.now(),
         is_reimbursable: 0,
         unit_price: undefined,

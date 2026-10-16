@@ -4,6 +4,7 @@ import * as SQLite from 'expo-sqlite';
 import { logger } from '../utils/logger';
 import { CurrencyConversionError } from '../data/SettingsContracts';
 import { parseMoneyAmount } from '../data/moneyInput';
+import { parseImportDate } from '../data/dateInput';
 
 vi.mock('react-native', () => ({ Platform: { OS: 'test' } }));
 
@@ -379,6 +380,285 @@ describe('parseMoneyAmount reads a grouped or decimal amount and refuses the res
 
   it('still reads a value the app itself writes in exponential form', () => {
     expect(parseMoneyAmount('1e-7')).toEqual({ valid: true, value: 1e-7 });
+  });
+});
+
+// BUG-09-19. The import read the date with `new Date(...)` and returned `Date.now()`
+// whenever that was not a valid date, so a row the file dated wrongly was stored as if
+// it had happened today, with no error and no warning. A wrong date moves an expense
+// between months, so it can change a budget total, a monthly comparison and a streak.
+// Every case below asserts the instant that reaches the record, or that nothing was
+// imported and the row was named. No existing expectation was loosened to make the fix
+// pass: the pinned JSON test that asserts a row without a date is not an error still
+// passes unchanged, which is why an absent date keeps the documented default.
+describe('DatabaseService imported date is read or the row is refused (BUG-09-19)', () => {
+  // The header and column order the export writer emits, so these rows are the file
+  // shape the app itself produces and not a synthetic one.
+  const csvWithDate = (dateCell: string): string => [
+    'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image',
+    `${dateCell},Cafe,1250.5,NGN,dining,,,0,no`,
+  ].join('\n');
+
+  const readDate = (dateCell: string): number => {
+    const result = databaseService.parseImportData(csvWithDate(dateCell));
+    expect(result.errors).toEqual([]);
+    const [row] = result.expenses;
+    expect(row).toBeDefined();
+    return row?.date ?? Number.NaN;
+  };
+
+  it('reads the calendar date the export writer emits as UTC midnight', () => {
+    expect(readDate('2026-01-05')).toBe(Date.UTC(2026, 0, 5));
+  });
+
+  it('keeps the date of a file the export writer produced, end to end', async () => {
+    database.getAllAsync.mockResolvedValue([
+      {
+        id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining',
+        note: '', scanned: 0, date: Date.UTC(2026, 0, 5, 12, 30),
+      },
+    ]);
+
+    const csv = await databaseService.exportToCSV(0, Date.now());
+    expect(csv).toContain('2026-01-05');
+
+    const result = databaseService.parseImportData(csv);
+    expect(result.errors).toEqual([]);
+    expect(result.expenses.map(expense => expense.date)).toEqual([Date.UTC(2026, 0, 5)]);
+  });
+
+  it('skips a date it cannot read and never stores that row with today instead', () => {
+    const startOfToday = new Date().setHours(0, 0, 0, 0);
+    const result = databaseService.parseImportData(csvWithDate('not-a-date'));
+
+    expect(result.errors).toEqual(['CSV row 1: the date "not-a-date" could not be read, so the row was skipped']);
+    expect(result.expenses).toHaveLength(0);
+    // The exact regression: this row used to be stored with `Date.now()` as its date.
+    expect(result.expenses.some(row => (row.date ?? 0) >= startOfToday)).toBe(false);
+  });
+
+  it('refuses an ambiguous date instead of guessing between two readings', () => {
+    const mayOrJanuary = databaseService.parseImportData(csvWithDate('05/01/2026'));
+    const januaryOrFebruary = databaseService.parseImportData(csvWithDate('01/02/2026'));
+
+    expect(mayOrJanuary.expenses).toEqual([]);
+    expect(mayOrJanuary.errors).toEqual(['CSV row 1: the date "05/01/2026" could not be read, so the row was skipped']);
+    expect(januaryOrFebruary.expenses).toEqual([]);
+    expect(januaryOrFebruary.errors).toEqual(['CSV row 1: the date "01/02/2026" could not be read, so the row was skipped']);
+    // `new Date('05/01/2026')` used to pick one of the two readings and store it.
+    expect(mayOrJanuary.expenses.some(row => row.date === new Date('05/01/2026').getTime())).toBe(false);
+  });
+
+  it('reads an ISO date and time with an offset as the instant it names', () => {
+    expect(readDate('2026-01-05T10:30:00Z')).toBe(Date.UTC(2026, 0, 5, 10, 30));
+    expect(readDate('2026-01-05T10:30:00+01:00')).toBe(Date.UTC(2026, 0, 5, 9, 30));
+
+    // No offset names the device's local time, so the file does not fix the
+    // instant and the row is refused rather than dated by whichever phone ran it.
+    const noOffset = databaseService.parseImportData(csvWithDate('2026-01-05T10:30:00'));
+    expect(noOffset.expenses).toEqual([]);
+    expect(noOffset.errors).toEqual(['CSV row 1: the date "2026-01-05T10:30:00" could not be read, so the row was skipped']);
+  });
+
+  it('refuses a CSV with no date column instead of dating every row today', () => {
+    const result = databaseService.parseImportData([
+      'merchant,amount,currency,category',
+      'Cafe,1250.5,NGN,dining',
+    ].join('\n'));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV must have "merchant", "amount", "currency", "category", and "date" columns.']);
+  });
+
+  it('skips an empty date cell with the same wording an empty amount cell gets', () => {
+    const result = databaseService.parseImportData(csvWithDate(''));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: skipped invalid entry']);
+  });
+
+  it('refuses a JSON date value it cannot read instead of dating the item today', () => {
+    const result = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: true }]),
+    );
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['item 1: the date "true" could not be read, so the row was skipped']);
+  });
+
+  it('keeps reading a JSON epoch date, and keeps the documented default when no date is given', () => {
+    const epoch = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: Date.UTC(2026, 0, 5) }]),
+    );
+    expect(epoch.errors).toEqual([]);
+    expect(epoch.expenses[0]?.date).toBe(Date.UTC(2026, 0, 5));
+
+    const before = Date.now();
+    const undated = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining' }]),
+    );
+    expect(undated.errors).toEqual([]);
+    expect(undated.expenses[0]?.date).toBeGreaterThanOrEqual(before);
+  });
+
+  it('keeps the documented default for an absent or blank JSON date, never an epoch date', () => {
+    const before = Date.now();
+    const blank = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: '' }]),
+    );
+
+    expect(blank.errors).toEqual([]);
+    // The contract documents the default as today for an unknown date, and it is
+    // never 0 or an epoch instant, which would be a different lie about the row.
+    expect(blank.expenses[0]?.date).toBeGreaterThanOrEqual(before);
+  });
+
+  it('refuses a zero, compact or unreadable JSON date instead of storing today or 1970', () => {
+    const cases: unknown[] = [0, -1, 20260105, '1710000000000', 'not-a-date', true];
+    for (const date of cases) {
+      const result = databaseService.parseImportData(
+        JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date }]),
+      );
+      // Nothing is stored, so the row cannot become today, 1970 or any other date.
+      expect(result.expenses).toHaveLength(0);
+      expect(result.errors).toEqual([`item 1: the date "${String(date)}" could not be read, so the row was skipped`]);
+    }
+  });
+});
+
+// BUG-09-19. `unit_price` and `units` were passed straight through from JSON with no
+// numeric check, so a string, boolean or array reached the repository and was stored as
+// whatever SQLite coerced it to. Both are read on the same terms as the amount column
+// now, and a value that fails its field rule refuses the row rather than being stored.
+describe('DatabaseService imported quantity fields are read or refused (BUG-09-19)', () => {
+  const jsonItem = (fields: Record<string, unknown>): string => JSON.stringify([
+    { merchant: 'Cafe', amount: 7, currency: 'NGN', category: 'dining', date: '2026-01-05', ...fields },
+  ]);
+
+  it('refuses a unit_price it would otherwise have coerced or stored out of range', () => {
+    const boolean = databaseService.parseImportData(jsonItem({ unit_price: true }));
+    expect(boolean.expenses).toEqual([]);
+    expect(boolean.errors).toEqual(['item 1: invalid unit_price']);
+
+    const withText = databaseService.parseImportData(jsonItem({ unit_price: '3.50 each' }));
+    expect(withText.expenses).toEqual([]);
+    expect(withText.errors).toEqual(['item 1: invalid unit_price']);
+
+    const negative = databaseService.parseImportData(jsonItem({ unit_price: -1 }));
+    expect(negative.expenses).toEqual([]);
+    expect(negative.errors).toEqual(['item 1: invalid unit_price']);
+  });
+
+  it('refuses a units value that is not a whole count of at least one', () => {
+    const withText = databaseService.parseImportData(jsonItem({ units: '2 items' }));
+    expect(withText.expenses).toEqual([]);
+    expect(withText.errors).toEqual(['item 1: invalid units']);
+
+    const fractional = databaseService.parseImportData(jsonItem({ units: 2.5 }));
+    expect(fractional.expenses).toEqual([]);
+    expect(fractional.errors).toEqual(['item 1: invalid units']);
+
+    const zero = databaseService.parseImportData(jsonItem({ units: 0 }));
+    expect(zero.expenses).toEqual([]);
+    expect(zero.errors).toEqual(['item 1: invalid units']);
+  });
+
+  it('keeps reading a readable unit_price and units, in the shapes a file carries', () => {
+    const plain = databaseService.parseImportData(jsonItem({ unit_price: 3.5, units: 2 }));
+    expect(plain.errors).toEqual([]);
+    expect(plain.expenses[0]?.unit_price).toBe(3.5);
+    expect(plain.expenses[0]?.units).toBe(2);
+
+    const asText = databaseService.parseImportData(jsonItem({ unit_price: '1,250.50', units: '2' }));
+    expect(asText.errors).toEqual([]);
+    expect(asText.expenses[0]?.unit_price).toBe(1250.5);
+    expect(asText.expenses[0]?.units).toBe(2);
+
+    const absent = databaseService.parseImportData(jsonItem({}));
+    expect(absent.errors).toEqual([]);
+    expect(absent.expenses[0]?.unit_price).toBeUndefined();
+    expect(absent.expenses[0]?.units).toBeUndefined();
+  });
+
+  it('leaves a blank or null optional field absent rather than refusing the row', () => {
+    // Both fields are optional in the documented shape, so a blank one is "not
+    // provided", the same rule an absent or blank date gets, not a value to refuse.
+    const blank = databaseService.parseImportData(jsonItem({ unit_price: '', units: '' }));
+    expect(blank.errors).toEqual([]);
+    expect(blank.expenses[0]?.unit_price).toBeUndefined();
+    expect(blank.expenses[0]?.units).toBeUndefined();
+
+    const nul = databaseService.parseImportData(jsonItem({ unit_price: null, units: null }));
+    expect(nul.errors).toEqual([]);
+    expect(nul.expenses[0]?.unit_price).toBeUndefined();
+    expect(nul.expenses[0]?.units).toBeUndefined();
+  });
+});
+
+describe('parseImportDate reads an ISO date and refuses the rest (BUG-09-19)', () => {
+  it('reads the calendar date the app and the v1 export write as UTC midnight', () => {
+    expect(parseImportDate('2026-01-05')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5) });
+    expect(parseImportDate(' 2026-06-13 ')).toEqual({ valid: true, value: Date.UTC(2026, 5, 13) });
+  });
+
+  it('reads an ISO date and time that carries an offset as the instant it names', () => {
+    expect(parseImportDate('2026-01-05T10:30:00Z')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 10, 30) });
+    expect(parseImportDate('2026-01-05T10:30:00+01:00')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 9, 30) });
+    expect(parseImportDate('2026-01-05T10:30:00.500Z')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 10, 30, 0, 500) });
+    expect(parseImportDate('2026-01-05T10:30:00-05:00')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 15, 30) });
+  });
+
+  it('reads epoch milliseconds, the type the app stores a date as', () => {
+    expect(parseImportDate(Date.UTC(2026, 0, 5))).toEqual({ valid: true, value: Date.UTC(2026, 0, 5) });
+  });
+
+  it('refuses a numeric date that also reads as a compact date, or is zero or negative', () => {
+    // `20260105` is both 2026-01-05 as a compact date and 1970-08-23 as a
+    // timestamp, so it has two real readings and is refused rather than guessed.
+    expect(parseImportDate(20260105)).toEqual({ valid: false });
+    expect(parseImportDate(2026)).toEqual({ valid: false });
+    expect(parseImportDate(2026_01)).toEqual({ valid: false });
+    // Zero and a negative value are 1970 or earlier as a timestamp, never an
+    // expense date the user wrote, so they are refused rather than stored as 1970.
+    expect(parseImportDate(0)).toEqual({ valid: false });
+    expect(parseImportDate(-1)).toEqual({ valid: false });
+    expect(parseImportDate(Number.NaN)).toEqual({ valid: false });
+    expect(parseImportDate(Number.POSITIVE_INFINITY)).toEqual({ valid: false });
+  });
+
+  it('refuses an ambiguous or implementation defined date instead of picking a reading', () => {
+    expect(parseImportDate('05/01/2026')).toEqual({ valid: false });
+    expect(parseImportDate('01/02/2026')).toEqual({ valid: false });
+    expect(parseImportDate('2026/01/05')).toEqual({ valid: false });
+    expect(parseImportDate('Jan 5, 2026')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05 10:30:00')).toEqual({ valid: false });
+    expect(parseImportDate('2026-1-5')).toEqual({ valid: false });
+    // No offset: the form names the device's local time, so the file does not fix
+    // the instant. A colon-less offset is not the form ECMAScript defines either.
+    expect(parseImportDate('2026-01-05T10:30')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05T10:30:00')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05T10:30:00+0100')).toEqual({ valid: false });
+  });
+
+  it('refuses a date that is not a real calendar day instead of rolling it forward', () => {
+    // `new Date('2026-02-30')` is March 2 and `new Date('2026-02-30T10:00:00Z')` is
+    // March 2 as well, both of which are days the file never named.
+    expect(parseImportDate('2026-02-30')).toEqual({ valid: false });
+    expect(parseImportDate('2026-02-30T10:00:00Z')).toEqual({ valid: false });
+    expect(parseImportDate('2026-13-05')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05T25:00:00Z')).toEqual({ valid: false });
+  });
+
+  it('refuses a partial date, a compact date, a bare number string and an empty value', () => {
+    expect(parseImportDate('2026-01')).toEqual({ valid: false });
+    expect(parseImportDate('2026')).toEqual({ valid: false });
+    expect(parseImportDate('20260105')).toEqual({ valid: false });
+    expect(parseImportDate('1710000000000')).toEqual({ valid: false });
+    expect(parseImportDate('')).toEqual({ valid: false });
+    expect(parseImportDate(null)).toEqual({ valid: false });
+    expect(parseImportDate(undefined)).toEqual({ valid: false });
+    expect(parseImportDate({})).toEqual({ valid: false });
+    expect(parseImportDate(Number.NaN)).toEqual({ valid: false });
   });
 });
 
