@@ -68,6 +68,8 @@ vi.mock('../../data', () => ({ resolveExpenseBatchSave: vi.fn(), runCaptureSideE
 // eslint-disable-next-line import/first
 import { AI_ERROR_CODES } from '../../ai/contracts';
 // eslint-disable-next-line import/first
+import type { ScannedReceipt } from '../../types/gemini';
+// eslint-disable-next-line import/first
 import {
   SCAN_DIALOG_CODES,
   isScanDialogCode,
@@ -76,6 +78,8 @@ import {
   scanFailureDialogCopy,
   acceptBarcodeScan,
   productScanOptions,
+  evaluateCaptureGate,
+  firstBlockedCaptureMessage,
 } from './scan';
 
 const UPC_A = '0123456789012';
@@ -192,5 +196,99 @@ describe('scan failure surface routing', () => {
     expect(resolveScanFailure('offline', 'product')).toEqual({ kind: 'toast', message: 'AI provider is unavailable offline.' });
     expect(resolveScanFailure('missing_key', 'product')).toEqual({ kind: 'toast', message: 'AI provider key is not configured.' });
     expect(resolveScanFailure('provider', 'receipt')).toEqual({ kind: 'toast', message: 'AI provider request failed. Try again.' });
+  });
+});
+
+// The gate is the last check before a capture reaches the save boundary, so these
+// exercise its decision and its copy rather than the rendered toast. The rules
+// are pinned against the boundary read at data/contracts.ts:83, whose merchant
+// requirement is source based and whose scanned source is 'ocr', which this
+// screen always builds.
+describe('scan pre-save gate', () => {
+  const item = (patch: Partial<ScannedReceipt> = {}): ScannedReceipt => ({
+    merchant: 'Corner Store',
+    amount: 12.5,
+    currency: 'USD',
+    category: 'groceries',
+    ...patch,
+  });
+
+  it('lets a product with no merchant and a price through, because the boundary accepts an empty merchant for a scanned product', () => {
+    expect(evaluateCaptureGate(item({ merchant: '' }), 'product')).toEqual({ canSave: true });
+  });
+
+  it('refuses a product with no price and names the price rather than receipt fields', () => {
+    const decision = evaluateCaptureGate(item({ merchant: '', amount: 0 }), 'product');
+    expect(decision.canSave).toBe(false);
+    if (decision.canSave) return;
+    expect(decision.message).toBe('Add a price before saving this product.');
+  });
+
+  it('lets a receipt with a store name through', () => {
+    expect(evaluateCaptureGate(item(), 'receipt')).toEqual({ canSave: true });
+  });
+
+  it('refuses a receipt with no store name, keeping the rule receipt mode always had', () => {
+    const decision = evaluateCaptureGate(item({ merchant: '   ' }), 'receipt');
+    expect(decision.canSave).toBe(false);
+    if (decision.canSave) return;
+    expect(decision.message).toBe('Add the store name before saving this receipt.');
+  });
+
+  it('refuses a product missing a category and names the category', () => {
+    const decision = evaluateCaptureGate(item({ merchant: '', category: '' }), 'product');
+    expect(decision.canSave).toBe(false);
+    if (decision.canSave) return;
+    expect(decision.message).toBe('Add a category before saving this product.');
+  });
+
+  it('refuses a missing currency in both modes, matching the boundary', () => {
+    expect(evaluateCaptureGate(item({ currency: '  ' }), 'receipt').canSave).toBe(false);
+    expect(evaluateCaptureGate(item({ merchant: '', currency: '' }), 'product').canSave).toBe(false);
+  });
+
+  it('refuses a non finite or non positive amount in both modes, as the boundary does', () => {
+    for (const mode of ['receipt', 'product'] as const) {
+      expect(evaluateCaptureGate(item({ amount: 0 }), mode).canSave).toBe(false);
+      expect(evaluateCaptureGate(item({ amount: -3 }), mode).canSave).toBe(false);
+      expect(evaluateCaptureGate(item({ amount: Number.NaN }), mode).canSave).toBe(false);
+    }
+  });
+
+  it('never names a merchant or a receipt in any product message', () => {
+    const productFailures = [
+      item({ merchant: '', amount: 0 }),
+      item({ merchant: '', amount: Number.NaN }),
+      item({ merchant: '', currency: '' }),
+      item({ merchant: '', category: '   ' }),
+    ];
+    for (const failing of productFailures) {
+      const decision = evaluateCaptureGate(failing, 'product');
+      expect(decision.canSave).toBe(false);
+      if (decision.canSave) continue;
+      const text = decision.message.toLowerCase();
+      expect(text).not.toContain('merchant');
+      expect(text).not.toContain('receipt');
+    }
+  });
+
+  it('names each mode with its own noun in the gate copy too', () => {
+    const receiptBlocked = evaluateCaptureGate(item({ merchant: '' }), 'receipt');
+    const productBlocked = evaluateCaptureGate(item({ merchant: '', amount: 0 }), 'product');
+    expect(receiptBlocked.canSave).toBe(false);
+    expect(productBlocked.canSave).toBe(false);
+    if (receiptBlocked.canSave || productBlocked.canSave) return;
+    expect(receiptBlocked.message.toLowerCase()).toContain('receipt');
+    expect(productBlocked.message.toLowerCase()).toContain('product');
+  });
+
+  it('reports the first refused item in a batch and passes a clean batch', () => {
+    expect(firstBlockedCaptureMessage([item({ merchant: '' }), item({ merchant: '', amount: 0 })], 'product'))
+      .toBe('Add a price before saving this product.');
+    expect(firstBlockedCaptureMessage([item(), item({ amount: 5 })], 'receipt')).toBeNull();
+    expect(firstBlockedCaptureMessage([item({ merchant: '' }), item({ merchant: '', amount: 4 })], 'product')).toBeNull();
+    expect(firstBlockedCaptureMessage([item({ merchant: '' })], 'receipt'))
+      .toBe('Add the store name before saving this receipt.');
+    expect(firstBlockedCaptureMessage([], 'product')).toBeNull();
   });
 });

@@ -143,13 +143,58 @@ export function productScanOptions(
   return { signal, barcode };
 }
 
-const hasRequiredReceiptFields = (item: ScannedReceipt): boolean => (
-  item.merchant.trim().length > 0 &&
-  Number.isFinite(item.amount) &&
-  item.amount > 0 &&
-  item.currency.trim().length > 0 &&
-  item.category.trim().length > 0
-);
+// The pre-save gate, mode aware (BUG-09-17b). It is the last check before a
+// capture reaches the save boundary, so it requires exactly what that boundary
+// requires, except where a mode genuinely knows better. Receipt mode keeps the
+// store name it always required, because a receipt carries one. Product mode
+// does not require a merchant: a product photograph normally has none, and the
+// boundary accepts an empty merchant for a scanned product and stores that empty
+// value rather than an invented one (BUG-09-17a). Product mode calls the amount
+// a price, because the parse deliberately leaves it at zero when the photograph
+// showed no price, which is a real and common thing to be missing.
+const isBlank = (value: string): boolean => value.trim().length === 0;
+const isMissingAmount = (item: ScannedReceipt): boolean => !Number.isFinite(item.amount) || item.amount <= 0;
+
+interface CaptureGateCheck {
+  isMissing: (item: ScannedReceipt) => boolean;
+  message: string;
+}
+
+// Each mode's required fields in the order the gate reports them. The message
+// names the field that is actually missing, in the mode's own words: product
+// mode never names a merchant or a receipt, because it never requires a merchant
+// and no receipt exists on that screen.
+const CAPTURE_GATE_CHECKS: Record<ScanMode, readonly CaptureGateCheck[]> = {
+  receipt: [
+    { isMissing: (item) => isBlank(item.merchant), message: 'Add the store name before saving this receipt.' },
+    { isMissing: isMissingAmount, message: 'Add the total before saving this receipt.' },
+    { isMissing: (item) => isBlank(item.currency), message: 'Add the currency before saving this receipt.' },
+    { isMissing: (item) => isBlank(item.category), message: 'Add a category before saving this receipt.' },
+  ],
+  product: [
+    { isMissing: isMissingAmount, message: 'Add a price before saving this product.' },
+    { isMissing: (item) => isBlank(item.currency), message: 'Add the currency before saving this product.' },
+    { isMissing: (item) => isBlank(item.category), message: 'Add a category before saving this product.' },
+  ],
+};
+
+export type CaptureGateDecision = { canSave: true } | { canSave: false; message: string };
+
+export function evaluateCaptureGate(item: ScannedReceipt, mode: ScanMode): CaptureGateDecision {
+  const blocked = CAPTURE_GATE_CHECKS[mode].find((check) => check.isMissing(item));
+  return blocked ? { canSave: false, message: blocked.message } : { canSave: true };
+}
+
+// The message for the first item the gate refuses, or null when the whole batch
+// can be saved. Both save paths use it, so the confirm path and the save-anyway
+// path cannot disagree about what is saveable.
+export function firstBlockedCaptureMessage(items: ScannedReceipt[], mode: ScanMode): string | null {
+  for (const item of items) {
+    const decision = evaluateCaptureGate(item, mode);
+    if (!decision.canSave) return decision.message;
+  }
+  return null;
+}
 
 const PROCESSING_COPY: Record<ProcessingContext, { contextLabel: string; title: string; description: string }> = {
   receipt: {
@@ -430,8 +475,10 @@ export default function ScanScreen() {
   // Save Anyway only. A clean confirm persists inside handleConfirm through the
   // same shared boundary, so calling this on a clean batch would insert twice.
   const executeSave = useCallback(async (items: ScannedReceipt[]) => {
-    if (items.length === 0 || items.some(item => !hasRequiredReceiptFields(item))) {
-      showToast('Review missing receipt fields before saving.', 'error');
+    if (items.length === 0) return;
+    const blocked = firstBlockedCaptureMessage(items, processingMode(processingContext));
+    if (blocked) {
+      showToast(blocked, 'error');
       return;
     }
     const repository = await databaseService.getCaptureRepository();
@@ -440,14 +487,15 @@ export default function ScanScreen() {
     if (resolution.status !== 'saved') throw new Error('capture_save_failed');
     await runBatchSideEffects(resolution.records, candidates);
     await finalizeBatchSave(items);
-  }, [buildCandidates, finalizeBatchSave, runBatchSideEffects, showToast]);
+  }, [buildCandidates, finalizeBatchSave, processingContext, runBatchSideEffects, showToast]);
 
   const handleConfirm = useCallback(async (items: ScannedReceipt[]) => {
     try {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       if (items.length === 0) return;
-      if (items.some(item => !hasRequiredReceiptFields(item))) {
-        showToast('Review missing receipt fields before saving.', 'error');
+      const blocked = firstBlockedCaptureMessage(items, processingMode(processingContext));
+      if (blocked) {
+        showToast(blocked, 'error');
         return;
       }
       const repository = await databaseService.getCaptureRepository();
@@ -470,7 +518,7 @@ export default function ScanScreen() {
       showToast('Failed to save expenses', 'error');
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [buildCandidates, finalizeBatchSave, runBatchSideEffects, showToast]);
+  }, [buildCandidates, finalizeBatchSave, processingContext, runBatchSideEffects, showToast]);
 
   const runScan = useCallback(async (base64: string, context: ProcessingContext) => {
     setProcessingContext(context);
