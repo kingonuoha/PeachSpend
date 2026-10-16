@@ -440,12 +440,11 @@ describe('AI chat intent alternatives match the lowercased message (BUG-09-13)',
     expect(aiChatService.classifyIntent('what is the weather')).toEqual(['general']);
   });
 
-  // Characterisation, not a requirement. `what did I spend` in the recent_expenses
-  // pattern carries the same uppercase-I defect. It is named in the evidence and
-  // escalated rather than fixed here, so this pins today's behaviour and will fail
-  // loudly (as intended) if that third alternative is ever corrected.
-  it('records the unfixed third uppercase-I alternative for the escalation', () => {
-    expect(aiChatService.classifyIntent('what did I spend')).toEqual(['general']);
-    expect(aiChatService.classifyIntent('what did i spend')).toEqual(['general']);
+  // DEC-B49 follow-up: `what did I spend` in the recent_expenses pattern carried the
+  // same uppercase-I defect. It is now lowercase, so this replaces the characterisation
+  // test that pinned the old `['general']` result rather than sitting alongside it.
+  it('classifies "what did I spend" as recent_expenses', () => {
+    expect(aiChatService.classifyIntent('what did I spend')).toEqual(['recent_expenses']);
+    expect(aiChatService.classifyIntent('what did i spend')).toEqual(['recent_expenses']);
   });
 });

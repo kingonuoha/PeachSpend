@@ -398,7 +398,9 @@ class AIChatService {
     if (/how much (on|for|did i spend on)|spent on|category|on .* (category|this month)/.test(lower)) matches.push('category_query');
     if (/\b(at|from) \w/i.test(lower) || /merchant/.test(lower)) matches.push('merchant_query');
     if (/last week|this month|in (january|february|march|april|may|june|july|august|september|october|november|december)|between|this year|last month|this week/.test(lower)) matches.push('date_range_query');
-    if (/recent|latest|last few|what did I spend|recent expenses/.test(lower)) matches.push('recent_expenses');
+    // `what did I spend` carried the same uppercase `I` against the lowercased
+    // input as the two patterns below (BUG-09-13, DEC-B49 follow-up).
+    if (/recent|latest|last few|what did i spend|recent expenses/.test(lower)) matches.push('recent_expenses');
     // `lower` is already lowercased at :395, so every literal here must be lowercase
     // or it can never match (BUG-09-13). `when will i` was written with an uppercase
     // `I` and was dead against this input.
