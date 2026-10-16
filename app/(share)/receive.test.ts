@@ -1,9 +1,26 @@
 import { describe, expect, it, vi } from 'vitest';
 
-// The share screen renders native UI, so this suite exercises the pure recovery
-// presentation rather than the rendered card. Vitest hoists these mocks above the
+// The share screen renders native UI, so this suite exercises the pure recovery and
+// outcome helpers rather than the rendered card. Vitest hoists these mocks above the
 // import, and the helpers under test import nothing from the stubbed modules.
 vi.mock('react-native', () => ({
+  // ScalePressable calls Animated.createAnimatedComponent at module scope, and the
+  // screen speaks through AccessibilityInfo, so both are present even though this suite
+  // does not render the UI.
+  AccessibilityInfo: {
+    announceForAccessibility: vi.fn(),
+    isReduceMotionEnabled: async () => false,
+    addEventListener: () => ({ remove: () => undefined }),
+  },
+  Animated: {
+    Value: class {
+      setValue = vi.fn();
+      interpolate = vi.fn(() => '');
+    },
+    timing: vi.fn(() => ({ start: vi.fn() })),
+    createAnimatedComponent: (component: unknown) => component,
+  },
+  Easing: { inOut: () => () => 0, ease: () => 0 },
   Platform: { OS: 'ios' },
   Pressable: () => null,
   ScrollView: () => null,
@@ -60,7 +77,7 @@ vi.mock('../../data', () => ({ resolveExpenseBatchSave: vi.fn(), runCaptureSideE
 // eslint-disable-next-line import/first
 import { AI_ERROR_CODES, getAiErrorMessage } from '../../ai/contracts';
 // eslint-disable-next-line import/first
-import { RECOVERY_MANUAL_ROUTE, recoveryKind, resolveRecoveryPresentation } from './receive';
+import { RECOVERY_MANUAL_ROUTE, describeRecoveryAnnouncement, describeSavedBatch, recoveryKind, resolveRecoveryPresentation } from './receive';
 
 // The words that assert a photographic cause. The app only establishes one for
 // `illegible_image`, so no other code may be answered with them.
@@ -136,5 +153,47 @@ describe('share recovery presentation, one cause per failure code', () => {
     expect(resolveRecoveryPresentation('unauthorized').manualEntry).toBe(true);
     expect(resolveRecoveryPresentation('timeout').manualEntry).toBe(true);
     expect(resolveRecoveryPresentation(null).manualEntry).toBe(true);
+  });
+});
+
+describe('share async outcome announcements, spoken text matches rendered text', () => {
+  it('announces the same heading the card renders, plus the message, for a response the app could not use', () => {
+    const message = getAiErrorMessage('invalid_response', 'receipt');
+    const spoken = describeRecoveryAnnouncement('invalid_response', message);
+    expect(spoken).toBe(`${resolveRecoveryPresentation('invalid_response').heading}. ${message}`);
+    expect(spoken).toContain('response');
+    expect(spoken).not.toContain('image');
+  });
+
+  it('announces the image heading for every code that keeps it, and for the consumed token', () => {
+    for (const code of AI_ERROR_CODES) {
+      if (code === 'invalid_response' || code === 'cancelled') continue;
+      const spoken = describeRecoveryAnnouncement(code, getAiErrorMessage(code, 'receipt'));
+      expect(spoken.startsWith("Couldn't Read Shared Image. ")).toBe(true);
+    }
+    expect(describeRecoveryAnnouncement(null, 'This shared image is no longer available. Share it again to retry.'))
+      .toBe("Couldn't Read Shared Image. This shared image is no longer available. Share it again to retry.");
+  });
+
+  it('uses one success sentence for the render and for the announcement', () => {
+    const single = describeSavedBatch([
+      { merchant: 'Whole Foods Market', amount: 18.2, currency: 'USD', category: 'groceries' },
+    ]);
+    expect(single.merchant).toBe('Whole Foods Market ($18.20)');
+    expect(single.tail).toBe(' has been logged under Groceries.');
+
+    const multi = describeSavedBatch([
+      { merchant: 'A', amount: 1, currency: 'USD', category: 'groceries' },
+      { merchant: 'B', amount: 2, currency: 'USD', category: 'dining' },
+    ]);
+    expect(multi.merchant).toBeNull();
+    expect(multi.tail).toBe('2 shared receipts have been logged to your ledger.');
+  });
+
+  it('keeps the empty-batch sentence honest rather than claiming a save', () => {
+    expect(describeSavedBatch([])).toEqual({
+      merchant: null,
+      tail: '0 shared receipts have been logged to your ledger.',
+    });
   });
 });
