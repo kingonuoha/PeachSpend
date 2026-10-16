@@ -32,7 +32,7 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useAchievements } from '../../components/ui/AchievementProvider';
-import { AiError, getAiErrorMessage, normalizeAiError } from '../../ai/contracts';
+import { AiError, getAiErrorMessage, normalizeAiError, type AiErrorCode } from '../../ai/contracts';
 import { resolveExpenseBatchSave, runCaptureSideEffects, normalizeCurrencyTotal, type DuplicateMatch, type CaptureCandidate } from '../../data';
 import { copyReceiptImageToAppCache, deleteOwnedReceiptImage, readOwnedReceiptImageAsBase64 } from '../../utils/ownedReceiptImage';
 import { ScannedReceipt } from '../../types/gemini';
@@ -73,7 +73,51 @@ const BARCODE_PILL_CLEARANCE = Spacing.s9;
 type ScanMode = 'receipt' | 'product';
 type ProcessingContext = 'receipt' | 'gallery' | 'product';
 
-const isIllegibleCode = (code: string): boolean => code === 'illegible_image' || code === 'invalid_response';
+// The two codes that mean the scan produced nothing usable, so they get the recovery dialog rather
+// than a toast. They are exactly the two codes ai/contracts.ts keeps mode aware copy for.
+export const SCAN_DIALOG_CODES = ['illegible_image', 'invalid_response'] as const;
+export type ScanDialogCode = (typeof SCAN_DIALOG_CODES)[number];
+
+export const isScanDialogCode = (code: string): code is ScanDialogCode =>
+  (SCAN_DIALOG_CODES as readonly string[]).includes(code);
+
+// The recovery dialog names the object being scanned in the active mode and the failure class, and
+// its body is the settled sentence from ai/contracts.ts. Neither asserts a photographic cause (blur,
+// dim light): the app only ever knows what the provider returned, which is the defect BUG-09-09
+// removes. `invalid_response` is a response the app could not use, not an unreadable photo, so it
+// gets its own title rather than borrowing the illegible one.
+const SCAN_DIALOG_TITLE: Record<ScanMode, Record<ScanDialogCode, string>> = {
+  receipt: {
+    illegible_image: 'Receipt Unclear',
+    invalid_response: 'Receipt Could Not Be Read',
+  },
+  product: {
+    illegible_image: 'Product Unclear',
+    invalid_response: 'Product Could Not Be Read',
+  },
+};
+
+// The mode the scan pipeline actually ran in: a gallery image is read as a receipt, and product only
+// when the context is product. This is the same mapping resolveItems uses to pick the provider
+// prompt, so the failure copy names the object the app actually tried to read.
+export function processingMode(context: ProcessingContext): ScanMode {
+  return context === 'product' ? 'product' : 'receipt';
+}
+
+export function scanFailureDialogCopy(code: ScanDialogCode, mode: ScanMode): { title: string; body: string } {
+  return { title: SCAN_DIALOG_TITLE[mode][code], body: getAiErrorMessage(code, mode) };
+}
+
+export type ScanFailureSurface =
+  | { kind: 'dialog'; code: ScanDialogCode; title: string; body: string }
+  | { kind: 'toast'; message: string };
+
+// Every failure on this screen resolves here, so the real mode always reaches the copy and neither
+// mode is ever described in the other's nouns.
+export function resolveScanFailure(code: AiErrorCode, mode: ScanMode): ScanFailureSurface {
+  if (isScanDialogCode(code)) return { kind: 'dialog', code, ...scanFailureDialogCopy(code, mode) };
+  return { kind: 'toast', message: getAiErrorMessage(code, mode) };
+}
 
 // A decoded code is accepted as product context only: product mode, a camera
 // that is live, and no scan already in flight. Receipt mode can never accept
@@ -227,7 +271,9 @@ export default function ScanScreen() {
 
   const [isScanning, setIsScanning] = useState(false);
   const [processingContext, setProcessingContext] = useState<ProcessingContext>('receipt');
-  const [illegibleVisible, setIllegibleVisible] = useState(false);
+  // The failure code the recovery dialog is showing, or null when it is closed. Holding the code
+  // rather than a boolean lets the title and body come from the code and the active mode.
+  const [dialogCode, setDialogCode] = useState<ScanDialogCode | null>(null);
   const [flash, setFlash] = useState<'on' | 'off'>('off');
   const [scanMode, setScanMode] = useState<ScanMode>('receipt');
   const [scanResult, setScanResult] = useState<ScannedReceipt[] | null>(null);
@@ -306,7 +352,7 @@ export default function ScanScreen() {
   }), [conversionRates, settings.currency]);
 
   const resolveItems = useCallback(async (base64: string, context: ProcessingContext, signal: AbortSignal): Promise<ScannedReceipt[]> => {
-    const mode = context === 'product' ? 'product' : 'receipt';
+    const mode = processingMode(context);
     const rawItems = await geminiService.scanReceipt(base64, mode, productScanOptions(context, decodedBarcode, signal));
     if (!rawItems || !Array.isArray(rawItems)) throw new AiError('invalid_response', 'gemini', 'AI response did not match the receipt contract');
     return convertToUserCurrency(rawItems);
@@ -334,11 +380,14 @@ export default function ScanScreen() {
     clearDecodedBarcode();
   }, [clearDecodedBarcode]);
 
-  const handleFailure = useCallback((error: unknown, logMessage: string) => {
+  // The real mode of the operation that failed is passed in, so receipt mode gets receipt copy and
+  // product mode gets product copy rather than the receipt context being hardcoded.
+  const handleFailure = useCallback((error: unknown, logMessage: string, context: ProcessingContext) => {
     const normalized = normalizeAiError(error, 'gemini');
     logger.error(logMessage, normalized.code);
-    if (isIllegibleCode(normalized.code)) setIllegibleVisible(true);
-    else showToast(getAiErrorMessage(normalized.code, 'receipt'), 'error');
+    const surface = resolveScanFailure(normalized.code, processingMode(context));
+    if (surface.kind === 'dialog') setDialogCode(surface.code);
+    else showToast(surface.message, 'error');
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
   }, [showToast]);
 
@@ -437,7 +486,7 @@ export default function ScanScreen() {
       // A user cancel owns its own cleanup in cancelProcessing; do not surface it
       // as an OCR failure.
       if (!(error instanceof AiError && error.code === 'cancelled')) {
-        handleFailure(error, 'Failed to scan receipt');
+        handleFailure(error, 'Failed to scan receipt', context);
         await deleteOwnedReceiptImage(ownedImageUri ?? undefined);
         setOwnedImageUri(null);
         setCameraActive(true);
@@ -474,7 +523,7 @@ export default function ScanScreen() {
       setOwnedImageUri(copiedUri);
       await runScan(await readOwnedReceiptImageAsBase64(copiedUri), 'gallery');
     } catch (error) {
-      handleFailure(error, 'Failed to scan gallery image');
+      handleFailure(error, 'Failed to scan gallery image', 'gallery');
       await deleteOwnedReceiptImage(copiedUri ?? ownedImageUri ?? undefined);
       setOwnedImageUri(null);
     }
@@ -502,7 +551,7 @@ export default function ScanScreen() {
       setOwnedImageUri(copiedUri);
       await runScan(await readOwnedReceiptImageAsBase64(copiedUri), scanMode === 'product' ? 'product' : 'receipt');
     } catch (error) {
-      handleFailure(error, 'Failed to capture or scan receipt');
+      handleFailure(error, 'Failed to capture or scan receipt', scanMode === 'product' ? 'product' : 'receipt');
       await deleteOwnedReceiptImage(copiedUri ?? ownedImageUri ?? undefined);
       setOwnedImageUri(null);
       setCameraActive(true);
@@ -525,7 +574,7 @@ export default function ScanScreen() {
       const items = await resolveItems(await readOwnedReceiptImageAsBase64(ownedImageUri), scanMode === 'product' ? 'product' : 'receipt', controller.signal);
       setScanResult(items);
     } catch (error) {
-      if (!(error instanceof AiError && error.code === 'cancelled')) handleFailure(error, 'Failed to retry receipt extraction');
+      if (!(error instanceof AiError && error.code === 'cancelled')) handleFailure(error, 'Failed to retry receipt extraction', scanMode === 'product' ? 'product' : 'receipt');
     } finally {
       if (scanAbortRef.current === controller) scanAbortRef.current = null;
       setIsScanning(false);
@@ -563,6 +612,7 @@ export default function ScanScreen() {
   const instruction = scanMode === 'product' ? 'Point at barcode or grocery item' : 'Align receipt within the frame';
   const processing = PROCESSING_COPY[processingContext];
   const showBarcode = scanMode === 'product' && decodedBarcode !== null;
+  const failureDialog = dialogCode ? scanFailureDialogCopy(dialogCode, scanMode) : null;
 
   return (
     <View style={styles.screen}>
@@ -671,21 +721,21 @@ export default function ScanScreen() {
         />
       )}
 
-      {/* Illegible image recovery */}
-      {illegibleVisible ? (
+      {/* Scan recovery, for the two codes that mean nothing usable came back. The title and body are
+          derived from the code and the active mode, so a product failure is never described with
+          receipt nouns and no cause the app did not establish is asserted. */}
+      {failureDialog ? (
         <View style={styles.illegibleScrim}>
           <View style={styles.illegibleCard} accessibilityViewIsModal>
             <View style={styles.illegibleIcon}>
               <Camera size={24} color={Colors.primary} />
             </View>
-            <Text accessibilityRole="header" style={styles.illegibleTitle}>Receipt Unclear</Text>
-            <Text style={styles.illegibleBody}>
-              Text was too blurry or lighting was too dim to reliably parse the merchant and totals.
-            </Text>
-            <PeachButton title="Try Again" onPress={() => setIllegibleVisible(false)} variant="primary" size="lg" fullWidth tone="dark" />
+            <Text accessibilityRole="header" style={styles.illegibleTitle}>{failureDialog.title}</Text>
+            <Text style={styles.illegibleBody}>{failureDialog.body}</Text>
+            <PeachButton title="Try Again" onPress={() => setDialogCode(null)} variant="primary" size="lg" fullWidth tone="dark" />
             <PeachButton
               title="Enter Manually"
-              onPress={() => { setIllegibleVisible(false); router.push('/expense/manual'); }}
+              onPress={() => { setDialogCode(null); router.push('/expense/manual'); }}
               variant="secondary"
               tone="dark"
               size="lg"

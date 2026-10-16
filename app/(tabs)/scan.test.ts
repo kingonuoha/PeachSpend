@@ -66,7 +66,17 @@ vi.mock('../../hooks/useReduceMotion', () => ({ useReduceMotion: () => false }))
 vi.mock('../../data', () => ({ resolveExpenseBatchSave: vi.fn(), runCaptureSideEffects: vi.fn(), normalizeCurrencyTotal: vi.fn() }));
 
 // eslint-disable-next-line import/first
-import { acceptBarcodeScan, productScanOptions } from './scan';
+import { AI_ERROR_CODES } from '../../ai/contracts';
+// eslint-disable-next-line import/first
+import {
+  SCAN_DIALOG_CODES,
+  isScanDialogCode,
+  processingMode,
+  resolveScanFailure,
+  scanFailureDialogCopy,
+  acceptBarcodeScan,
+  productScanOptions,
+} from './scan';
 
 const UPC_A = '0123456789012';
 const IDLE_PRODUCT = { mode: 'product' as const, isScanning: false, cameraActive: true };
@@ -113,5 +123,74 @@ describe('scan screen barcode plumbing', () => {
 
   it('sends no code when nothing was decoded', () => {
     expect(productScanOptions('product', null, signal).barcode).toBeUndefined();
+  });
+});
+
+// The screen renders native UI, so these exercise the pure copy selection rather than the rendered
+// dialog. They prove the real mode reaches the copy, that the two modes never share nouns, and that
+// no sentence asserts a photographic cause the app never establishes.
+describe('scan failure mode resolution', () => {
+  it('maps each processing context to the mode the pipeline actually ran in', () => {
+    expect(processingMode('receipt')).toBe('receipt');
+    expect(processingMode('gallery')).toBe('receipt');
+    expect(processingMode('product')).toBe('product');
+  });
+
+  it('passes the mode through to the copy for both modes', () => {
+    for (const code of SCAN_DIALOG_CODES) {
+      const receipt = resolveScanFailure(code, 'receipt');
+      const product = resolveScanFailure(code, 'product');
+      expect(receipt.kind).toBe('dialog');
+      expect(product.kind).toBe('dialog');
+      if (receipt.kind !== 'dialog' || product.kind !== 'dialog') continue;
+      // Different copy in the two modes can only happen if the mode reached getAiErrorMessage.
+      expect(receipt.title).not.toBe(product.title);
+      expect(receipt.body).not.toBe(product.body);
+    }
+  });
+
+  it('names each mode with its own noun and never the other mode', () => {
+    for (const code of SCAN_DIALOG_CODES) {
+      const receipt = scanFailureDialogCopy(code, 'receipt');
+      const product = scanFailureDialogCopy(code, 'product');
+      const receiptText = `${receipt.title} ${receipt.body}`.toLowerCase();
+      const productText = `${product.title} ${product.body}`.toLowerCase();
+      expect(receiptText).toContain('receipt');
+      expect(receiptText).not.toContain('product');
+      expect(productText).toContain('product');
+      expect(productText).not.toContain('receipt');
+    }
+  });
+
+  it('never asserts blur, dim or lighting, because the app never establishes any of them', () => {
+    for (const mode of ['receipt', 'product'] as const) {
+      for (const code of SCAN_DIALOG_CODES) {
+        const { title, body } = scanFailureDialogCopy(code, mode);
+        for (const sentence of [title, body]) {
+          expect(sentence).not.toContain('blur');
+          expect(sentence).not.toContain('dim');
+          expect(sentence).not.toContain('lighting');
+        }
+      }
+    }
+  });
+});
+
+describe('scan failure surface routing', () => {
+  it('routes the two unusable-scan codes to the dialog and every other code to a visible toast', () => {
+    for (const code of AI_ERROR_CODES) {
+      const surface = resolveScanFailure(code, 'receipt');
+      if (isScanDialogCode(code)) {
+        expect(surface.kind).toBe('dialog');
+      } else {
+        expect(surface.kind).toBe('toast');
+      }
+    }
+  });
+
+  it('keeps offline, missing key and provider failures specific rather than silent', () => {
+    expect(resolveScanFailure('offline', 'product')).toEqual({ kind: 'toast', message: 'AI provider is unavailable offline.' });
+    expect(resolveScanFailure('missing_key', 'product')).toEqual({ kind: 'toast', message: 'AI provider key is not configured.' });
+    expect(resolveScanFailure('provider', 'receipt')).toEqual({ kind: 'toast', message: 'AI provider request failed. Try again.' });
   });
 });
