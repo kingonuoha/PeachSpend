@@ -1,11 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, Platform, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
+import { AccessibilityInfo, AppState, Platform, Pressable, ScrollView, Text, TextInput, View, useWindowDimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 import { ChevronLeft, ChevronRight, Eye, RotateCcw, ShieldCheck } from 'lucide-react-native';
-import { OnboardingSlide } from '../../components/onboarding/OnboardingSlide';
+import { OnboardingSlide, onboardingIllustrationSize } from '../../components/onboarding/OnboardingSlide';
 import { PeachButton } from '../../components/ui/PeachButton';
+import { ScalePressable } from '../../components/ui/ScalePressable';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { useSettings } from '../../components/ui/SettingsProvider';
+import { useToast } from '../../components/ui/ToastProvider';
+import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Radii, Spacing, Typography } from '../../constants/tokens';
 import { createNativeAutoCaptureAdapter } from '../../data/NativeAutoCaptureAdapter';
@@ -36,11 +41,26 @@ const GUTTER_MIN = 20;
 const GUTTER_MAX = 28;
 const GUTTER_RATIO = 0.0615;
 
+// FR-01.7 writes the setup through one local SQLite transaction, and there is no
+// network step anywhere on this screen, so the only outcome the pair does not
+// depict is a refused device write. The copy says exactly that and promises
+// nothing it cannot keep: the write is transactional, so a failure saves nothing.
+const SAVE_FAILURE_MESSAGE = 'Could not save your setup on this device. Nothing was saved. Try again.';
+
+// The locked indicator dots are 8pt wide on a 16pt pitch inside a 10pt row, so the
+// dot geometry, not the slop, limits the target: 4pt a side is the widest area that
+// never reaches the next dot, which is what stops a tap on one dot resolving to its
+// neighbour, and the row's own 10pt height caps the vertical. Both the 48dp floor
+// shortfall that remains and the row height that causes it are escalated.
+const DOT_HIT_SLOP = Spacing.s1;
+
 export default function OnboardingScreen() {
   const router = useRouter();
   const { width } = useWindowDimensions();
   const theme = useThemeStyles();
   const { settings, isLoading, completeOnboarding } = useSettings();
+  const { showToast } = useToast();
+  const reduceMotion = useReduceMotion();
   const listRef = useRef<ScrollView>(null);
   const [index, setIndex] = useState(0);
   const [name, setName] = useState('');
@@ -51,6 +71,10 @@ export default function OnboardingScreen() {
   const [budget, setBudget] = useState('');
   const [permission, setPermission] = useState<AutoCapturePermission>('unsupported');
   const [canRequestPermission, setCanRequestPermission] = useState(false);
+  // The setup write is the screen's only async commit, so it is the only state
+  // that needs a busy flag and a spoken outcome.
+  const [submitting, setSubmitting] = useState(false);
+  const [saveFailure, setSaveFailure] = useState('');
   const isAndroid = Platform.OS === 'android';
   const isComplete = settings.onboarding_complete === 'true';
   const autoCaptureAdapter = useMemo(() => createNativeAutoCaptureAdapter(), []);
@@ -64,9 +88,9 @@ export default function OnboardingScreen() {
   const isAutoCapture = isAndroid && index === totalDots - 1;
   const gutter = Math.min(Math.max(width * GUTTER_RATIO, GUTTER_MIN), GUTTER_MAX);
 
-  // FR-01.8: checked before slide 1 renders, no flash. The guard renders an
-  // empty themed canvas while loading or already complete so onboarding never
-  // paints on re-entry.
+  // FR-01.8: checked before slide 1 renders, no flash. The redirect below is the
+  // only path that runs on re-entry, and it renders the empty themed canvas so
+  // onboarding never paints over Home while the replace lands.
   useEffect(() => {
     if (!isLoading && isComplete) router.replace('/(tabs)');
   }, [isComplete, isLoading, router]);
@@ -89,21 +113,46 @@ export default function OnboardingScreen() {
   const goTo = useCallback((nextIndex: number) => {
     const bounded = Math.min(Math.max(nextIndex, 0), totalDots - 1);
     setIndex(bounded);
-    listRef.current?.scrollTo({ x: bounded * width, animated: true });
-  }, [totalDots, width]);
+    // POLISH Section 4: a step change is a translation, so under reduce motion the
+    // carousel moves instantly instead of sliding the full page width.
+    listRef.current?.scrollTo({ x: bounded * width, animated: !reduceMotion });
+  }, [reduceMotion, totalDots, width]);
 
   // FR-01.7: skip and complete both write the full onboarding state once, then
-  // land on Home. Typed atomic store write, no direct SQL.
+  // land on Home. Typed atomic store write, no direct SQL. The write is local, so
+  // a failure is a device failure: it is surfaced instead of left as a silent
+  // rejection, and the screen stays put so the retry is possible.
   const complete = useCallback(async () => {
-    await completeOnboarding({ profileName: name, currency, monthlyBudget: budget });
-    router.replace('/(tabs)');
-  }, [budget, completeOnboarding, currency, name, router]);
+    if (submitting) return;
+    // A live region only speaks when its content changes, so the previous failure
+    // is cleared as the attempt starts. The clear commits in the press handler and
+    // the failure string commits later in the promise continuation, so an identical
+    // retry is still announced rather than silently skipped.
+    setSaveFailure('');
+    setSubmitting(true);
+    try {
+      await completeOnboarding({ profileName: name, currency, monthlyBudget: budget });
+      router.replace('/(tabs)');
+    } catch {
+      showToast(SAVE_FAILURE_MESSAGE, 'error');
+      if (Platform.OS === 'ios') {
+        AccessibilityInfo.announceForAccessibility(SAVE_FAILURE_MESSAGE);
+      } else {
+        setSaveFailure(SAVE_FAILURE_MESSAGE);
+      }
+      setSubmitting(false);
+    }
+  }, [budget, completeOnboarding, currency, name, router, showToast, submitting]);
 
   const skip = useCallback(() => {
     void complete();
   }, [complete]);
 
-  if (isLoading || isComplete) return <View style={{ flex: 1, backgroundColor: theme.bg.screen }} />;
+  // FR-01.8: the loading read shows the shared skeleton mirroring the settled first
+  // slide; the already-complete guard keeps the empty themed canvas, because a
+  // redirect in flight is not a load and a placeholder there would depict one.
+  if (isLoading) return <SetupSkeleton />;
+  if (isComplete) return <View style={{ flex: 1, backgroundColor: theme.bg.screen }} />;
 
   const primaryLabel = isSetup && !isAndroid ? 'Get Started' : isSetup ? 'Next: Permissions' : 'Next';
 
@@ -119,32 +168,30 @@ export default function OnboardingScreen() {
         }}
       >
         {index > 0 ? (
-          <Pressable
+          <ScalePressable
             accessibilityRole="button"
             accessibilityLabel="Back to previous onboarding step"
             onPress={() => goTo(index - 1)}
-            hitSlop={8}
             style={{ minWidth: 64, minHeight: 48, justifyContent: 'center' }}
           >
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
               <ChevronLeft color={theme.icon.primary} size={20} />
               <Text style={{ color: theme.icon.primary, ...Typography.labelLg }}>Back</Text>
             </View>
-          </Pressable>
+          </ScalePressable>
         ) : (
           <View style={{ minWidth: 64, minHeight: 48 }} />
         )}
 
         {index <= 2 ? (
-          <Pressable
+          <ScalePressable
             accessibilityRole="button"
             accessibilityLabel="Skip onboarding"
             onPress={skip}
-            hitSlop={8}
             style={{ minHeight: 48, justifyContent: 'center', paddingHorizontal: Spacing.s2 }}
           >
             <Text style={{ color: theme.text.onSurfaceVariant, ...Typography.labelLg }}>Skip</Text>
-          </Pressable>
+          </ScalePressable>
         ) : (
           <View style={{ minWidth: 64, minHeight: 48 }} />
         )}
@@ -196,6 +243,7 @@ export default function OnboardingScreen() {
               theme={theme}
               permission={permission}
               canRequestPermission={canRequestPermission}
+              busy={submitting}
               onGrant={() => { void autoCaptureAdapter.openSystemSettings(); }}
               onSkip={complete}
             />
@@ -213,8 +261,8 @@ export default function OnboardingScreen() {
               accessibilityRole="button"
               accessibilityLabel={`Go to onboarding step ${dotIndex + 1} of ${totalDots}`}
               accessibilityState={{ selected: dotIndex === index }}
-              onPress={() => goTo(dotIndex)}
-              hitSlop={18}
+              onPress={() => { void Haptics.selectionAsync(); goTo(dotIndex); }}
+              hitSlop={DOT_HIT_SLOP}
               style={{
                 width: dotIndex === index ? 26 : 8,
                 height: 8,
@@ -230,16 +278,78 @@ export default function OnboardingScreen() {
             title={primaryLabel}
             size="xl"
             fullWidth
+            isLoading={submitting}
             onPress={() => (index < totalDots - 1 ? goTo(index + 1) : complete())}
             trailingIcon={<ChevronRight color={theme.text.white} size={18} />}
           />
         )}
+      </View>
+
+      {/* POLISH Section 7: Android speaks the refused setup write through this polite
+          live region. The node is a 1x1 clipped transparent box, so it renders
+          nothing the locked pair does not show. */}
+      <View accessibilityLiveRegion="polite" style={{ position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' }}>
+        <Text>{saveFailure}</Text>
       </View>
     </SafeAreaView>
   );
 }
 
 type Theme = ReturnType<typeof useThemeStyles>;
+
+// POLISH Section 6. The settings read that gates the first slide used to paint an
+// empty themed canvas, so a slow device showed nothing at all. The placeholder
+// mirrors the settled first slide: the same header height, the same 24pt slide
+// gutter, the same illustration geometry through the one shared size function, bars
+// at the real title and description line heights, then the real dots row and the
+// real 52pt pill. Only the text wrap differs, so the shift is bounded and the
+// skeleton-to-content transition stays on the device checklist.
+function SetupSkeleton() {
+  const theme = useThemeStyles();
+  const { width } = useWindowDimensions();
+  const gutter = Math.min(Math.max(width * GUTTER_RATIO, GUTTER_MIN), GUTTER_MAX);
+  const illustrationSize = onboardingIllustrationSize(width);
+
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg.screen }}>
+      <View
+        accessible
+        accessibilityRole="progressbar"
+        accessibilityLabel="Loading PeachSpend setup"
+        accessibilityState={{ busy: true }}
+        style={{ flex: 1 }}
+      >
+        <View style={{ height: 48 }} />
+
+        <View style={{ flex: 1, paddingHorizontal: Spacing.s6, paddingTop: Spacing.s4, alignItems: 'center' }}>
+          <Skeleton
+            width={illustrationSize * 0.76}
+            height={illustrationSize * 0.85}
+            borderRadius={Radii.xl}
+            style={{ marginBottom: Spacing.s5 }}
+          />
+          <Skeleton width="82%" height={Typography.headlineLg.lineHeight} />
+          <Skeleton width="48%" height={Typography.headlineLg.lineHeight} />
+          <Skeleton width="92%" height={Typography.bodyMd.lineHeight} style={{ marginTop: Spacing.s2 }} />
+          <Skeleton width="88%" height={Typography.bodyMd.lineHeight} />
+          <Skeleton width="58%" height={Typography.bodyMd.lineHeight} />
+        </View>
+
+        <View style={{ paddingHorizontal: gutter, paddingBottom: Spacing.s4 }}>
+          <View
+            style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: Spacing.s2, height: 10, marginBottom: Spacing.s4 }}
+          >
+            <Skeleton width={26} height={8} borderRadius={Radii.full} />
+            {Array.from({ length: 4 }).map((_, dotIndex) => (
+              <Skeleton key={dotIndex} width={8} height={8} borderRadius={Radii.full} />
+            ))}
+          </View>
+          <Skeleton width="100%" height={52} borderRadius={Radii.full} />
+        </View>
+      </View>
+    </SafeAreaView>
+  );
+}
 
 interface SetupSlideProps {
   width: number;
@@ -281,7 +391,7 @@ function SetupSlide({ width, gutter, name, setName, currency, setCurrency, budge
           <Text style={labelStyle(theme)}>Default Currency</Text>
           <Text style={badgeStyle(theme)}>Base Unit</Text>
         </View>
-        <View style={{ flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s5 }}>
+        <View accessibilityRole="radiogroup" accessibilityLabel="Default currency" style={{ flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s5 }}>
           {pillCodes.map((code) => {
             const selected = code === currency;
             return (
@@ -290,7 +400,7 @@ function SetupSlide({ width, gutter, name, setName, currency, setCurrency, budge
                 accessibilityRole="radio"
                 accessibilityLabel={`${getCurrencyName(code)}, ${code}`}
                 accessibilityState={{ selected }}
-                onPress={() => setCurrency(code)}
+                onPress={() => { void Haptics.selectionAsync(); setCurrency(code); }}
                 style={[
                   currencyPill(theme),
                   selected && { backgroundColor: theme.raw.primary, borderColor: theme.raw.primary },
@@ -328,6 +438,7 @@ interface AutoCaptureSlideProps {
   theme: Theme;
   permission: AutoCapturePermission;
   canRequestPermission: boolean;
+  busy: boolean;
   onGrant: () => void;
   onSkip: () => void;
 }
@@ -335,7 +446,7 @@ interface AutoCaptureSlideProps {
 // Android-only slide. Grant action is inert until a native listener source is
 // approved, so the primary control is honestly disabled and the unsupported
 // state explains itself. Skip is always equal-weight and always proceeds.
-function AutoCaptureSlide({ width, gutter, theme, permission, canRequestPermission, onGrant, onSkip }: AutoCaptureSlideProps) {
+function AutoCaptureSlide({ width, gutter, theme, permission, canRequestPermission, busy, onGrant, onSkip }: AutoCaptureSlideProps) {
   const unavailable = permission === 'unsupported' || !canRequestPermission;
   return (
     <View style={{ width, flex: 1, paddingHorizontal: gutter, paddingTop: Spacing.s3 }}>
@@ -384,7 +495,7 @@ function AutoCaptureSlide({ width, gutter, theme, permission, canRequestPermissi
             size="xl"
             fullWidth
             variant={unavailable ? 'disabled' : 'primary'}
-            disabled={unavailable}
+            disabled={unavailable || busy}
             onPress={onGrant}
           />
           <PeachButton
@@ -392,6 +503,7 @@ function AutoCaptureSlide({ width, gutter, theme, permission, canRequestPermissi
             size="xl"
             fullWidth
             variant="outline"
+            isLoading={busy}
             onPress={onSkip}
           />
         </View>
