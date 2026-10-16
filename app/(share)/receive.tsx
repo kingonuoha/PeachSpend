@@ -31,7 +31,7 @@ import { consumeShareIntentHandoff, type ShareIntentFileRecord } from '../../uti
 import { ScannedReceipt } from '../../types/gemini';
 import type { Expense } from '../../types/database';
 import { resolveExpenseBatchSave, runCaptureSideEffects, normalizeCurrencyTotal, type CaptureCandidate, type DuplicateMatch } from '../../data';
-import { AiError, getAiErrorMessage, getReceiptOcrAvailability, normalizeAiError } from '../../ai/contracts';
+import { AiError, getAiErrorMessage, getReceiptOcrAvailability, normalizeAiError, type AiErrorCode } from '../../ai/contracts';
 
 // Recovery kind selects the honest primary action for a state the canonical pair
 // does not itself show (missing key, offline). Everything else uses the pair's
@@ -39,8 +39,52 @@ import { AiError, getAiErrorMessage, getReceiptOcrAvailability, normalizeAiError
 type RecoveryKind = 'generic' | 'missing_key' | 'offline';
 
 interface RecoveryState {
-  kind: RecoveryKind;
   message: string;
+  // The AI failure code behind this state, or null for the one non-AI state: a
+  // share handoff token that was already consumed. The kind is derived from it
+  // rather than stored beside it, so the two cannot disagree.
+  code: AiErrorCode | null;
+}
+
+// The manual entry route the scan surface and the offline state already use, so a
+// user whose shared image cannot be read still has a way to log the expense.
+export const RECOVERY_MANUAL_ROUTE = '/expense/manual';
+
+export function recoveryKind(code: AiErrorCode | null): RecoveryKind {
+  if (code === 'offline') return 'offline';
+  if (code === 'missing_key') return 'missing_key';
+  return 'generic';
+}
+
+// The app only ever establishes a photographic cause for `illegible_image`, where
+// the provider reported that the image itself could not be read. Every other
+// failure is about the provider request or the response it returned, so it is
+// answered with its own honest heading and no photographic remedy (DEC-B75).
+const PHOTOGRAPHIC_ADVICE = [
+  'Share an image with all four corners visible.',
+  'Avoid strong glare on thermal paper totals.',
+  'Ensure the merchant and grand total are legible.',
+] as const;
+
+export interface RecoveryPresentation {
+  // The heading names the same cause class as the body, so a response the app
+  // could not use is never headed as an image that could not be read.
+  heading: string;
+  // Photographic advice, empty unless the app established that the image itself
+  // could not be read.
+  advice: readonly string[];
+  // True when the card adds a manual entry action beside its primary action. The
+  // offline state already routes to manual entry as its primary action, and the
+  // missing key state keeps its provider settings action, so neither adds one.
+  manualEntry: boolean;
+}
+
+export function resolveRecoveryPresentation(code: AiErrorCode | null): RecoveryPresentation {
+  return {
+    heading: code === 'invalid_response' ? "Couldn't Use the AI Response" : "Couldn't Read Shared Image",
+    advice: code === 'illegible_image' ? PHOTOGRAPHIC_ADVICE : [],
+    manualEntry: recoveryKind(code) === 'generic',
+  };
 }
 
 interface OwnedImageMeta {
@@ -187,12 +231,7 @@ export default function ShareReceiveScreen() {
   const applyAiError = useCallback((error: unknown) => {
     const normalized = normalizeAiError(error, 'gemini');
     logger.error('Failed to process shared image', normalized.code);
-    const kind: RecoveryKind = normalized.code === 'offline'
-      ? 'offline'
-      : normalized.code === 'missing_key'
-        ? 'missing_key'
-        : 'generic';
-    setRecovery({ kind, message: getAiErrorMessage(normalized.code, 'receipt') });
+    setRecovery({ code: normalized.code, message: getAiErrorMessage(normalized.code, 'receipt') });
   }, []);
 
   const checkAvailability = useCallback(async (): Promise<'ready' | 'offline' | 'missing_key'> => {
@@ -266,7 +305,7 @@ export default function ShareReceiveScreen() {
         const record = token ? consumeShareIntentHandoff(token) : null;
         if (!record) {
           if (mountedRef.current) {
-            setRecovery({ kind: 'generic', message: 'This shared image is no longer available. Share it again to retry.' });
+            setRecovery({ code: null, message: 'This shared image is no longer available. Share it again to retry.' });
             setProcessing(false);
           }
           return;
@@ -274,12 +313,12 @@ export default function ShareReceiveScreen() {
         const availability = await checkAvailability();
         if (!mountedRef.current) return;
         if (availability === 'offline') {
-          setRecovery({ kind: 'offline', message: getAiErrorMessage('offline', 'receipt') });
+          setRecovery({ code: 'offline', message: getAiErrorMessage('offline', 'receipt') });
           setProcessing(false);
           return;
         }
         if (availability === 'missing_key') {
-          setRecovery({ kind: 'missing_key', message: 'Gemini API key missing. Open AI Provider Settings.' });
+          setRecovery({ code: 'missing_key', message: 'Gemini API key missing. Open AI Provider Settings.' });
           setProcessing(false);
           return;
         }
@@ -432,6 +471,10 @@ export default function ShareReceiveScreen() {
 
   const showSuccess = savedItems !== null;
   const showRecovery = recovery !== null;
+  // Derived from the failure code rather than stored, so the presentation and the
+  // primary action can never disagree with the code the state carries.
+  const recoveryKindValue: RecoveryKind = recovery ? recoveryKind(recovery.code) : 'generic';
+  const recoveryView: RecoveryPresentation | null = recovery ? resolveRecoveryPresentation(recovery.code) : null;
   const headerSubtitle = showSuccess
     ? 'Saved to your ledger'
     : showRecovery
@@ -513,23 +556,19 @@ export default function ShareReceiveScreen() {
             </View>
             <PeachButton title="Return to Home Dashboard" onPress={handleGoHome} variant="primary" size="lg" fullWidth />
           </View>
-        ) : showRecovery && recovery ? (
+        ) : showRecovery && recovery && recoveryView ? (
           <View style={[styles.recoveryBlock, styles.errorBlock]}>
             <View style={[styles.recoveryIcon, { backgroundColor: ts.raw.dangerSoft }]}>
               <TriangleAlert size={32} color={ts.raw.danger} />
             </View>
             <Text accessibilityRole="header" style={[styles.recoveryTitle, { color: ts.text.onSurface }]}>
-              Couldn&apos;t Read Shared Image
+              {recoveryView.heading}
             </Text>
             <Text style={[styles.recoveryBody, { color: ts.text.onSurfaceVariant }]}>{recovery.message}</Text>
-            {recovery.kind === 'generic' ? (
+            {recoveryView.advice.length > 0 ? (
               <View style={[styles.fixCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
                 <Text style={[styles.fixTitle, { color: ts.text.onSurface }]}>Quick Fix Suggestions:</Text>
-                {[
-                  'Share an image with all four corners visible.',
-                  'Avoid strong glare on thermal paper totals.',
-                  'Ensure the merchant and grand total are legible.',
-                ].map((line) => (
+                {recoveryView.advice.map((line) => (
                   <View key={line} style={styles.fixRow}>
                     <View style={[styles.fixDot, { backgroundColor: ts.text.onSurfaceVariant }]} />
                     <Text style={[styles.fixText, { color: ts.text.onSurfaceVariant }]}>{line}</Text>
@@ -538,7 +577,7 @@ export default function ShareReceiveScreen() {
               </View>
             ) : null}
             <View style={styles.actionStack}>
-              {recovery.kind === 'missing_key' ? (
+              {recoveryKindValue === 'missing_key' ? (
                 <PeachButton
                   title="Open AI Provider Settings"
                   onPress={() => router.push('/settings/chat')}
@@ -546,10 +585,10 @@ export default function ShareReceiveScreen() {
                   size="lg"
                   fullWidth
                 />
-              ) : recovery.kind === 'offline' ? (
+              ) : recoveryKindValue === 'offline' ? (
                 <PeachButton
                   title="Enter Manually"
-                  onPress={() => router.push('/expense/manual')}
+                  onPress={() => router.push(RECOVERY_MANUAL_ROUTE)}
                   variant="primary"
                   size="lg"
                   fullWidth
@@ -565,6 +604,15 @@ export default function ShareReceiveScreen() {
                   icon={<ImageIcon size={16} color={Colors.white} />}
                 />
               )}
+              {recoveryView.manualEntry ? (
+                <PeachButton
+                  title="Enter Manually"
+                  onPress={() => router.push(RECOVERY_MANUAL_ROUTE)}
+                  variant="secondary"
+                  size="lg"
+                  fullWidth
+                />
+              ) : null}
               <PeachButton
                 title="Go Home"
                 onPress={handleGoHome}
