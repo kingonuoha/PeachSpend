@@ -3,6 +3,8 @@ import { databaseService } from './DatabaseService';
 import * as SQLite from 'expo-sqlite';
 import { logger } from '../utils/logger';
 import { CurrencyConversionError } from '../data/SettingsContracts';
+import { parseMoneyAmount } from '../data/moneyInput';
+import { parseImportDate } from '../data/dateInput';
 
 vi.mock('react-native', () => ({ Platform: { OS: 'test' } }));
 
@@ -26,6 +28,12 @@ vi.mock('expo-file-system', () => ({ getInfoAsync: vi.fn(), deleteAsync: vi.fn()
 vi.mock('expo-file-system/legacy', () => fileSystemLegacy);
 vi.mock('../data/migrations', async (importOriginal) => ({ ...(await importOriginal<typeof import('../data/migrations')>()), runMigrations: vi.fn() }));
 
+// BUG-09-11b. The freshness publishers. Mocked rather than spied so the assertion
+// is on what this service published, and so the module under test does not have to
+// carry a React import into a node test.
+const freshness = vi.hoisted(() => ({ markDataChanged: vi.fn() }));
+vi.mock('../hooks/useDataFreshness', () => freshness);
+
 type MockDatabase = {
   getAllAsync: ReturnType<typeof vi.fn>;
   getFirstAsync: ReturnType<typeof vi.fn>;
@@ -39,6 +47,57 @@ const database: MockDatabase = {
   runAsync: vi.fn(),
   execAsync: vi.fn(),
 };
+
+// The single aggregate row the achievement pass reads since BUG-09-11a, with the same
+// column names the statement returns. Defaults are an empty account.
+type AggregateRow = {
+  expense_count: number;
+  scanned_count: number;
+  total_spent: number;
+  distinct_categories: number;
+  note_count: number;
+  detail_count: number;
+  min_amount: number | null;
+  min_currency: string | null;
+  recurring_count: number;
+};
+
+const aggregateTotals = (overrides: Partial<AggregateRow> = {}): AggregateRow => ({
+  expense_count: 0,
+  scanned_count: 0,
+  total_spent: 0,
+  distinct_categories: 0,
+  note_count: 0,
+  detail_count: 0,
+  min_amount: null,
+  min_currency: null,
+  recurring_count: 0,
+  ...overrides,
+});
+
+// The populated fixture used by the achievement regression tests. The numbers are the
+// ones measured in docs/phases/phase-09-ui-polish/bugfix-BUG-09-11-evidence.md for a
+// six-row account: three categories, three rows with a note, two reimbursable rows (one
+// of which also has a note, so the detail count is four), two scanned rows, 2500 spent
+// with a 2.50 GBP minimum, two recurring templates and three income rows.
+const POPULATED_FIXTURE: AggregateRow = {
+  expense_count: 6,
+  scanned_count: 2,
+  total_spent: 2500,
+  distinct_categories: 3,
+  note_count: 3,
+  detail_count: 4,
+  min_amount: 2.5,
+  min_currency: 'GBP',
+  recurring_count: 2,
+};
+
+const POPULATED_SETTINGS = [
+  { key: 'currency', value: 'EUR' },
+  { key: 'monthly_budget', value: '4500' },
+  { key: 'export_count', value: '1' },
+  { key: 'last_streak', value: '7' },
+];
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -196,23 +255,588 @@ describe('DatabaseService CSV export validation', () => {
   });
 });
 
+// BUG-09-15. The CSV amount cell was read with `parseFloat`, which stops at the first
+// character it cannot use, so `1,250.50` imported as 1 and `2,900` as 2. Both passed the
+// row's own validity check, because 1 and 2 are finite positive numbers, so a wrong
+// amount reached the user's records with no error and no warning. Every case below
+// asserts the value that reaches the record, or that nothing was imported and the row
+// was reported. No existing expectation was loosened to make the fix pass.
+describe('DatabaseService imported amount reads its true value (BUG-09-15)', () => {
+  // The header and column order the export writer emits, so these rows are the file
+  // shape the app itself produces and not a synthetic one. The amount cell is quoted
+  // because that is how a CSV carries a value containing a comma: a third-party, bank
+  // or hand-edited file quotes it, and `parseCsvLine` hands the raw `1,250.50` to the
+  // parse. An unquoted `2,900` would split into two columns and misalign the row.
+  const csvWithAmount = (amountCell: string): string => [
+    'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image',
+    `2026-01-05,Cafe,"${amountCell}",NGN,dining,,,0,no`,
+  ].join('\n');
+
+  const readAmount = (amountCell: string): number => {
+    const result = databaseService.parseImportData(csvWithAmount(amountCell));
+    expect(result.errors).toEqual([]);
+    const [row] = result.expenses;
+    expect(row).toBeDefined();
+    return row?.amount ?? Number.NaN;
+  };
+
+  it('reads a raw amount the way the export writer writes it', () => {
+    expect(readAmount('1250.5')).toBe(1250.5);
+    expect(readAmount('1250000.75')).toBe(1250000.75);
+  });
+
+  it('reads a grouped amount as its true value and not as its first digit', () => {
+    const amount = readAmount('2,900');
+    expect(amount).toBe(2900);
+    expect(amount).not.toBe(2);
+  });
+
+  it('reads a grouped amount with decimals as its true value and not as its first digit', () => {
+    const amount = readAmount('1,250.50');
+    expect(amount).toBe(1250.5);
+    expect(amount).not.toBe(1);
+    expect(readAmount('12,345,678.90')).toBe(12345678.9);
+  });
+
+  it('reads an amount that uses a decimal comma', () => {
+    expect(readAmount('1250,50')).toBe(1250.5);
+    expect(readAmount('1.250,50')).toBe(1250.5);
+  });
+
+  it('skips an amount it cannot read, reports the row, and imports no number at all', () => {
+    const result = databaseService.parseImportData(csvWithAmount('1,25,0'));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: the amount "1,25,0" could not be read, so the row was skipped']);
+  });
+
+  it('refuses a cell carrying a currency symbol instead of importing part of it', () => {
+    const result = databaseService.parseImportData(csvWithAmount('₦2,900'));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: the amount "₦2,900" could not be read, so the row was skipped']);
+  });
+
+  it('skips an empty amount without turning it into zero', () => {
+    const result = databaseService.parseImportData(csvWithAmount(''));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: skipped invalid entry']);
+  });
+
+  it('reads a grouped JSON amount and refuses a JSON type it would otherwise coerce', () => {
+    const grouped = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: '1,250.50', currency: 'NGN', category: 'dining' }]),
+    );
+    expect(grouped.errors).toEqual([]);
+    expect(grouped.expenses[0]?.amount).toBe(1250.5);
+
+    const coerced = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: true, currency: 'NGN', category: 'dining' }]),
+    );
+    expect(coerced.expenses).toEqual([]);
+    expect(coerced.errors).toEqual(['item 1: invalid amount']);
+  });
+
+  it('keeps reading a file the export writer produced, end to end', async () => {
+    database.getAllAsync.mockResolvedValue([
+      { id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining', note: '', scanned: 0, date: 1710000000000 },
+      { id: 'b', merchant: 'Mall', amount: 2900, currency: 'NGN', category: 'shopping', note: 'Sale', scanned: 1, date: 1710000000000 },
+      { id: 'c', merchant: 'Kiosk', amount: 12.345, currency: 'NGN', category: 'other', note: 'Converted', scanned: 0, date: 1710000000000 },
+    ]);
+
+    const csv = await databaseService.exportToCSV(0, Date.now());
+    const result = databaseService.parseImportData(csv);
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses.map(expense => expense.amount)).toEqual([1250.5, 2900, 12.345]);
+  });
+});
+
+describe('parseMoneyAmount reads a grouped or decimal amount and refuses the rest (BUG-09-15)', () => {
+  it('reads grouped, decimal and plain amounts as their true value', () => {
+    expect(parseMoneyAmount('1250.50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('2,900')).toEqual({ valid: true, value: 2900 });
+    expect(parseMoneyAmount('1,250.50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('1250,50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('1.250,50')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount(' 1,250.50 ')).toEqual({ valid: true, value: 1250.5 });
+    expect(parseMoneyAmount('1250.505')).toEqual({ valid: true, value: 1250.505 });
+    expect(parseMoneyAmount('.5')).toEqual({ valid: true, value: 0.5 });
+  });
+
+  it('keeps the dot as the decimal separator so an exported three decimal amount survives', () => {
+    // `String(amount)` is what the export writer emits, so these are real file values.
+    expect(parseMoneyAmount(String(12.345))).toEqual({ valid: true, value: 12.345 });
+    expect(parseMoneyAmount('1.500')).toEqual({ valid: true, value: 1.5 });
+    expect(parseMoneyAmount(String(0.1 + 0.2))).toEqual({ valid: true, value: 0.1 + 0.2 });
+    // A repeated separator cannot be a decimal, so dot grouping still reads.
+    expect(parseMoneyAmount('1.250.000')).toEqual({ valid: true, value: 1250000 });
+  });
+
+  it('refuses an amount it cannot read unambiguously instead of truncating it', () => {
+    expect(parseMoneyAmount('1,25,0')).toEqual({ valid: false });
+    expect(parseMoneyAmount('abc')).toEqual({ valid: false });
+    expect(parseMoneyAmount('₦2,900')).toEqual({ valid: false });
+    expect(parseMoneyAmount('1,250 kr')).toEqual({ valid: false });
+    expect(parseMoneyAmount('')).toEqual({ valid: false });
+    expect(parseMoneyAmount(null)).toEqual({ valid: false });
+    expect(parseMoneyAmount('.')).toEqual({ valid: false });
+  });
+
+  it('still reads a value the app itself writes in exponential form', () => {
+    expect(parseMoneyAmount('1e-7')).toEqual({ valid: true, value: 1e-7 });
+  });
+});
+
+// BUG-09-19. The import read the date with `new Date(...)` and returned `Date.now()`
+// whenever that was not a valid date, so a row the file dated wrongly was stored as if
+// it had happened today, with no error and no warning. A wrong date moves an expense
+// between months, so it can change a budget total, a monthly comparison and a streak.
+// Every case below asserts the instant that reaches the record, or that nothing was
+// imported and the row was named. No existing expectation was loosened to make the fix
+// pass: the pinned JSON test that asserts a row without a date is not an error still
+// passes unchanged, which is why an absent date keeps the documented default.
+describe('DatabaseService imported date is read or the row is refused (BUG-09-19)', () => {
+  // The header and column order the export writer emits, so these rows are the file
+  // shape the app itself produces and not a synthetic one.
+  const csvWithDate = (dateCell: string): string => [
+    'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image',
+    `${dateCell},Cafe,1250.5,NGN,dining,,,0,no`,
+  ].join('\n');
+
+  const readDate = (dateCell: string): number => {
+    const result = databaseService.parseImportData(csvWithDate(dateCell));
+    expect(result.errors).toEqual([]);
+    const [row] = result.expenses;
+    expect(row).toBeDefined();
+    return row?.date ?? Number.NaN;
+  };
+
+  it('reads the calendar date the export writer emits as UTC midnight', () => {
+    expect(readDate('2026-01-05')).toBe(Date.UTC(2026, 0, 5));
+  });
+
+  it('keeps the date of a file the export writer produced, end to end', async () => {
+    database.getAllAsync.mockResolvedValue([
+      {
+        id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining',
+        note: '', scanned: 0, date: Date.UTC(2026, 0, 5, 12, 30),
+      },
+    ]);
+
+    const csv = await databaseService.exportToCSV(0, Date.now());
+    expect(csv).toContain('2026-01-05');
+
+    const result = databaseService.parseImportData(csv);
+    expect(result.errors).toEqual([]);
+    expect(result.expenses.map(expense => expense.date)).toEqual([Date.UTC(2026, 0, 5)]);
+  });
+
+  it('skips a date it cannot read and never stores that row with today instead', () => {
+    const startOfToday = new Date().setHours(0, 0, 0, 0);
+    const result = databaseService.parseImportData(csvWithDate('not-a-date'));
+
+    expect(result.errors).toEqual(['CSV row 1: the date "not-a-date" could not be read, so the row was skipped']);
+    expect(result.expenses).toHaveLength(0);
+    // The exact regression: this row used to be stored with `Date.now()` as its date.
+    expect(result.expenses.some(row => (row.date ?? 0) >= startOfToday)).toBe(false);
+  });
+
+  it('refuses an ambiguous date instead of guessing between two readings', () => {
+    const mayOrJanuary = databaseService.parseImportData(csvWithDate('05/01/2026'));
+    const januaryOrFebruary = databaseService.parseImportData(csvWithDate('01/02/2026'));
+
+    expect(mayOrJanuary.expenses).toEqual([]);
+    expect(mayOrJanuary.errors).toEqual(['CSV row 1: the date "05/01/2026" could not be read, so the row was skipped']);
+    expect(januaryOrFebruary.expenses).toEqual([]);
+    expect(januaryOrFebruary.errors).toEqual(['CSV row 1: the date "01/02/2026" could not be read, so the row was skipped']);
+    // `new Date('05/01/2026')` used to pick one of the two readings and store it.
+    expect(mayOrJanuary.expenses.some(row => row.date === new Date('05/01/2026').getTime())).toBe(false);
+  });
+
+  it('reads an ISO date and time with an offset as the instant it names', () => {
+    expect(readDate('2026-01-05T10:30:00Z')).toBe(Date.UTC(2026, 0, 5, 10, 30));
+    expect(readDate('2026-01-05T10:30:00+01:00')).toBe(Date.UTC(2026, 0, 5, 9, 30));
+
+    // No offset names the device's local time, so the file does not fix the
+    // instant and the row is refused rather than dated by whichever phone ran it.
+    const noOffset = databaseService.parseImportData(csvWithDate('2026-01-05T10:30:00'));
+    expect(noOffset.expenses).toEqual([]);
+    expect(noOffset.errors).toEqual(['CSV row 1: the date "2026-01-05T10:30:00" could not be read, so the row was skipped']);
+  });
+
+  it('refuses a CSV with no date column instead of dating every row today', () => {
+    const result = databaseService.parseImportData([
+      'merchant,amount,currency,category',
+      'Cafe,1250.5,NGN,dining',
+    ].join('\n'));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV must have "merchant", "amount", "currency", "category", and "date" columns.']);
+  });
+
+  it('skips an empty date cell with the same wording an empty amount cell gets', () => {
+    const result = databaseService.parseImportData(csvWithDate(''));
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['CSV row 1: skipped invalid entry']);
+  });
+
+  it('refuses a JSON date value it cannot read instead of dating the item today', () => {
+    const result = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: true }]),
+    );
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['item 1: the date "true" could not be read, so the row was skipped']);
+  });
+
+  it('keeps reading a JSON epoch date, and keeps the documented default when no date is given', () => {
+    const epoch = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: Date.UTC(2026, 0, 5) }]),
+    );
+    expect(epoch.errors).toEqual([]);
+    expect(epoch.expenses[0]?.date).toBe(Date.UTC(2026, 0, 5));
+
+    const before = Date.now();
+    const undated = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining' }]),
+    );
+    expect(undated.errors).toEqual([]);
+    expect(undated.expenses[0]?.date).toBeGreaterThanOrEqual(before);
+  });
+
+  it('keeps the documented default for an absent or blank JSON date, never an epoch date', () => {
+    const before = Date.now();
+    const blank = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: '' }]),
+    );
+
+    expect(blank.errors).toEqual([]);
+    // The contract documents the default as today for an unknown date, and it is
+    // never 0 or an epoch instant, which would be a different lie about the row.
+    expect(blank.expenses[0]?.date).toBeGreaterThanOrEqual(before);
+  });
+
+  it('refuses a zero, compact or unreadable JSON date instead of storing today or 1970', () => {
+    const cases: unknown[] = [0, -1, 20260105, '1710000000000', 'not-a-date', true];
+    for (const date of cases) {
+      const result = databaseService.parseImportData(
+        JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date }]),
+      );
+      // Nothing is stored, so the row cannot become today, 1970 or any other date.
+      expect(result.expenses).toHaveLength(0);
+      expect(result.errors).toEqual([`item 1: the date "${String(date)}" could not be read, so the row was skipped`]);
+    }
+  });
+});
+
+// BUG-09-19. `unit_price` and `units` were passed straight through from JSON with no
+// numeric check, so a string, boolean or array reached the repository and was stored as
+// whatever SQLite coerced it to. Both are read on the same terms as the amount column
+// now, and a value that fails its field rule refuses the row rather than being stored.
+describe('DatabaseService imported quantity fields are read or refused (BUG-09-19)', () => {
+  const jsonItem = (fields: Record<string, unknown>): string => JSON.stringify([
+    { merchant: 'Cafe', amount: 7, currency: 'NGN', category: 'dining', date: '2026-01-05', ...fields },
+  ]);
+
+  it('refuses a unit_price it would otherwise have coerced or stored out of range', () => {
+    const boolean = databaseService.parseImportData(jsonItem({ unit_price: true }));
+    expect(boolean.expenses).toEqual([]);
+    expect(boolean.errors).toEqual(['item 1: invalid unit_price']);
+
+    const withText = databaseService.parseImportData(jsonItem({ unit_price: '3.50 each' }));
+    expect(withText.expenses).toEqual([]);
+    expect(withText.errors).toEqual(['item 1: invalid unit_price']);
+
+    const negative = databaseService.parseImportData(jsonItem({ unit_price: -1 }));
+    expect(negative.expenses).toEqual([]);
+    expect(negative.errors).toEqual(['item 1: invalid unit_price']);
+  });
+
+  it('refuses a units value that is not a whole count of at least one', () => {
+    const withText = databaseService.parseImportData(jsonItem({ units: '2 items' }));
+    expect(withText.expenses).toEqual([]);
+    expect(withText.errors).toEqual(['item 1: invalid units']);
+
+    const fractional = databaseService.parseImportData(jsonItem({ units: 2.5 }));
+    expect(fractional.expenses).toEqual([]);
+    expect(fractional.errors).toEqual(['item 1: invalid units']);
+
+    const zero = databaseService.parseImportData(jsonItem({ units: 0 }));
+    expect(zero.expenses).toEqual([]);
+    expect(zero.errors).toEqual(['item 1: invalid units']);
+  });
+
+  it('keeps reading a readable unit_price and units, in the shapes a file carries', () => {
+    const plain = databaseService.parseImportData(jsonItem({ unit_price: 3.5, units: 2 }));
+    expect(plain.errors).toEqual([]);
+    expect(plain.expenses[0]?.unit_price).toBe(3.5);
+    expect(plain.expenses[0]?.units).toBe(2);
+
+    const asText = databaseService.parseImportData(jsonItem({ unit_price: '1,250.50', units: '2' }));
+    expect(asText.errors).toEqual([]);
+    expect(asText.expenses[0]?.unit_price).toBe(1250.5);
+    expect(asText.expenses[0]?.units).toBe(2);
+
+    const absent = databaseService.parseImportData(jsonItem({}));
+    expect(absent.errors).toEqual([]);
+    expect(absent.expenses[0]?.unit_price).toBeUndefined();
+    expect(absent.expenses[0]?.units).toBeUndefined();
+  });
+
+  it('leaves a blank or null optional field absent rather than refusing the row', () => {
+    // Both fields are optional in the documented shape, so a blank one is "not
+    // provided", the same rule an absent or blank date gets, not a value to refuse.
+    const blank = databaseService.parseImportData(jsonItem({ unit_price: '', units: '' }));
+    expect(blank.errors).toEqual([]);
+    expect(blank.expenses[0]?.unit_price).toBeUndefined();
+    expect(blank.expenses[0]?.units).toBeUndefined();
+
+    const nul = databaseService.parseImportData(jsonItem({ unit_price: null, units: null }));
+    expect(nul.errors).toEqual([]);
+    expect(nul.expenses[0]?.unit_price).toBeUndefined();
+    expect(nul.expenses[0]?.units).toBeUndefined();
+  });
+});
+
+describe('parseImportDate reads an ISO date and refuses the rest (BUG-09-19)', () => {
+  it('reads the calendar date the app and the v1 export write as UTC midnight', () => {
+    expect(parseImportDate('2026-01-05')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5) });
+    expect(parseImportDate(' 2026-06-13 ')).toEqual({ valid: true, value: Date.UTC(2026, 5, 13) });
+  });
+
+  it('reads an ISO date and time that carries an offset as the instant it names', () => {
+    expect(parseImportDate('2026-01-05T10:30:00Z')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 10, 30) });
+    expect(parseImportDate('2026-01-05T10:30:00+01:00')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 9, 30) });
+    expect(parseImportDate('2026-01-05T10:30:00.500Z')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 10, 30, 0, 500) });
+    expect(parseImportDate('2026-01-05T10:30:00-05:00')).toEqual({ valid: true, value: Date.UTC(2026, 0, 5, 15, 30) });
+  });
+
+  it('reads epoch milliseconds, the type the app stores a date as', () => {
+    expect(parseImportDate(Date.UTC(2026, 0, 5))).toEqual({ valid: true, value: Date.UTC(2026, 0, 5) });
+  });
+
+  it('refuses a numeric date that also reads as a compact date, or is zero or negative', () => {
+    // `20260105` is both 2026-01-05 as a compact date and 1970-08-23 as a
+    // timestamp, so it has two real readings and is refused rather than guessed.
+    expect(parseImportDate(20260105)).toEqual({ valid: false });
+    expect(parseImportDate(2026)).toEqual({ valid: false });
+    expect(parseImportDate(2026_01)).toEqual({ valid: false });
+    // Zero and a negative value are 1970 or earlier as a timestamp, never an
+    // expense date the user wrote, so they are refused rather than stored as 1970.
+    expect(parseImportDate(0)).toEqual({ valid: false });
+    expect(parseImportDate(-1)).toEqual({ valid: false });
+    expect(parseImportDate(Number.NaN)).toEqual({ valid: false });
+    expect(parseImportDate(Number.POSITIVE_INFINITY)).toEqual({ valid: false });
+  });
+
+  it('refuses an ambiguous or implementation defined date instead of picking a reading', () => {
+    expect(parseImportDate('05/01/2026')).toEqual({ valid: false });
+    expect(parseImportDate('01/02/2026')).toEqual({ valid: false });
+    expect(parseImportDate('2026/01/05')).toEqual({ valid: false });
+    expect(parseImportDate('Jan 5, 2026')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05 10:30:00')).toEqual({ valid: false });
+    expect(parseImportDate('2026-1-5')).toEqual({ valid: false });
+    // No offset: the form names the device's local time, so the file does not fix
+    // the instant. A colon-less offset is not the form ECMAScript defines either.
+    expect(parseImportDate('2026-01-05T10:30')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05T10:30:00')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05T10:30:00+0100')).toEqual({ valid: false });
+  });
+
+  it('refuses a date that is not a real calendar day instead of rolling it forward', () => {
+    // `new Date('2026-02-30')` is March 2 and `new Date('2026-02-30T10:00:00Z')` is
+    // March 2 as well, both of which are days the file never named.
+    expect(parseImportDate('2026-02-30')).toEqual({ valid: false });
+    expect(parseImportDate('2026-02-30T10:00:00Z')).toEqual({ valid: false });
+    expect(parseImportDate('2026-13-05')).toEqual({ valid: false });
+    expect(parseImportDate('2026-01-05T25:00:00Z')).toEqual({ valid: false });
+  });
+
+  it('refuses a partial date, a compact date, a bare number string and an empty value', () => {
+    expect(parseImportDate('2026-01')).toEqual({ valid: false });
+    expect(parseImportDate('2026')).toEqual({ valid: false });
+    expect(parseImportDate('20260105')).toEqual({ valid: false });
+    expect(parseImportDate('1710000000000')).toEqual({ valid: false });
+    expect(parseImportDate('')).toEqual({ valid: false });
+    expect(parseImportDate(null)).toEqual({ valid: false });
+    expect(parseImportDate(undefined)).toEqual({ valid: false });
+    expect(parseImportDate({})).toEqual({ valid: false });
+    expect(parseImportDate(Number.NaN)).toEqual({ valid: false });
+  });
+});
+
+// BUG-09-20. A CSV row whose field count does not match the header used to be imported
+// with its columns shifted, so an unquoted `2,900` in a hand-edited file stored amount 2
+// against a currency of `900` with no error: silent corruption of the user's money. The
+// row is now reported and skipped, before any column is read. JSON is keyed, so a value
+// cannot shift between columns there; what a JSON file can get wrong is the shape of the
+// item itself, and an item that is not an object is named and skipped rather than
+// failing the whole file. A Unix seconds date is refused instead of becoming 1970, the
+// same decision the amount and date fixes make for a value that cannot be read.
+describe('DatabaseService imported row shape matches the header (BUG-09-20)', () => {
+  // The header and column order the export writer emits, so the rows below are the file
+  // shape the app itself produces and not a synthetic one.
+  const HEADER = 'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image';
+  const parseRows = (...rows: string[]): ReturnType<typeof databaseService.parseImportData> =>
+    databaseService.parseImportData([HEADER, ...rows].join('\n'));
+
+  it('reads a well formed row the export writer produces', () => {
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining,,,0,no');
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses).toHaveLength(1);
+    expect(result.expenses[0]?.merchant).toBe('Cafe');
+    expect(result.expenses[0]?.amount).toBe(1250.5);
+    expect(result.expenses[0]?.currency).toBe('NGN');
+    expect(result.expenses[0]?.category).toBe('dining');
+  });
+
+  it('skips a row whose unquoted grouped amount shifts every column after it', () => {
+    // The shape the defect was found on: `2,900` unquoted, so the file holds ten fields
+    // where the header declares nine and amount, currency and category all shift.
+    const result = parseRows('2026-01-05,Cafe,2,900,NGN,dining,,,0,no');
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual([
+      'CSV row 1: the row has 10 fields where the header declares 9, so the row was skipped',
+    ]);
+    // The exact regression: this row used to import amount 2 against a currency of 900.
+    expect(result.expenses.some(row => row.amount === 2)).toBe(false);
+    expect(result.expenses.some(row => row.currency === '900')).toBe(false);
+  });
+
+  it('skips a row that is missing a trailing field', () => {
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining,,,0');
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual([
+      'CSV row 1: the row has 8 fields where the header declares 9, so the row was skipped',
+    ]);
+  });
+
+  it('skips a short row even when the field it omits is optional', () => {
+    // `note`, `tags`, `scanned` and `has_receipt_image` are all optional, but the rule
+    // compares the declared field count, so a short row is refused rather than read with
+    // the missing cells treated as empty: an omitted trailing column and a row the file
+    // never finished writing are the same shape, and the importer refuses rather than
+    // guesses which of the two it is.
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining');
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual([
+      'CSV row 1: the row has 5 fields where the header declares 9, so the row was skipped',
+    ]);
+  });
+
+  it('counts a quoted field containing a comma as one field', () => {
+    const result = parseRows('2026-01-05,"Cafe, Inc","1,250.50",NGN,dining,"Lunch, with team",,0,no');
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses).toHaveLength(1);
+    expect(result.expenses[0]?.merchant).toBe('Cafe, Inc');
+    expect(result.expenses[0]?.amount).toBe(1250.5);
+    expect(result.expenses[0]?.note).toBe('Lunch, with team');
+  });
+
+  it('counts a trailing empty field as a field rather than a mismatch', () => {
+    // The header's last column is empty in this row, which is a real row shape and not a
+    // short row, so it still imports.
+    const result = parseRows('2026-01-05,Cafe,1250.5,NGN,dining,,,0,');
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses).toHaveLength(1);
+    expect(result.expenses[0]?.amount).toBe(1250.5);
+  });
+
+  it('keeps reading a file the export writer produced, end to end', async () => {
+    database.getAllAsync.mockResolvedValue([
+      { id: 'a', merchant: 'Cafe', amount: 1250.5, currency: 'NGN', category: 'dining', note: '', scanned: 0, date: Date.UTC(2026, 0, 5) },
+    ]);
+
+    const csv = await databaseService.exportToCSV(0, Date.now());
+    const result = databaseService.parseImportData(csv);
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses.map(expense => expense.amount)).toEqual([1250.5]);
+  });
+
+  it('refuses a JSON epoch seconds date instead of storing a date in 1970', () => {
+    // `1767571200` is 2026-01-05 in seconds and 1970-01-21 in milliseconds. The module's
+    // rule is that a 1970 instant cannot be a date the user wrote, so it is refused and
+    // named rather than multiplied by 1000.
+    const result = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: 1767571200 }]),
+    );
+
+    expect(result.expenses).toEqual([]);
+    expect(result.errors).toEqual(['item 1: the date "1767571200" could not be read, so the row was skipped']);
+    // The exact regression: nothing may be stored as a 1970 instant.
+    expect(result.expenses.some(row => (row.date ?? 0) < Date.UTC(1971, 0, 1))).toBe(false);
+  });
+
+  it('keeps reading a JSON epoch milliseconds date', () => {
+    const result = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', date: 1767571200000 }]),
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.expenses[0]?.date).toBe(Date.UTC(2026, 0, 5));
+  });
+
+  it('refuses a millisecond reading before 1971 at the boundary and keeps 1971 onward', () => {
+    // The refused range is every instant before 1971-01-01, which is where a Unix
+    // seconds value lands as milliseconds. The boundary is tested on both sides.
+    expect(parseImportDate(31_535_999_999)).toEqual({ valid: false });
+    expect(parseImportDate(31_536_000_000)).toEqual({ valid: true, value: 31_536_000_000 });
+    expect(parseImportDate(Number.NaN)).toEqual({ valid: false });
+    expect(parseImportDate(1767571200)).toEqual({ valid: false });
+    expect(parseImportDate(12345678)).toEqual({ valid: false });
+  });
+
+  it('names a JSON item that is not an object instead of failing the whole file', () => {
+    // A null item used to throw on its first property read, so the whole file was refused
+    // as `Invalid JSON format. Check for syntax errors.` even though its syntax was fine.
+    for (const item of ['"Cafe"', '12', '[1,2]', 'null', 'true']) {
+      const result = databaseService.parseImportData(`[${item}]`);
+
+      expect(result.expenses).toEqual([]);
+      expect(result.errors).toEqual(['item 1: the row is not a JSON object, so the row was skipped']);
+    }
+  });
+
+  it('still reads an object row that omits optional keys or carries unexpected ones', () => {
+    const minimal = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining' }]),
+    );
+    expect(minimal.errors).toEqual([]);
+    expect(minimal.expenses).toHaveLength(1);
+
+    const extraKey = databaseService.parseImportData(
+      JSON.stringify([{ merchant: 'Cafe', amount: 12, currency: 'NGN', category: 'dining', unexpected: 'x' }]),
+    );
+    expect(extraKey.errors).toEqual([]);
+    expect(extraKey.expenses).toHaveLength(1);
+  });
+});
+
 describe('DatabaseService achievement currency descriptions', () => {  it('uses user currency for aggregate spending thresholds and record currency for saver', async () => {
     database.getAllAsync.mockImplementation(async (sql: string) => {
       if (sql.includes('FROM achievements')) return [];
       return [{ key: 'currency', value: 'EUR' }];
     });
     database.getFirstAsync.mockImplementation(async (sql: string) => {
-      if (sql.includes('ORDER BY amount ASC')) return { min: 2, currency: 'GBP' };
-      if (sql.includes('SUM(amount)')) return { total: 1000 };
-      if (sql.includes('COUNT(DISTINCT')) return { count: 0 };
+      if (sql.includes('min_amount')) return aggregateTotals({ min_amount: 2, min_currency: 'GBP' });
       return { count: 0 };
     });
 
     const badges = await databaseService.getBadgeProgress();
 
-    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ £3.00');
-    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('€1000.00 total spent');
-    expect(badges.find(badge => badge.id === 'big-league')?.description).toBe('€10000.00 total spent');
+    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ £3');
+    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('€1,000 total spent');
+    expect(badges.find(badge => badge.id === 'big-league')?.description).toBe('€10,000 total spent');
   });
 
   it('uses NGN when user and record currencies are absent', async () => {
@@ -221,20 +845,21 @@ describe('DatabaseService achievement currency descriptions', () => {  it('uses 
       return [];
     });
     database.getFirstAsync.mockImplementation(async (sql: string) => {
-      if (sql.includes('ORDER BY amount ASC')) return { min: 2, currency: null };
-      if (sql.includes('SUM(amount)')) return { total: 0 };
+      if (sql.includes('min_amount')) return aggregateTotals({ min_amount: 2, min_currency: null });
       return { count: 0 };
     });
 
     const badges = await databaseService.getBadgeProgress();
 
-    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ ₦3.00');
-    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('₦1000.00 total spent');
+    expect(badges.find(badge => badge.id === 'saver')?.description).toBe('Single expense ≤ ₦3');
+    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('₦1,000 total spent');
   });
 });
 
 describe('DatabaseService atomic onboarding completion', () => {
   const upsert = 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)';
+  const monthlyBudgetWrites = () =>
+    database.runAsync.mock.calls.filter(call => (call[1] as [string, string])[0] === 'monthly_budget');
 
   it('writes every onboarding value inside one transaction and marks complete last', async () => {
     await databaseService.completeOnboarding({ profileName: ' Peach ', currency: 'USD', monthlyBudget: '1200' });
@@ -269,6 +894,29 @@ describe('DatabaseService atomic onboarding completion', () => {
     expect(writtenKeys).toEqual(['currency', 'budget_currency', 'profile_join_date', 'onboarding_complete']);
   });
 
+  it('stores a typed budget in canonical form instead of the raw string', async () => {
+    await databaseService.completeOnboarding({ currency: 'NGN', monthlyBudget: ' 4500 ' });
+
+    expect(monthlyBudgetWrites()).toEqual([[upsert, ['monthly_budget', '4500']]]);
+  });
+
+  // BUG-09-04a: onboarding was the one writer that stored the typed budget raw, and
+  // "66,000" typed or pasted into the S-01 field became a stored cap of 66 on Home
+  // while Settings read the same string as not set. E-12 proposal, recorded: an
+  // entry that cannot be parsed is dropped rather than written, with no new UI on
+  // the locked S-01 pair.
+  it('refuses an entry it cannot parse instead of persisting the raw string', async () => {
+    for (const monthlyBudget of ['66,000', '66,000.5', 'NGN 66,000', '-4500', 'abc']) {
+      database.runAsync.mockClear();
+
+      await databaseService.completeOnboarding({ currency: 'NGN', monthlyBudget });
+
+      expect(monthlyBudgetWrites(), monthlyBudget).toEqual([]);
+      const writtenKeys = database.runAsync.mock.calls.map(call => (call[1] as [string, string])[0]);
+      expect(writtenKeys, monthlyBudget).toContain('onboarding_complete');
+    }
+  });
+
   it('registers profile name and budget so logs cannot echo them', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
@@ -277,6 +925,164 @@ describe('DatabaseService atomic onboarding completion', () => {
 
     expect(error).toHaveBeenCalledWith('[ERROR]:', 'settings_write_failed', '[REDACTED] spent [REDACTED]');
     error.mockRestore();
+  });
+});
+
+// BUG-09-04a read side: the achievement gate was a fourth reader of the same stored
+// key, and its parseFloat('66,000') read a cap of 66 that no one had set.
+//
+// BUG-09-11a moved the streak out of a second settings read and into the snapshot the
+// pass already loaded, so these two cases are now asserted where the user sees the
+// difference: whether the streak badges are awarded at all.
+describe('DatabaseService reads the stored budget strictly (BUG-09-04a)', () => {
+  const settingsRows = (monthlyBudget: string) => async (sql: string) =>
+    sql.includes('FROM achievements')
+      ? []
+      : [{ key: 'monthly_budget', value: monthlyBudget }, { key: 'last_streak', value: '9' }];
+
+  const weeklyStreakBadges = (ids: string[]) => ids.filter(id => id === 'week_warrior' || id === 'on-track');
+
+  it('does not open the budget streak gate for a stored value a strict parse refuses', async () => {
+    database.getAllAsync.mockImplementation(settingsRows('66,000'));
+    database.getFirstAsync.mockResolvedValue(aggregateTotals());
+
+    const newBadges = await databaseService.checkAchievements();
+
+    expect(newBadges).toEqual([]);
+    expect(weeklyStreakBadges(newBadges)).toEqual([]);
+  });
+
+  it('still opens the budget streak gate for a stored numeric budget', async () => {
+    database.getAllAsync.mockImplementation(settingsRows('4500'));
+    database.getFirstAsync.mockResolvedValue(aggregateTotals());
+
+    const newBadges = await databaseService.checkAchievements();
+
+    expect(newBadges).toContain('week_warrior');
+    expect(weeklyStreakBadges(newBadges)).toEqual(['week_warrior', 'on-track']);
+  });
+});
+
+// BUG-09-11a. The fan out collapsed into one aggregate read plus one achievements read.
+// These tests hold the two things that collapse could break: the badge values
+// themselves, and the statements the pass is allowed to issue.
+describe('DatabaseService achievement pass (BUG-09-11a)', () => {
+  const usePopulatedFixture = (earned: { id: string; earned_at: number | null }[] = []) => {
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM achievements')) return earned;
+      return POPULATED_SETTINGS;
+    });
+    database.getFirstAsync.mockResolvedValue(POPULATED_FIXTURE);
+  };
+
+  it('keeps every badge current and target value for the populated fixture', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    const badges = await databaseService.getBadgeProgress();
+
+    // Derived by hand from the fixture: 6 expenses in 3 categories with 3 notes and 4
+    // detail rows, 2 scanned, 2 recurring, 2500 spent with a 2.50 minimum, streak 7,
+    // 1 export. A change to any of those numbers moves a line here.
+    const expected: [string, number, number][] = [
+      ['first_step', 1, 1],
+      ['eagle_eye', 1, 1],
+      ['on_repeat', 1, 1],
+      ['week_warrior', 7, 7],
+      ['month_master', 7, 30],
+      ['paper_trail', 1, 1],
+      ['detail_devil', 1, 1],
+      ['getting-started', 5, 5],
+      ['regular', 6, 25],
+      ['century', 6, 100],
+      ['sneak-peek', 2, 3],
+      ['shutterbug', 2, 15],
+      ['scanner-king', 2, 50],
+      ['fortnight', 7, 14],
+      ['season', 7, 60],
+      ['half-year-hero', 7, 180],
+      ['variety', 3, 3],
+      ['explorer', 3, 5],
+      ['completionist', 3, 8],
+      ['saver', 1, 1],
+      ['shopper', 10, 10],
+      ['big-league', 2, 10],
+      ['habit', 2, 2],
+      ['loyalist', 2, 5],
+      ['novelist', 3, 5],
+      ['on-track', 7, 7],
+      ['disciplined', 7, 30],
+    ];
+
+    expect(badges.map(badge => [badge.id, badge.current, badge.target])).toEqual(expected);
+    expect(badges.find(badge => badge.id === 'first_step')?.earned_at).toBe(111);
+    expect(badges.filter(badge => badge.id !== 'first_step').every(badge => badge.earned_at === null)).toBe(true);
+  });
+
+  it('awards the same badge ids in the same order for the populated fixture', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    const newBadges = await databaseService.checkAchievements();
+
+    // Catalogue order, only the unearned ids whose check now passes.
+    expect(newBadges).toEqual([
+      'eagle_eye', 'on_repeat', 'paper_trail', 'detail_devil', 'week_warrior',
+      'getting-started', 'variety', 'saver', 'shopper', 'habit', 'on-track',
+    ]);
+    expect(database.runAsync.mock.calls.map(call => (call[1] as [string])[0])).toEqual(newBadges);
+  });
+
+  it('reads the whole pass in three statements, whatever the badge catalogue size', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    await databaseService.checkAchievements();
+
+    const settingsReads = database.getAllAsync.mock.calls.filter(call => (call[0] as string).includes('FROM settings'));
+    expect(settingsReads).toHaveLength(1);
+    expect(database.getAllAsync).toHaveBeenCalledTimes(2);
+    expect(database.getFirstAsync).toHaveBeenCalledTimes(1);
+    expect(database.getFirstAsync.mock.calls[0]?.[0]).toContain('AS min_amount');
+  });
+
+  it('resolves the minimum amount and its currency from one row with a shared tie break', async () => {
+    usePopulatedFixture([]);
+
+    await databaseService.checkAchievements();
+
+    // The collapsed statement replaces a single row read with two scalar subqueries. A
+    // bare `ORDER BY amount ASC LIMIT 1` in each lets two rows with an equal minimum
+    // amount supply the amount and the currency separately, so the saver badge would
+    // name a currency that held no such expense. (amount, rowid) is a total order, so
+    // both subqueries must order by it and must therefore land on the same row.
+    const sql = database.getFirstAsync.mock.calls[0]?.[0] as string;
+    const sharedOrder = sql.match(/ORDER BY amount ASC, rowid ASC LIMIT 1/g) ?? [];
+    expect(sharedOrder).toHaveLength(2);
+    expect(sql).not.toMatch(/ORDER BY amount ASC LIMIT 1/);
+  });
+
+  it('reads the profile badge view in three statements and never re-reads settings', async () => {
+    usePopulatedFixture([{ id: 'first_step', earned_at: 111 }]);
+
+    await databaseService.getBadgeProgress();
+
+    const settingsReads = database.getAllAsync.mock.calls.filter(call => (call[0] as string).includes('FROM settings'));
+    expect(settingsReads).toHaveLength(1);
+    expect(database.getAllAsync).toHaveBeenCalledTimes(2);
+    expect(database.getFirstAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('never reads income, so income rows cannot move a badge', async () => {
+    usePopulatedFixture([]);
+
+    await databaseService.checkAchievements();
+
+    const statements = [
+      ...database.getAllAsync.mock.calls.map(call => call[0] as string),
+      ...database.getFirstAsync.mock.calls.map(call => call[0] as string),
+      ...database.runAsync.mock.calls.map(call => call[0] as string),
+    ].join(' ');
+    expect(statements).not.toMatch(/income/i);
+    expect(statements).toMatch(/FROM expenses/);
+    expect(statements).toMatch(/recurring_templates/);
   });
 });
 
@@ -374,7 +1180,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v1', userVersion: 0, currentVersion: 6, hasRecords: false,
+      schema: 'v1', userVersion: 0, currentVersion: 7, hasRecords: false,
     });
   });
 
@@ -387,7 +1193,23 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v2', userVersion: 6, currentVersion: 6, hasRecords: true,
+      schema: 'v2', userVersion: 6, currentVersion: 7, hasRecords: true,
+    });
+  });
+
+  // BUG-09-11a continuity gate. Migration 7 writes user_version 7, so the state a real
+  // reader now sees on every install is version 7, not 6. The classifier must still
+  // call that a v2 owned file, and it must still call an unversioned legacy file v1.
+  it('classifies a file already at user_version 7 as a v2 account, not v1', async () => {
+    database.getAllAsync.mockResolvedValue([{ name: 'expenses' }]);
+    database.getFirstAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('user_version')) return { user_version: 7 };
+      if (sql.includes('COUNT(*)')) return { count: 12 };
+      return null;
+    });
+
+    await expect(databaseService.detectContinuity()).resolves.toEqual({
+      schema: 'v2', userVersion: 7, currentVersion: 7, hasRecords: true,
     });
   });
 
@@ -400,7 +1222,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'none', userVersion: 0, currentVersion: 6, hasRecords: false,
+      schema: 'none', userVersion: 0, currentVersion: 7, hasRecords: false,
     });
   });
 
@@ -560,5 +1382,125 @@ describe('DatabaseService single-flight initialization', () => {
     await expect(databaseService.init()).resolves.toBeUndefined();
     expect(openDatabaseAsync).toHaveBeenCalledTimes(2);
     restore();
+  });
+});
+
+// BUG-09-11b. The invalidation path, one case per writer class the row's evidence
+// names. A write publishes the domain its screens read; a read publishes nothing.
+// The screens themselves never publish, so a missed publisher here is a screen
+// that silently keeps showing stale money.
+describe('DatabaseService freshness publishers', () => {
+  const candidate = {
+    merchant: 'Cafe',
+    amount: 12.5,
+    currency: 'USD',
+    category: 'dining',
+    date: 1_700_000_000_000,
+    source: 'manual' as const,
+  };
+
+  beforeEach(() => {
+    // Earlier cases in this file replace getCaptureRepository with a partial stub
+    // and never restore it, so the real decorated repository is put back before the
+    // publishers are exercised. Nothing after this block depends on those stubs.
+    vi.restoreAllMocks();
+    freshness.markDataChanged.mockClear();
+    (databaseService as unknown as { db: MockDatabase }).db = database;
+    database.getAllAsync.mockResolvedValue([]);
+    // Null rather than a row: the capture boundary reads the currency setting and
+    // probes for a duplicate through getFirstAsync, and a truthy stub would make
+    // every probe look like a duplicate.
+    database.getFirstAsync.mockResolvedValue(null);
+    database.runAsync.mockResolvedValue(undefined);
+  });
+
+  it('publishes the ledger token for a manual save through the capture repository', async () => {
+    const repository = await databaseService.getCaptureRepository();
+
+    await repository.save(candidate);
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+    expect(freshness.markDataChanged).not.toHaveBeenCalledWith('settings');
+  });
+
+  it('publishes the ledger token for an auto capture confirmed through the same boundary', async () => {
+    const repository = await databaseService.getCaptureRepository();
+
+    await repository.save({ ...candidate, source: 'auto_capture' });
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token once for a batch save', async () => {
+    const repository = await databaseService.getCaptureRepository();
+
+    await repository.saveBatch([candidate, { ...candidate, merchant: 'Shop', date: candidate.date + 1 }]);
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token for an import commit', async () => {
+    await databaseService.importExpenses([
+      { merchant: 'Cafe', amount: 12.5, currency: 'USD', category: 'dining', date: candidate.date },
+    ]);
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token for a continuity row restore', async () => {
+    const port = await databaseService.getContinuityImportPort();
+
+    await port.saveRow({
+      merchant: 'Cafe',
+      amount: 12.5,
+      currency: 'USD',
+      category: 'dining',
+      date: candidate.date,
+      note: '',
+      scanned: 0,
+    });
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the ledger token for a ledger edit and a category write', async () => {
+    await databaseService.updateExpenseNote('expense-1', 'note');
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+
+    freshness.markDataChanged.mockClear();
+    await databaseService.addCategory('Travel', 'plane', '#FFFFFF');
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the settings token for a settings change and not the ledger token', async () => {
+    await databaseService.updateSetting('currency', 'USD');
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+    expect(freshness.markDataChanged).not.toHaveBeenCalledWith('ledger');
+  });
+
+  it('publishes the settings token for an onboarding completion', async () => {
+    await databaseService.completeOnboarding({ currency: 'USD', monthlyBudget: '1200', profileName: 'Peach' });
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+  });
+
+  it('publishes the notifications token for an inserted notification and a mark-all-read', async () => {
+    await databaseService.insertNotification({ id: 'n1', title: 'Title', body: 'Body' });
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('notifications');
+
+    freshness.markDataChanged.mockClear();
+    await databaseService.markAllNotificationsRead();
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('notifications');
+  });
+
+  it('publishes nothing for a read', async () => {
+    database.getAllAsync.mockResolvedValue([]);
+
+    await databaseService.getExpenses();
+    await databaseService.getNotifications();
+    await databaseService.getAllSettings();
+
+    expect(freshness.markDataChanged).not.toHaveBeenCalled();
   });
 });

@@ -4,6 +4,14 @@
     "slug": "PeachSpend",
     "owner": "kingonuoha01",
     "version": "2.3.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/a9eaaa77-1cef-4084-9d19-66190ca73606",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 5000
+    },
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "app",
@@ -37,12 +45,9 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff",
+          "backgroundColor": "#7C3AED",
           "dark": {
-            "backgroundColor": "#000000"
+            "backgroundColor": "#7C3AED"
           }
         }
       ],

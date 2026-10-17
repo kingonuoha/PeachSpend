@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   Modal,
-  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -154,11 +153,11 @@ export default function ManageCategoriesScreen() {
   const reduceMotion = useReduceMotion();
   // Surface 7 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
   // math, but measured and applied on the UI thread so the category sheet tracks the
-  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
-  // soft-input resize already shrinks the window, so adding this padding there would
-  // double-count the keyboard. Hooks run unconditionally; only the style is gated at
-  // render time.
-  const isIOS = Platform.OS === 'ios';
+  // keyboard without waiting on a JS bridge frame. Applies on both platforms: per the
+  // Reanimated docs, while useAnimatedKeyboard is mounted it disables Android's default
+  // window resize for the whole app, so Android gets no system resize and this padding
+  // is the only keyboard handling. With the keyboard closed the height is 0, so the
+  // resting layout is unchanged.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
@@ -437,7 +436,7 @@ export default function ManageCategoriesScreen() {
         animationType={reduceMotion ? 'none' : 'slide'}
         onRequestClose={closeEditor}
       >
-        <Animated.View style={[styles.modalRoot, isIOS ? keyboardPaddingStyle : null]}>
+        <Animated.View style={[styles.modalRoot, keyboardPaddingStyle]}>
           <Pressable
             onPress={closeEditor}
             accessibilityRole="button"

@@ -2,14 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
-  Platform,
   Pressable,
   Text,
   TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -33,12 +32,16 @@ import {
 import Animated, {
   FadeIn,
   FadeInUp,
+  KeyboardState,
   useAnimatedKeyboard,
+  useAnimatedReaction,
   useAnimatedStyle,
 } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import { Colors, Radii, Spacing, Typography, Gradients } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
+import { useBottomClearance } from '../components/navigation/useBottomClearance';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { useToast } from '../components/ui/ToastProvider';
 import { LuminousCard } from '../components/ui/LuminousCard';
@@ -749,20 +752,41 @@ function ErrorCard({ text, retryable, code, onRetry, onOpenSettings }: {
 export default function ChatScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
-  const insets = useSafeAreaInsets();
   const reduceMotion = useReduceMotion();
   const { height: windowHeight } = useWindowDimensions();
   // Surface 6 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
   // math, but measured and applied on the UI thread so the message list tracks the
-  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
-  // soft-input resize already shrinks the window, so adding this padding there would
-  // double-count the keyboard and overlap the input bar. Hooks run unconditionally;
-  // only the style is gated at render time.
-  const isIOS = Platform.OS === 'ios';
+  // keyboard without waiting on a JS bridge frame. Applies on both platforms: per the
+  // Reanimated docs, while useAnimatedKeyboard is mounted it disables Android's default
+  // window resize for the whole app, so Android gets no system resize and this padding
+  // is the only keyboard handling. With the keyboard closed the height is 0, so the
+  // resting layout is unchanged. Hooks run unconditionally.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
   }));
+  // DEC-B58: while the keyboard is open the bar sits behind it and cannot be seen, so
+  // the composer must not also reserve the bar's height. React state rather than a
+  // shared value, because this flips twice per keyboard session and not once per frame,
+  // so it adds no per-frame layout work. A floating iPad keyboard reports CLOSED and
+  // keeps the bar clearance, which is right because it does not cover the bar.
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  useAnimatedReaction(
+    () => keyboard.state.get() === KeyboardState.OPENING || keyboard.state.get() === KeyboardState.OPEN,
+    (open) => {
+      scheduleOnRN(setKeyboardOpen, open);
+    },
+  );
+  // The chat screen renders in two hosts: as the chat tab, where the floating
+  // bar is mounted over it, and as a stack route pushed from elsewhere, where it
+  // is not. The hook resolves which one this is, so the composer and the provider
+  // sheet clear the bar in the tab host and gain no dead space when pushed.
+  const bottomClearance = useBottomClearance();
+  // The composer's own clearance, which is the safe area alone while the keyboard is
+  // open. The provider sheet below keeps the host clearance: it is anchored to the
+  // screen's bottom edge, so its bottom padding raises the sheet's own top edge and
+  // shows more of the model list above the keyboard instead of reserving dead space.
+  const composerClearance = useBottomClearance(keyboardOpen);
   const { settings, updateSetting } = useSettings();
   const toast = useToast();
   const { checkForNewAchievements } = useAchievements();
@@ -798,39 +822,43 @@ export default function ChatScreen() {
   useEffect(() => {
     let active = true;
     const bootstrap = async () => {
+      // Best effort maintenance first: the expiry sweep can remove retained
+      // messages, so it runs before the history read rather than beside it.
       try {
         await aiChatService.checkAutoExpiry();
-        const history = await aiChatService.getHistory();
-        if (active) setEntries(entriesFromHistory(history));
       } catch {
-        if (active) setEntries([]);
-      } finally {
-        if (active) setLoadingHistory(false);
+        // A failed sweep must not stop the history from loading.
       }
 
-      try {
-        const stored = (await databaseService.getSetting('chat_provider')) === 'openrouter' ? 'openrouter' : 'gemini';
-        const model = stored === 'openrouter'
-          ? (await databaseService.getSetting('chat_openrouter_model')) || ''
-          : (await databaseService.getSetting('chat_gemini_model')) || '';
-        const display = stored === 'openrouter'
-          ? (await databaseService.getSetting('chat_openrouter_model_display')) || model
-          : (await databaseService.getSetting('chat_gemini_model_display')) || model;
-        if (active) {
-          setProvider(stored);
-          setActiveModelId(model);
-          setActiveModelLabel(display || model);
-        }
-      } catch {
-        // Provider defaults remain; the sheet shows the honest empty state.
+      // BUG-09-11b. These reads are independent, so they are issued together
+      // instead of one after another. The stored provider decides which model
+      // setting to read, so that pair stays a second wave; the statement count is
+      // unchanged, the number of round trip waves drops from five to three.
+      const [history, storedProvider] = await Promise.all([
+        aiChatService.getHistory().catch(() => []),
+        databaseService.getSetting('chat_provider').catch(() => null),
+      ]);
+      if (active) {
+        setEntries(entriesFromHistory(history));
+        setLoadingHistory(false);
       }
 
-      try {
-        const nextKeyState = await aiChatService.getProviderKeyState();
-        if (active) setKeyState(nextKeyState);
-      } catch {
-        if (active) setKeyState(null);
-      }
+      const stored = storedProvider === 'openrouter' ? 'openrouter' : 'gemini';
+      if (active) setProvider(stored);
+
+      const [model, display, nextKeyState] = await Promise.all([
+        databaseService.getSetting(stored === 'openrouter' ? 'chat_openrouter_model' : 'chat_gemini_model').catch(() => null),
+        databaseService
+          .getSetting(stored === 'openrouter' ? 'chat_openrouter_model_display' : 'chat_gemini_model_display')
+          .catch(() => null),
+        aiChatService.getProviderKeyState().catch(() => null),
+      ]);
+      if (!active) return;
+
+      const resolvedModel = model || '';
+      setActiveModelId(resolvedModel);
+      setActiveModelLabel(display || resolvedModel);
+      setKeyState(nextKeyState);
     };
     void bootstrap();
     return () => {
@@ -889,7 +917,7 @@ export default function ChatScreen() {
       onIncomeSaved: async () => undefined,
       scheduleNotification: (candidate) => {
         if ('merchant' in candidate) {
-          notificationService.scheduleExpenseNotification(candidate.merchant, `${candidate.currency} ${candidate.amount.toFixed(2)}`);
+          notificationService.scheduleExpenseNotification(candidate.merchant, formatCurrency(candidate.amount, candidate.currency));
         }
       },
     };
@@ -1659,7 +1687,7 @@ export default function ChatScreen() {
         </View>
       </View>
 
-      <Animated.View style={[{ flex: 1 }, isIOS ? keyboardPaddingStyle : null]}>
+      <Animated.View style={[{ flex: 1 }, keyboardPaddingStyle]}>
         {importMode ? (
           <View style={{ paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 }}>
             <View style={{ alignSelf: 'center', width: '100%', maxWidth: MAX_CONTENT_WIDTH, flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2, padding: Spacing.s3, borderRadius: Radii.md, backgroundColor: ts.raw.purple100, borderWidth: 1, borderColor: ts.border.primary20 }}>
@@ -1756,7 +1784,7 @@ export default function ChatScreen() {
           style={{
             paddingHorizontal: Spacing.s3,
             paddingTop: Spacing.s2,
-            paddingBottom: Math.max(Spacing.s2, insets.bottom),
+            paddingBottom: Math.max(Spacing.s2, composerClearance),
             borderTopWidth: 1,
             borderTopColor: ts.border.subtle,
             backgroundColor: ts.raw.surface,
@@ -1865,7 +1893,7 @@ export default function ChatScreen() {
                 borderTopWidth: 1,
                 borderColor: ts.raw.outline,
                 padding: Spacing.s5,
-                paddingBottom: Math.max(Spacing.s5, insets.bottom),
+                paddingBottom: Math.max(Spacing.s5, bottomClearance),
                 gap: Spacing.s3,
               }}
             >

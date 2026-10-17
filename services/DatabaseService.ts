@@ -7,14 +7,17 @@ import { CURRENT_SCHEMA_VERSION, readContinuitySchema, runV1ExportMigration } fr
 import type { ContinuityContract, ContinuityDetection, ContinuityFileInput, ContinuityImportPort, ContinuityMigrationResult, ContinuityRowMatch, ContinuitySchemaPort, ContinuitySchemaState } from '../data/ContinuityContracts';
 import { deleteSecret, getSecret, isSecretSettingKey, migrateLegacySecrets, setSecret, SECRET_SETTING_KEYS, type SecretSettingKey } from '../data/secrets';
 import { SqliteCaptureRepository } from '../data/CaptureRepository';
-import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSettings, type CaptureCandidate, type CaptureRepository, type OnboardingSettings, type OnboardingSettingsStore } from '../data/contracts';
+import { CaptureValidationError, type AutoCapturePermission, type AutoCaptureSettings, type CaptureCandidate, type CaptureEventInput, type CaptureEventQuery, type CaptureRepository, type CaptureSource, type IncomeCandidate, type OnboardingSettings, type OnboardingSettingsStore, type RecurringTemplateHandoff } from '../data/contracts';
 import { deleteOwnedReceiptImage, isOwnedReceiptImage } from '../utils/ownedReceiptImage';
 import { formatCurrency, resolveCurrency } from '../utils/currency';
-import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense } from '../data/SettingsContracts';
+import { CurrencyConversionError, executeBulkCurrencyConversion, isExportableExpense, parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
+import { parseMoneyAmount, type MoneyParse } from '../data/moneyInput';
+import { parseImportDate } from '../data/dateInput';
 import { CategoryService } from '../data/CategoryService';
 import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../data/RecurringDataService';
 import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
 import { eraseOwnedMediaForScope } from './MediaErasureService';
+import { markDataChanged } from '../hooks/useDataFreshness';
 
 const DATABASE_NAME = 'peachspend.db';
 const ACHIEVEMENT_THRESHOLDS = {
@@ -22,6 +25,61 @@ const ACHIEVEMENT_THRESHOLDS = {
   shopper: 1_000,
   bigLeague: 10_000,
 } as const;
+
+// BUG-09-11a. Every number the achievement catalogue needs, in one statement, so a
+// save no longer pays for eight awaited aggregates. The min amount pair is a scalar
+// subquery rather than a second statement, and it is served by idx_expenses_amount
+// instead of the whole table sort the old `ORDER BY amount ASC LIMIT 1` caused. Both
+// subqueries order by (amount, rowid) so they resolve to the same physical row: with a
+// bare `ORDER BY amount ASC` two rows sharing the minimum amount could supply the
+// amount from one and the currency from the other, and the saver badge would state its
+// threshold in a currency that held no such expense. The detail count is deliberately
+// the same expression as before, `note != '' OR is_reimbursable = 1`, so a null note
+// still does not count as detail.
+const ACHIEVEMENT_TOTALS_SQL = `
+  SELECT
+    COUNT(*) AS expense_count,
+    COALESCE(SUM(CASE WHEN scanned = 1 THEN 1 ELSE 0 END), 0) AS scanned_count,
+    COALESCE(SUM(amount), 0) AS total_spent,
+    COUNT(DISTINCT category) AS distinct_categories,
+    COALESCE(SUM(CASE WHEN note IS NOT NULL AND note != '' THEN 1 ELSE 0 END), 0) AS note_count,
+    COALESCE(SUM(CASE WHEN (note IS NOT NULL AND note != '') OR is_reimbursable = 1 THEN 1 ELSE 0 END), 0) AS detail_count,
+    (SELECT amount FROM expenses ORDER BY amount ASC, rowid ASC LIMIT 1) AS min_amount,
+    (SELECT currency FROM expenses ORDER BY amount ASC, rowid ASC LIMIT 1) AS min_currency,
+    (SELECT COUNT(*) FROM recurring_templates) AS recurring_count
+  FROM expenses
+`;
+
+interface AchievementTotals {
+  expense_count: number;
+  scanned_count: number;
+  total_spent: number;
+  distinct_categories: number;
+  note_count: number;
+  detail_count: number;
+  min_amount: number | null;
+  min_currency: string | null;
+  recurring_count: number;
+}
+
+const EMPTY_ACHIEVEMENT_TOTALS: AchievementTotals = {
+  expense_count: 0,
+  scanned_count: 0,
+  total_spent: 0,
+  distinct_categories: 0,
+  note_count: 0,
+  detail_count: 0,
+  min_amount: null,
+  min_currency: null,
+  recurring_count: 0,
+};
+
+// The stored streak read from a settings snapshot the caller already loaded. Both
+// achievement passes used to read the whole settings table a second time through
+// getStreak() for this one number.
+function streakFromSettings(settings: Record<string, string>): number {
+  return parseInt(settings.last_streak) || 0;
+}
 
 // Public settings whose values are financial or personally identifying. Their
 // values are registered for logger redaction before persistence, so an error that
@@ -51,6 +109,92 @@ function escapeCsv(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+// BUG-09-11b freshness signal for the ledger. Every expense and income write in
+// the app goes through the capture repository, whether the caller is manual entry,
+// the scan confirm flow, the share intake, the expense review sheet, the auto
+// capture host, the chat action handler or the import commit, so the change token
+// is published here rather than at each of those call sites, where a later writer
+// could forget it. Only the three saving methods publish; every read and every
+// non ledger write is delegated unchanged, so no existing behaviour or return
+// shape moves.
+class PublishingCaptureRepository implements CaptureRepository {
+  constructor(private readonly inner: CaptureRepository) {}
+
+  private publish<T>(operation: Promise<T>): Promise<T> {
+    return operation.then(result => {
+      markDataChanged('ledger');
+      return result;
+    });
+  }
+
+  findDuplicate(candidate: Pick<CaptureCandidate, 'merchant' | 'amount' | 'date'>) {
+    return this.inner.findDuplicate(candidate);
+  }
+
+  findBatchDuplicates(candidates: CaptureCandidate[]) {
+    return this.inner.findBatchDuplicates(candidates);
+  }
+
+  save(candidate: CaptureCandidate, allowDuplicate?: boolean) {
+    return this.publish(this.inner.save(candidate, allowDuplicate));
+  }
+
+  saveBatch(candidates: CaptureCandidate[], allowDuplicates?: boolean) {
+    return this.publish(this.inner.saveBatch(candidates, allowDuplicates));
+  }
+
+  findIncomeDuplicate(candidate: Pick<IncomeCandidate, 'sourceName' | 'amount' | 'date'>) {
+    return this.inner.findIncomeDuplicate(candidate);
+  }
+
+  saveIncome(candidate: IncomeCandidate, allowDuplicate?: boolean) {
+    return this.publish(this.inner.saveIncome(candidate, allowDuplicate));
+  }
+
+  withTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    return this.inner.withTransaction(operation);
+  }
+
+  getRecurringTemplateHandoff(): RecurringTemplateHandoff {
+    return this.inner.getRecurringTemplateHandoff();
+  }
+
+  rememberCategory(merchant: string, category: string, source: CaptureSource) {
+    return this.inner.rememberCategory(merchant, category, source);
+  }
+
+  getRememberedCategory(merchant: string) {
+    return this.inner.getRememberedCategory(merchant);
+  }
+
+  recordEvent(event: CaptureEventInput) {
+    return this.inner.recordEvent(event);
+  }
+
+  listEvents(query?: CaptureEventQuery) {
+    return this.inner.listEvents(query);
+  }
+
+  enqueueAutoCapture(payload: CaptureCandidate) {
+    return this.inner.enqueueAutoCapture(payload);
+  }
+
+  claimQueuedAutoCaptures(now?: number) {
+    return this.inner.claimQueuedAutoCaptures(now);
+  }
+
+  completeQueuedAutoCapture(id: string) {
+    return this.inner.completeQueuedAutoCapture(id);
+  }
+
+  failQueuedAutoCapture(id: string, errorCode: string, retryAt: number) {
+    return this.inner.failQueuedAutoCapture(id, errorCode, retryAt);
+  }
+
+  discardQueuedAutoCaptures() {
+    return this.inner.discardQueuedAutoCaptures();
+  }
+}
 class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   private db: SQLite.SQLiteDatabase | null = null;
   // Single-flight handle for the first open. The open is async, so several
@@ -62,13 +206,20 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // through init(), so they all await this one promise instead.
   private initPromise: Promise<void> | null = null;
   // Schema state captured before the migration runner advances the file. A v1
-  // file reports 'v1' here even though user_version is 6 by the time any reader
+  // file reports 'v1' here even though user_version is 7 by the time any reader
   // sees it.
   private startupSchema: ContinuitySchemaState | null = null;
   private startupUserVersion = 0;
 
+  // One aggregate read shared by both achievement passes: checkAchievements and
+  // getBadgeProgress ask for the same nine numbers.
+  private async readAchievementTotals(db: SQLite.SQLiteDatabase): Promise<AchievementTotals> {
+    const row = await db.getFirstAsync<AchievementTotals>(ACHIEVEMENT_TOTALS_SQL);
+    return row ?? EMPTY_ACHIEVEMENT_TOTALS;
+  }
+
   async getCaptureRepository(): Promise<CaptureRepository> {
-    return new SqliteCaptureRepository(await this.getDb());
+    return new PublishingCaptureRepository(new SqliteCaptureRepository(await this.getDb()));
   }
 
   // The single accessor for the open handle. The init() call inside is
@@ -162,7 +313,14 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async migrateV1Export(input: ContinuityFileInput): Promise<ContinuityMigrationResult> {
-    return runV1ExportMigration(await this.getContinuityImportPort(), input);
+    const result = await runV1ExportMigration(await this.getContinuityImportPort(), input);
+    // The continuity restore is its own writer class: it lands through the
+    // capture repository like any other save, but it is driven by a bulk port,
+    // so it publishes once for the whole restore as well.
+    if (result.status === 'imported' || result.status === 'partially_imported' || result.status === 'already_current') {
+      markDataChanged('ledger');
+    }
+    return result;
   }
 
   private continuitySchemaPort(db: SQLite.SQLiteDatabase): ContinuitySchemaPort {
@@ -275,6 +433,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
         'INSERT OR REPLACE INTO expenses (id, merchant, amount, currency, category, note, scanned, date, created_at, image_uri, is_reimbursable, unit_price, units, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         params
       );
+      markDataChanged('ledger');
       logger.info(`Expense saved: ${expense.id}`);
     } catch (error) {
       logger.error('DatabaseService.saveExpense failed', 'expense_save_failed');
@@ -299,12 +458,14 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     }
 
     await db.runAsync('DELETE FROM expenses WHERE id = ?', [id]);
+    markDataChanged('ledger');
     logger.info(`Expense deleted: ${id}`);
   }
 
   async updateExpenseNote(id: string, note: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET note = ? WHERE id = ?', [note, id]);
+    markDataChanged('ledger');
   }
 
   // Single write boundary for an S-08 category correction. The learning-loop
@@ -313,11 +474,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async updateExpenseCategory(id: string, category: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET category = ? WHERE id = ?', [category, id]);
+    markDataChanged('ledger');
   }
 
   async updateExpenseReimbursable(id: string, isReimbursable: boolean): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET is_reimbursable = ? WHERE id = ?', [isReimbursable ? 1 : 0, id]);
+    markDataChanged('ledger');
   }
 
   async getExpensesByCategory(): Promise<{ category: string; total: number }[]> {
@@ -352,6 +515,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const rates = await this.getSetting('conversion_rates');
     const outcome = await executeBulkCurrencyConversion(this, expenses, targetCurrency, rates);
     if (outcome.status === 'refused') throw new CurrencyConversionError(outcome.missingRates);
+    markDataChanged('ledger');
     logger.info(`Converted ${outcome.convertedCount} expense row(s) to ${targetCurrency}`);
     return outcome;
   }
@@ -359,6 +523,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async updateExpenseCurrency(id: string, amount: number, currency: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET amount = ?, currency = ? WHERE id = ?', [amount, currency, id]);
+    markDataChanged('ledger');
   }
 
   // Categories
@@ -376,6 +541,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO categories (id, title, icon_name, color, is_default) VALUES (?, ?, ?, ?, 0)',
       [id, title, icon, color]
     );
+    markDataChanged('ledger');
     return id;
   }
 
@@ -385,16 +551,19 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'UPDATE categories SET title = ? WHERE id = ?',
       [newTitle, id]
     );
+    markDataChanged('ledger');
   }
 
   async updateCategoryColor(id: string, color: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE categories SET color = ? WHERE id = ?', [color, id]);
+    markDataChanged('ledger');
   }
 
   async updateCategoryIcon(id: string, iconName: string): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE categories SET icon_name = ? WHERE id = ?', [iconName, id]);
+    markDataChanged('ledger');
   }
 
   // Settings
@@ -430,6 +599,10 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
       [key, value]
     );
+    // One publisher for the settings table: updateSetting, completeOnboarding and
+    // the auto capture settings write all funnel through here, so a settings
+    // change cannot reach the table without waking the screens that read it.
+    markDataChanged('settings');
   }
 
   async updateSetting(key: string, value: string) {
@@ -448,17 +621,21 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // follows the setup currency so Home never reconverts a value the user typed in
   // the currency they chose during setup. The join date is written here so S-05
   // has a real install date; existing installs fall back to their earliest record.
+  // BUG-09-04a: the typed budget goes through the one canonical write rule, so a
+  // thousands separator, a currency symbol, or letters can no longer be stored as
+  // the budget. An entry that cannot be parsed is not written (E-12), and a blank
+  // entry keeps its existing meaning of no budget row at all.
   async completeOnboarding(settings: OnboardingSettings): Promise<void> {
     const db = await this.getDb();
     const profileName = settings.profileName?.trim();
-    const monthlyBudget = settings.monthlyBudget?.trim();
+    const storedBudget = toStoredBudget(settings.monthlyBudget);
 
     await db.execAsync('BEGIN');
     try {
       await this.writePublicSetting(db, 'currency', settings.currency);
       await this.writePublicSetting(db, 'budget_currency', settings.currency);
       if (profileName) await this.writePublicSetting(db, 'profile_name', profileName);
-      if (monthlyBudget) await this.writePublicSetting(db, 'monthly_budget', monthlyBudget);
+      if (storedBudget !== null) await this.writePublicSetting(db, 'monthly_budget', storedBudget);
       await this.writePublicSetting(db, 'profile_join_date', String(Date.now()));
       await this.writePublicSetting(db, 'onboarding_complete', 'true');
       await db.execAsync('COMMIT');
@@ -494,6 +671,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO notifications (id, title, body, type, data, read, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)',
       [notification.id, notification.title, notification.body, notification.type || 'expense', notification.data || null, Date.now()]
     );
+    markDataChanged('notifications');
   }
 
   async getNotifications(): Promise<Notification[]> {
@@ -510,21 +688,25 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async markNotificationRead(id: string) {
     const db = await this.getDb();
     await db.runAsync('UPDATE notifications SET read = 1 WHERE id = ?', [id]);
+    markDataChanged('notifications');
   }
 
   async markAllNotificationsRead() {
     const db = await this.getDb();
     await db.runAsync('UPDATE notifications SET read = 1 WHERE read = 0');
+    markDataChanged('notifications');
   }
 
   async deleteNotification(id: string) {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM notifications WHERE id = ?', [id]);
+    markDataChanged('notifications');
   }
 
   async clearAllNotifications() {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM notifications');
+    markDataChanged('notifications');
   }
 
   async runAsync(sql: string, params: SQLite.SQLiteBindParams = []) {
@@ -552,6 +734,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO recurring_templates (id, merchant, amount, currency, category, note, interval, recurrence_days, next_due_date, type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [template.id, template.merchant, template.amount, currency, template.category, template.note || '', template.interval, template.recurrence_days || null, template.next_due_date, template.type || 'expense', template.created_at]
     );
+    markDataChanged('ledger');
   }
 
   async getRecurringTemplates(type?: string): Promise<RecurringTemplate[]> {
@@ -577,11 +760,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'UPDATE recurring_templates SET next_due_date = ? WHERE id = ?',
       [nextDue, id]
     );
+    markDataChanged('ledger');
   }
 
   async deleteRecurringTemplate(id: string) {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM recurring_templates WHERE id = ?', [id]);
+    markDataChanged('ledger');
   }
 
   async getNextDueDate(interval: string, recurrence_days?: string, fromDate?: number): Promise<number> {
@@ -608,6 +793,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'UPDATE recurring_templates SET merchant = ?, amount = ?, currency = ?, category = ?, note = ?, interval = ?, recurrence_days = ?, next_due_date = ?, type = ? WHERE id = ?',
       [patch.merchant, patch.amount, currency, patch.category, patch.note || '', patch.interval, patch.recurrence_days || null, patch.next_due_date, patch.type || 'expense', id]
     );
+    markDataChanged('ledger');
   }
 
   // Income
@@ -630,6 +816,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'INSERT INTO income (id, source, amount, currency, category, note, is_recurring, recurrence_interval, next_due_date, date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [income.id, income.source, income.amount, currency, income.category, income.note || '', income.is_recurring || 0, income.recurrence_interval || null, income.next_due_date || null, income.date, income.created_at]
     );
+    markDataChanged('ledger');
   }
 
   async getIncome(startDate?: number, endDate?: number): Promise<Income[]> {
@@ -643,6 +830,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   async deleteIncome(id: string) {
     const db = await this.getDb();
     await db.runAsync('DELETE FROM income WHERE id = ?', [id]);
+    markDataChanged('ledger');
   }
 
   async getNetBalance(startDate?: number, endDate?: number): Promise<number> {
@@ -707,11 +895,48 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const errors: string[] = [];
     const trimmed = input.trim();
 
-    const toTimestamp = (dateStr: string): number => {
-      if (!dateStr) return Date.now();
-      const d = new Date(dateStr);
-      return isNaN(d.getTime()) ? Date.now() : d.getTime();
+    // BUG-09-19. A date is read through the shared parse in ../data/dateInput.
+    // `new Date(value)` used to be reached with anything, and an unreadable value
+    // silently became `Date.now()`, so a row the file dated wrongly was stored as if
+    // it had happened today: no error, no warning, and a wrong month, which moves an
+    // expense between budget periods. A value the file supplies that cannot be read
+    // now refuses the row, which is the decision BUG-09-15 made for an amount it
+    // cannot read.
+    //
+    // A date the file does not supply at all is a different case and is not a
+    // refusal. The import's documented default for an unknown date is the import
+    // time: `EXTERNAL_IMPORT_PROMPT` tells the source to use today when the date is
+    // unknown, the JSON shape in ../data/ImportContracts.ts marks `date` optional,
+    // and a pinned test asserts that a JSON row without a date is not an error. That
+    // default is stated here rather than left to a `||` a reader has to notice.
+    const dateIsSupplied = (raw: unknown): boolean => {
+      if (raw === undefined || raw === null) return false;
+      return typeof raw === 'string' ? raw.trim() !== '' : true;
     };
+
+    const dateErrorMessage = (prefix: string, raw: unknown): string =>
+      `${prefix}: the date "${String(raw)}" could not be read, so the row was skipped`;
+
+    // An absent, null or blank JSON numeric field stays absent, the same rule an
+    // absent or blank date gets below, because both fields are optional in the
+    // documented shape (`unit_price` and `units` are optional in `Expense` and in
+    // `CaptureCandidate`). Every other JSON type is read through the shared parse,
+    // which refuses a boolean, an array, a hex string or any other value `Number()`
+    // would have coerced into a number the user never wrote.
+    const readOptionalNumber = (raw: unknown): MoneyParse | null => {
+      if (raw === undefined || raw === null) return null;
+      if (typeof raw === 'string' && raw.trim() === '') return null;
+      return parseMoneyAmount(typeof raw === 'number' || typeof raw === 'string' ? String(raw) : null);
+    };
+
+    // BUG-09-20. JSON is keyed, so a field count cannot shift a value into the wrong
+    // column the way a CSV row can; what a JSON file can get wrong is the shape of the
+    // item itself. A string, number, array or null is not a row. A null item used to
+    // throw on its first property read, so the whole file was refused as `Invalid JSON
+    // format. Check for syntax errors.` even though its syntax was fine. The item is
+    // named and skipped instead, and that is the whole of the JSON shape check.
+    const isRowObject = (value: unknown): boolean =>
+      value !== null && typeof value === 'object' && !Array.isArray(value);
 
     // Try JSON first
     if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
@@ -723,8 +948,41 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const expErrors: string[] = [];
+           if (!isRowObject(item)) {
+             errors.push(`item ${i + 1}: the row is not a JSON object, so the row was skipped`);
+             continue;
+           }
            if (typeof item.merchant !== 'string' || !item.merchant.trim()) expErrors.push(`item ${i + 1}: missing merchant`);
-           if (item.amount === undefined || item.amount === null || !Number.isFinite(Number(item.amount)) || Number(item.amount) <= 0) expErrors.push(`item ${i + 1}: invalid amount`);
+           // A JSON amount is a number in the documented shape, and it is read through the
+           // same shared parse as a CSV cell. Any other JSON type is refused rather than
+           // coerced, because `Number(true)` is 1 and `Number("0x10")` is 16, both of which
+           // used to be imported as a wrong amount with no message. The fallback zero is
+           // only ever produced for a row the guard below skips, so an unreadable amount
+           // never reaches the database as zero.
+           const amountParse = parseMoneyAmount(typeof item.amount === 'number' || typeof item.amount === 'string' ? String(item.amount) : null);
+           const amount = amountParse.valid ? amountParse.value : 0;
+           if (!amountParse.valid || amount <= 0) expErrors.push(`item ${i + 1}: invalid amount`);
+
+           // BUG-09-19. The date is read on the same terms as the amount above, and
+           // a value the file supplies that cannot be read refuses the row instead of
+           // becoming today. A date the file does not supply keeps the documented
+           // import default, so an item without one is not an error.
+           const dateParse = parseImportDate(item.date);
+           if (!dateParse.valid && dateIsSupplied(item.date)) expErrors.push(dateErrorMessage(`item ${i + 1}`, item.date));
+
+           // `unit_price` and `units` used to be passed straight through, so a JSON
+           // string, boolean or array reached the repository and was stored as
+           // whatever SQLite coerced it to. Each keeps its own field rule: `units` is
+           // a whole count of at least one, the rule the receipt parser already
+           // applies (`ai/parsing.ts`), and `unit_price` is a money amount that is not
+           // negative. The parser's further check that `unit_price * units` equals the
+           // amount is not applied here, because the import's `amount` is the row
+           // total and a file may legitimately carry a pair that does not multiply to
+           // it, so that check would refuse honest rows.
+           const unitPriceParse = readOptionalNumber(item.unit_price);
+           const unitsParse = readOptionalNumber(item.units);
+           if (unitPriceParse && (!unitPriceParse.valid || unitPriceParse.value < 0)) expErrors.push(`item ${i + 1}: invalid unit_price`);
+           if (unitsParse && (!unitsParse.valid || !Number.isInteger(unitsParse.value) || unitsParse.value < 1)) expErrors.push(`item ${i + 1}: invalid units`);
 
             const currency = typeof item.currency === 'string' ? item.currency.trim() : '';
             const category = typeof item.category === 'string' ? item.category.trim().toLowerCase() : '';
@@ -737,16 +995,16 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
            expenses.push({
             id: Math.random().toString(36).substring(2, 15),
             merchant: String(item.merchant),
-            amount: Number(item.amount),
+            amount,
              currency,
              category,
             note: item.note || '',
             scanned: item.scanned || 0,
-            date: toTimestamp(item.date),
+            date: dateParse.valid ? dateParse.value : Date.now(),
             created_at: Date.now(),
             is_reimbursable: item.is_reimbursable || 0,
-            unit_price: item.unit_price ?? undefined,
-            units: item.units ?? undefined,
+            unit_price: unitPriceParse && unitPriceParse.valid ? unitPriceParse.value : undefined,
+            units: unitsParse && unitsParse.valid ? unitsParse.value : undefined,
           });
         }
         return { expenses, errors };
@@ -764,6 +1022,11 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     }
 
     const header = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    // BUG-09-20. The field count the header declares, read with the same CSV reader as
+    // the data rows below, so a quoted comma is one field on both sides. For a plain
+    // header, which is every header this app or the v1 export writes, this equals
+    // `header.length`, the token count the column lookups just below come from.
+    const headerFieldCount = parseCsvLine(lines[0]).length;
     const dateIdx = header.indexOf('date');
     const merchantIdx = header.indexOf('merchant');
     const amountIdx = header.indexOf('amount');
@@ -772,34 +1035,68 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const noteIdx = header.indexOf('note');
     const scannedIdx = header.indexOf('scanned');
 
-     if (merchantIdx === -1 || amountIdx === -1 || currencyIdx === -1 || categoryIdx === -1) {
-       errors.push('CSV must have "merchant", "amount", "currency", and "category" columns.');
+     if (merchantIdx === -1 || amountIdx === -1 || currencyIdx === -1 || categoryIdx === -1 || dateIdx === -1) {
+       errors.push('CSV must have "merchant", "amount", "currency", "category", and "date" columns.');
       return { expenses: [], errors };
     }
 
     const expenses: Partial<Expense>[] = [];
     for (let i = 1; i < lines.length; i++) {
       const cols = parseCsvLine(lines[i]);
+      // BUG-09-20. A row whose field count differs from the header's shifts every
+      // column after the differing one, so an unquoted grouped amount such as `2,900`
+      // in a hand-edited file used to store amount 2 against a currency of `900` with
+      // no error and no warning. The count is of parsed fields on both sides, so a
+      // quoted field containing a comma is one field and a trailing empty field is a
+      // field rather than a mismatch. The row is reported and skipped here, before any
+      // column is read, so a shifted row can never be imported with shifted values.
+      if (cols.length !== headerFieldCount) {
+        errors.push(`CSV row ${i}: the row has ${cols.length} fields where the header declares ${headerFieldCount}, so the row was skipped`);
+        continue;
+      }
       const merchant = (cols[merchantIdx] || '').trim();
-       const amountValue = cols[amountIdx]?.trim() || '';
-       const amount = parseFloat(amountValue);
-       const currency = cols[currencyIdx]?.trim() || '';
-       const category = cols[categoryIdx]?.toLowerCase().trim() || '';
+      const amountValue = cols[amountIdx]?.trim() || '';
+      // BUG-09-15. `parseFloat` read `1,250.50` as 1 and `2,900` as 2, so a grouped cell
+      // was imported as its first digit with no error and no warning. The shared parse
+      // reads a grouped amount as its true value, and a cell it cannot read is reported
+      // below instead of being written as a truncated number or as zero.
+      const amount = parseMoneyAmount(amountValue);
+      const currency = cols[currencyIdx]?.trim() || '';
+      const category = cols[categoryIdx]?.toLowerCase().trim() || '';
+      // BUG-09-19. The header carries a date column, so a row whose date cell is
+      // empty or unreadable is a row this file did not date. It is skipped and named
+      // rather than stored as today, which used to move the expense into the current
+      // month with no error and no warning. An empty date cell is treated exactly as
+      // an empty amount cell is above, with the same wording.
+      const dateValue = (cols[dateIdx] || '').trim();
+      const date = parseImportDate(dateValue);
 
-       if (!merchant || !amountValue || isNaN(amount) || amount <= 0 || !currency || !category) {
+      if (!merchant || !amountValue || !currency || !category || !dateValue) {
+        errors.push(`CSV row ${i}: skipped invalid entry`);
+        continue;
+      }
+      if (!amount.valid) {
+        errors.push(`CSV row ${i}: the amount "${amountValue}" could not be read, so the row was skipped`);
+        continue;
+      }
+      if (!date.valid) {
+        errors.push(`CSV row ${i}: the date "${dateValue}" could not be read, so the row was skipped`);
+        continue;
+      }
+      if (amount.value <= 0) {
         errors.push(`CSV row ${i}: skipped invalid entry`);
         continue;
       }
 
-       expenses.push({
+      expenses.push({
         id: Math.random().toString(36).substring(2, 15),
         merchant,
-        amount,
-         currency,
-         category,
+        amount: amount.value,
+        currency,
+        category,
         note: noteIdx !== -1 ? (cols[noteIdx] || '').replace(/""/g, '"') : '',
         scanned: scannedIdx !== -1 ? parseInt(cols[scannedIdx] || '0') || 0 : 0,
-        date: dateIdx !== -1 ? toTimestamp(cols[dateIdx]) : Date.now(),
+        date: date.value,
         created_at: Date.now(),
         is_reimbursable: 0,
         unit_price: undefined,
@@ -845,74 +1142,71 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   // Achievements & Streaks
+  //
+  // BUG-09-11a. This used to cost one statement per badge in the catalogue, plus eight
+  // aggregates, plus a second settings read: 36 round trips on a save, 37 when a budget
+  // is set and getStreak() re-reads the settings table, and the count grew with the
+  // badge catalogue. It is now three reads, a single settings snapshot, and the earned
+  // set read once instead of probed per badge. The badge catalogue, its order, and every
+  // threshold below are unchanged, so the ids returned and the order celebrations queue
+  // in are identical.
   async checkAchievements(): Promise<string[]> {
     const db = await this.getDb();
     const allSettings = await this.getAllSettings();
-    const monthlyBudget = parseFloat(allSettings.monthly_budget) || 0;
-    const streak = monthlyBudget > 0 ? await this.getStreak() : 0;
+    const monthlyBudget = parseStoredBudget(allSettings.monthly_budget);
+    const streak = monthlyBudget > 0 ? streakFromSettings(allSettings) : 0;
 
-    const expenseCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses'))?.count || 0;
-    const scannedCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses WHERE scanned = 1'))?.count || 0;
-    const recurringCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM recurring_templates'))?.count || 0;
+    const totals = await this.readAchievementTotals(db);
     const exportCount = parseInt(allSettings.export_count) || 0;
-    const detailCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note != '' OR is_reimbursable = 1"))?.count || 0;
-    const totalSpent = (await db.getFirstAsync<{ total: number }>('SELECT SUM(amount) as total FROM expenses'))?.total || 0;
-    const distinctCategories = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(DISTINCT category) as count FROM expenses'))?.count || 0;
-    const minExpenseRecord = await db.getFirstAsync<{ min: number; currency: string }>(
-      'SELECT amount as min, currency FROM expenses ORDER BY amount ASC LIMIT 1'
-    );
-    const minExpense = minExpenseRecord?.min || 0;
-    const noteCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note IS NOT NULL AND note != ''"))?.count || 0;
+    const minExpense = totals.min_amount || 0;
+    const earnedIds = new Set((await db.getAllAsync<{ id: string }>('SELECT id FROM achievements')).map(row => row.id));
 
-    const badgeDefs: { id: string; check: () => Promise<boolean> }[] = [
+    const badgeDefs: { id: string; check: () => boolean }[] = [
       // Existing
-      { id: 'first_step', check: async () => expenseCount >= 1 },
-      { id: 'eagle_eye', check: async () => scannedCount >= 1 },
-      { id: 'on_repeat', check: async () => recurringCount >= 1 },
-      { id: 'paper_trail', check: async () => exportCount >= 1 },
-      { id: 'detail_devil', check: async () => detailCount >= 1 },
-      { id: 'week_warrior', check: async () => streak >= 7 },
-      { id: 'month_master', check: async () => streak >= 30 },
+      { id: 'first_step', check: () => totals.expense_count >= 1 },
+      { id: 'eagle_eye', check: () => totals.scanned_count >= 1 },
+      { id: 'on_repeat', check: () => totals.recurring_count >= 1 },
+      { id: 'paper_trail', check: () => exportCount >= 1 },
+      { id: 'detail_devil', check: () => totals.detail_count >= 1 },
+      { id: 'week_warrior', check: () => streak >= 7 },
+      { id: 'month_master', check: () => streak >= 30 },
       // Expense Milestones
-      { id: 'getting-started', check: async () => expenseCount >= 5 },
-      { id: 'regular', check: async () => expenseCount >= 25 },
-      { id: 'century', check: async () => expenseCount >= 100 },
+      { id: 'getting-started', check: () => totals.expense_count >= 5 },
+      { id: 'regular', check: () => totals.expense_count >= 25 },
+      { id: 'century', check: () => totals.expense_count >= 100 },
       // Scan Milestones
-      { id: 'sneak-peek', check: async () => scannedCount >= 3 },
-      { id: 'shutterbug', check: async () => scannedCount >= 15 },
-      { id: 'scanner-king', check: async () => scannedCount >= 50 },
+      { id: 'sneak-peek', check: () => totals.scanned_count >= 3 },
+      { id: 'shutterbug', check: () => totals.scanned_count >= 15 },
+      { id: 'scanner-king', check: () => totals.scanned_count >= 50 },
       // Streak Extensions
-      { id: 'fortnight', check: async () => streak >= 14 },
-      { id: 'season', check: async () => streak >= 60 },
-      { id: 'half-year-hero', check: async () => streak >= 180 },
+      { id: 'fortnight', check: () => streak >= 14 },
+      { id: 'season', check: () => streak >= 60 },
+      { id: 'half-year-hero', check: () => streak >= 180 },
       // Category Exploration
-      { id: 'variety', check: async () => distinctCategories >= 3 },
-      { id: 'explorer', check: async () => distinctCategories >= 5 },
-      { id: 'completionist', check: async () => distinctCategories >= 8 },
+      { id: 'variety', check: () => totals.distinct_categories >= 3 },
+      { id: 'explorer', check: () => totals.distinct_categories >= 5 },
+      { id: 'completionist', check: () => totals.distinct_categories >= 8 },
       // Spending & Saving
-      { id: 'saver', check: async () => minExpense > 0 && minExpense <= ACHIEVEMENT_THRESHOLDS.saver },
-      { id: 'shopper', check: async () => totalSpent >= ACHIEVEMENT_THRESHOLDS.shopper },
-      { id: 'big-league', check: async () => totalSpent >= ACHIEVEMENT_THRESHOLDS.bigLeague },
+      { id: 'saver', check: () => minExpense > 0 && minExpense <= ACHIEVEMENT_THRESHOLDS.saver },
+      { id: 'shopper', check: () => totals.total_spent >= ACHIEVEMENT_THRESHOLDS.shopper },
+      { id: 'big-league', check: () => totals.total_spent >= ACHIEVEMENT_THRESHOLDS.bigLeague },
       // Recurring & Notes
-      { id: 'habit', check: async () => recurringCount >= 2 },
-      { id: 'loyalist', check: async () => recurringCount >= 5 },
-      { id: 'novelist', check: async () => noteCount >= 5 },
+      { id: 'habit', check: () => totals.recurring_count >= 2 },
+      { id: 'loyalist', check: () => totals.recurring_count >= 5 },
+      { id: 'novelist', check: () => totals.note_count >= 5 },
       // Budget
-      { id: 'on-track', check: async () => streak >= 7 },
-      { id: 'disciplined', check: async () => streak >= 30 },
+      { id: 'on-track', check: () => streak >= 7 },
+      { id: 'disciplined', check: () => streak >= 30 },
     ];
 
     const newBadges: string[] = [];
     for (const badge of badgeDefs) {
-      const already = await db.getFirstAsync<{ earned_at: number }>('SELECT earned_at FROM achievements WHERE id = ?', [badge.id]);
-      if (!already) {
-        const earned = await badge.check();
-        if (earned) {
-          await db.runAsync('INSERT INTO achievements (id, earned_at) VALUES (?, ?)', [badge.id, Date.now()]);
-          newBadges.push(badge.id);
-        }
-      }
+      if (earnedIds.has(badge.id)) continue;
+      if (!badge.check()) continue;
+      await db.runAsync('INSERT INTO achievements (id, earned_at) VALUES (?, ?)', [badge.id, Date.now()]);
+      newBadges.push(badge.id);
     }
+    if (newBadges.length > 0) markDataChanged('ledger');
 
     return newBadges;
   }
@@ -946,23 +1240,24 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     target: number;
   }[]> {
     const db = await this.getDb();
+    // One settings read for the pass, and the streak comes out of that snapshot rather
+    // than a second read of the settings table (BUG-09-11a). The streak is
+    // unconditional here, as it was before: the profile view shows streak progress even
+    // with no budget set.
     const allSettings = await this.getAllSettings();
-    const streak = await this.getStreak();
-
-    const expenseCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses'))?.count || 0;
-    const scannedCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM expenses WHERE scanned = 1'))?.count || 0;
-    const recurringCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM recurring_templates'))?.count || 0;
+    const streak = streakFromSettings(allSettings);
+    const totals = await this.readAchievementTotals(db);
+    const expenseCount = totals.expense_count;
+    const scannedCount = totals.scanned_count;
+    const recurringCount = totals.recurring_count;
     const exportCount = parseInt(allSettings.export_count) || 0;
-    const detailCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note != '' OR is_reimbursable = 1"))?.count || 0;
-    const totalSpent = (await db.getFirstAsync<{ total: number }>('SELECT SUM(amount) as total FROM expenses'))?.total || 0;
-    const distinctCategoriesCount = (await db.getFirstAsync<{ count: number }>('SELECT COUNT(DISTINCT category) as count FROM expenses'))?.count || 0;
-    const minExpenseRecord = await db.getFirstAsync<{ min: number; currency: string }>(
-      'SELECT amount as min, currency FROM expenses ORDER BY amount ASC LIMIT 1'
-    );
-    const minExpense = minExpenseRecord?.min || 0;
+    const detailCount = totals.detail_count;
+    const totalSpent = totals.total_spent;
+    const distinctCategoriesCount = totals.distinct_categories;
+    const minExpense = totals.min_amount || 0;
     const userCurrency = resolveCurrency(undefined, allSettings.currency);
-    const saverCurrency = resolveCurrency(minExpenseRecord?.currency, userCurrency);
-    const noteCount = (await db.getFirstAsync<{ count: number }>("SELECT COUNT(*) as count FROM expenses WHERE note IS NOT NULL AND note != ''"))?.count || 0;
+    const saverCurrency = resolveCurrency(totals.min_currency, userCurrency);
+    const noteCount = totals.note_count;
 
     const achievements = await db.getAllAsync<{ id: string; earned_at: number }>('SELECT * FROM achievements');
 
@@ -1011,8 +1306,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   async getStreak(): Promise<number> {
-    const allSettings = await this.getAllSettings();
-    return parseInt(allSettings.last_streak) || 0;
+    return streakFromSettings(await this.getAllSettings());
   }
 
   async incrementStreak(): Promise<number> {
@@ -1218,6 +1512,8 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       const media = await eraseOwnedMediaForScope(CLEAR_ALL_DATA_MEDIA_SCOPE, receiptImageUris);
       if (media.failed > 0) logger.warn('Some cleared receipt images could not be erased', 'clear_all_data_media_partial');
       await db.execAsync('COMMIT');
+      markDataChanged('ledger');
+      markDataChanged('notifications');
     } catch (error) {
       await db.execAsync('ROLLBACK');
       logger.error('Failed to clear transaction data', 'clear_all_data_failed');
@@ -1242,6 +1538,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     `);
     await Promise.all(SECRET_SETTING_KEYS.map(deleteSecret));
     await this.seedCategories();
+    markDataChanged('ledger');
+    markDataChanged('settings');
+    markDataChanged('notifications');
     // D9 / S-06R-01: reset is the widest boundary, so it also removes every media
     // file the app wrote: receipt images, profile avatars, and export CSVs.
     const media = await eraseOwnedMediaForScope(RESET_APP_MEDIA_SCOPE);

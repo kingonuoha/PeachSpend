@@ -1,6 +1,7 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo } from 'react';
 import {
-  ActivityIndicator,
+  AccessibilityInfo,
+  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -12,11 +13,12 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { BarChart3, Check, Sparkles, Star, X } from 'lucide-react-native';
 
-import { CategoryTints, Gradients, Radii, Spacing, Typography } from '../constants/tokens';
+import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { LuminousCard } from '../components/ui/LuminousCard';
 import { ScalePressable } from '../components/ui/ScalePressable';
+import { Skeleton } from '../components/ui/Skeleton';
 import { PeachButton } from '../components/ui/PeachButton';
 import { CategoryGlyph } from '../components/capture/CategoryGlyph';
 import { useSpendingRecap } from '../hooks/useSpendingRecap';
@@ -53,6 +55,21 @@ function parseCadence(value: string | string[] | undefined): SpendingRecapCadenc
   const raw = Array.isArray(value) ? value[0] : value;
   return raw === 'monthly' ? 'monthly' : 'weekly';
 }
+
+// One source for the three non-ready read states, so the rendered card and the
+// screen-reader announcement can never drift apart (POLISH Section 7).
+const EMPTY_STATE_COPY = {
+  title: 'Nothing to recap yet',
+  message: 'Log a few expenses and your recap will show up here.',
+} as const;
+const OFFLINE_STATE_COPY = {
+  title: 'Could not reach your data',
+  message: 'We could not build this recap right now. Try again in a moment.',
+} as const;
+const FAILURE_STATE_COPY = {
+  title: 'Recap unavailable',
+  message: 'Something went wrong building this recap.',
+} as const;
 
 function formatPeriodLabel(cadence: SpendingRecapCadence, period: HomePeriod): string {
   const start = new Date(period.start);
@@ -158,6 +175,91 @@ function RecapSeriesChart({
   );
 }
 
+// Loading body (POLISH Section 6: no bare spinner where a skeleton fits, and
+// Section 10 lists this screen's ActivityIndicator as a gap). It mirrors only
+// the sections that render on every ready load: the hero narrative card, the
+// affirming gradient block and the dismiss row, sharing the loaded screen's
+// `scrollContent` wrap so the placeholder cannot drift from the layout it
+// replaces. The category and chart cards are conditional on the snapshot (they
+// hide when the period has no category or fewer than two populated buckets), so
+// reserving space for them would shift content the other way on those loads;
+// that matches the accepted Home skeleton convention in POLISH Section 13.
+// Every block height is the token line height of the real content it stands in
+// for, and decorative blocks stay hidden from assistive tech while the container
+// exposes one busy label, matching the Home/Profile skeleton convention.
+function RecapSkeleton() {
+  const ts = useThemeStyles();
+  const insets = useSafeAreaInsets();
+  // White at 15%, the existing hero glass convention from the Home skeleton, so
+  // placeholder blocks read as glass over the gradient instead of flat grey.
+  const onGradient = { backgroundColor: `${Colors.white}26` };
+
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading your recap"
+      accessibilityState={{ busy: true }}
+      style={[styles.root, { backgroundColor: ts.bg.screen }]}
+    >
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={[styles.scrollContent, { paddingBottom: Spacing.s7 + insets.bottom }]}
+      >
+        {/* Hero narrative card */}
+        <LuminousCard variant="high" style={styles.heroCard}>
+          <View style={styles.eyebrowRow}>
+            <View style={styles.eyebrowLeft}>
+              <Skeleton width={13} height={13} />
+              <Skeleton width={112} height={13} />
+            </View>
+            <Skeleton width={56} height={13} />
+          </View>
+          <Skeleton width="78%" height={26} />
+          <Skeleton width="96%" height={20} style={{ marginTop: Spacing.s2 }} />
+          <Skeleton width="64%" height={20} />
+          <View style={[styles.kpiRow, { borderTopColor: ts.raw.outline }]}>
+            <View style={[styles.kpiPill, { backgroundColor: ts.bg.low }]}>
+              <Skeleton width="70%" height={13} />
+              <Skeleton width="82%" height={20} style={styles.kpiValue} />
+              <Skeleton width="58%" height={13} />
+            </View>
+            <View style={[styles.kpiPill, { backgroundColor: ts.bg.low }]}>
+              <Skeleton width="70%" height={13} />
+              <Skeleton width="82%" height={20} style={styles.kpiValue} />
+              <Skeleton width="58%" height={13} />
+            </View>
+          </View>
+        </LuminousCard>
+
+        {/* Affirming, forward-looking close */}
+        <LinearGradient
+          colors={ts.isDark ? Gradients.dark : Gradients.light}
+          locations={GRADIENT_LOCATIONS}
+          start={GRADIENT_START}
+          end={GRADIENT_END}
+          style={styles.affirmCard}
+        >
+          <View style={styles.affirmRow}>
+            <Skeleton width={40} height={40} borderRadius={Radii.md} style={onGradient} />
+            <View style={styles.affirmText}>
+              <Skeleton width={96} height={13} style={onGradient} />
+              <Skeleton width="92%" height={22} style={[onGradient, { marginTop: Spacing.s1 }]} />
+              <Skeleton width="70%" height={20} style={[onGradient, { marginTop: Spacing.s1 }]} />
+            </View>
+          </View>
+        </LinearGradient>
+
+        {/* Single immediate dismiss */}
+        <View style={styles.dismissWrap}>
+          <Skeleton width="100%" height={52} borderRadius={Radii.full} />
+          <Skeleton width="62%" height={13} style={{ marginTop: Spacing.s2, alignSelf: 'center' }} />
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
+
 export default function SpendingRecapScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
@@ -248,6 +350,23 @@ export default function SpendingRecapScreen() {
     return ts.raw.onSurfaceVariant;
   }, [snapshot, ts.raw.statusSuccessText, ts.raw.primary, ts.raw.onSurfaceVariant]);
 
+  // POLISH Section 7: the recap read is async, so a resolved offline or failure
+  // state is spoken, not only rendered. iOS has no live region, so it speaks
+  // through announceForAccessibility; Android reads the polite live region on
+  // the state card title rendered below. The `refreshing` guard makes a retry
+  // re-announce its outcome and skips the stale error while the retry is still
+  // in flight. 'empty' is a normal resting state, not a failure, so it is
+  // announced only through that live region.
+  const readState = read?.state ?? null;
+  useEffect(() => {
+    if (Platform.OS !== 'ios' || refreshing) return;
+    if (readState === 'offline') {
+      AccessibilityInfo.announceForAccessibility(OFFLINE_STATE_COPY.title);
+    } else if (readState === 'failure') {
+      AccessibilityInfo.announceForAccessibility(FAILURE_STATE_COPY.title);
+    }
+  }, [readState, refreshing]);
+
   const periodLabel = view?.periodLabel ?? null;
 
   const header = (
@@ -291,29 +410,18 @@ export default function SpendingRecapScreen() {
     return (
       <View style={[styles.root, { backgroundColor: ts.bg.screen }]}>
         {header}
-        <View style={styles.loading}>
-          <ActivityIndicator color={ts.raw.primary} />
-        </View>
+        <RecapSkeleton />
       </View>
     );
   }
 
   if (!snapshot || !view) {
-    const stateCopy = read?.state === 'empty'
-      ? {
-          title: 'Nothing to recap yet',
-          message: 'Log a few expenses and your recap will show up here.',
-        }
-      : read?.state === 'offline'
-        ? {
-            title: 'Could not reach your data',
-            message: 'We could not build this recap right now. Try again in a moment.',
-          }
-        : {
-            title: 'Recap unavailable',
-            message: 'Something went wrong building this recap.',
-          };
-    const showRetry = read?.state === 'offline' || read?.state === 'failure';
+    const stateCopy = readState === 'empty'
+      ? EMPTY_STATE_COPY
+      : readState === 'offline'
+        ? OFFLINE_STATE_COPY
+        : FAILURE_STATE_COPY;
+    const showRetry = readState === 'offline' || readState === 'failure';
     return (
       <View style={[styles.root, { backgroundColor: ts.bg.screen }]}>
         {header}
@@ -325,7 +433,11 @@ export default function SpendingRecapScreen() {
           showsVerticalScrollIndicator={false}
         >
           <LuminousCard variant="high" style={styles.stateCard}>
-            <Text accessibilityRole="header" style={[Typography.headlineMd, { color: ts.raw.onSurface }]}>
+            <Text
+              accessibilityRole="header"
+              accessibilityLiveRegion="polite"
+              style={[Typography.headlineMd, { color: ts.raw.onSurface }]}
+            >
               {stateCopy.title}
             </Text>
             <Text style={[Typography.bodyRegular, styles.stateMessage, { color: ts.raw.onSurfaceVariant }]}>
@@ -598,11 +710,6 @@ const styles = StyleSheet.create({
   uppercase: {
     textTransform: 'uppercase',
     letterSpacing: 0.6,
-  },
-  loading: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
   scrollContent: {
     paddingHorizontal: Spacing.s5,

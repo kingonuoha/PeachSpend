@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
   Pressable,
   RefreshControl,
@@ -26,6 +26,8 @@ import {
 
 import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
+import { useTokenReload } from '../../hooks/useDataFreshness';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { PeachButton } from '../../components/ui/PeachButton';
@@ -35,9 +37,10 @@ import StreakSplash, { selectNextStreakBadge } from '../../components/ui/StreakS
 import { BadgeDetailModal } from '../../components/ui/BadgeDetailModal';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
 import { homeDataService } from '../../data/homeDataRepository';
+import { parseStoredBudget } from '../../data/SettingsContracts';
 import { databaseService } from '../../services/DatabaseService';
 import { profileDataService } from '../../services/DataServices';
-import { formatAmount } from '../../utils/format';
+import { formatCurrency } from '../../utils/currency';
 import { formatRelativeDateWithTime } from '../../utils/dateFormat';
 import type { Expense } from '../../types/database';
 import type { HomeSnapshot } from '../../data/HomeContracts';
@@ -46,6 +49,11 @@ import type { AchievementState } from '../../data/ProfileContracts';
 const MASK = '••••••';
 const MAX_CATEGORIES = 4;
 const RECENT_LIMIT = 5;
+
+// BUG-09-11b. Home reads expenses, income, the unread notification count and the
+// settings that decide its currency and visibility, so a write to any of those is
+// a real invalidation of its snapshot. Nothing else asks it to re-read.
+const HOME_FRESHNESS_DOMAINS = ['ledger', 'settings', 'notifications'] as const;
 
 interface CategoryInfo {
   title: string;
@@ -80,8 +88,9 @@ export default function HomeScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
+  const bottomClearance = useBottomClearance();
   const toast = useToast();
-  const { settings, currency, getCurrencySymbol, convertAmount, updateSetting } = useSettings();
+  const { settings, currency, convertAmount, updateSetting } = useSettings();
 
   const [load, setLoad] = useState<HomeLoad | null>(null);
   const [loading, setLoading] = useState(true);
@@ -91,10 +100,14 @@ export default function HomeScreen() {
   const [selectedBadge, setSelectedBadge] = useState<AchievementState | null>(null);
 
   // Income total and every other hero value come from the single typed snapshot.
-  // The screen no longer issues a separate income query.
+  // The screen no longer issues a separate income query. The category dictionary
+  // is independent of the snapshot, so both reads are issued together rather than
+  // one after the other: one round trip wave instead of two.
   const fetchHome = useCallback(async (): Promise<HomeLoad> => {
-    const snapshot = await homeDataService.getSnapshot();
-    const list = await databaseService.getCategories();
+    const [snapshot, list] = await Promise.all([
+      homeDataService.getSnapshot(),
+      databaseService.getCategories(),
+    ]);
     const categories: Record<string, CategoryInfo> = {};
     for (const category of list) {
       categories[category.id] = { title: category.title, icon_name: category.icon_name };
@@ -107,20 +120,20 @@ export default function HomeScreen() {
     setRefreshError(next.snapshot.state === 'offline' || next.snapshot.state === 'failure');
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      try {
-        const next = await fetchHome();
-        if (active) applyLoad(next);
-      } finally {
-        if (active) setLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-    };
+  // One read path for the screen: on first mount, and again only when local data
+  // changed. It is not re-run by a focus event, a tab switch or a re-render, which
+  // is what the earlier mount effect did on every navigation back to Home.
+  const reload = useCallback(async () => {
+    try {
+      applyLoad(await fetchHome());
+    } catch {
+      setRefreshError(true);
+    } finally {
+      setLoading(false);
+    }
   }, [fetchHome, applyLoad]);
+
+  useTokenReload(HOME_FRESHNESS_DOMAINS, reload);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -140,15 +153,14 @@ export default function HomeScreen() {
 
   const snapshot = load?.snapshot;
   const visible = settings.prices_visible !== 'false';
-  const symbol = getCurrencySymbol();
   const currencyCode = snapshot?.hero.currency ?? currency;
   const spend = snapshot?.hero.totalSpent ?? 0;
   const incomeTotal = snapshot?.hero.incomeTotal ?? 0;
 
   const budget = useMemo(() => {
-    const raw = parseFloat(settings.monthly_budget) || 0;
-    if (raw <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
-    const cap = convertAmount(raw, settings.budget_currency || currency).amount;
+    const limit = parseStoredBudget(settings.monthly_budget);
+    if (limit <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
+    const cap = convertAmount(limit, settings.budget_currency || currency).amount;
     if (cap <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
     const progress = spend / cap;
     const state = progress > 1 ? 'over' as const : progress >= 0.8 ? 'near' as const : 'on' as const;
@@ -161,11 +173,13 @@ export default function HomeScreen() {
   const streakDays = snapshot?.streak.days ?? 0;
   const unread = snapshot?.unreadNotificationCount ?? 0;
 
-  const recent = snapshot?.recentTransactions ?? [];
-  const visibleRecent = recent.slice(0, RECENT_LIMIT);
-  const categories = (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES);
+  // Derived slices are memoized on the snapshot they come from: without this they
+  // were rebuilt on every render, so each row received a new array identity.
+  const recent = useMemo(() => snapshot?.recentTransactions ?? [], [snapshot]);
+  const visibleRecent = useMemo(() => recent.slice(0, RECENT_LIMIT), [recent]);
+  const categories = useMemo(() => (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES), [snapshot]);
 
-  const money = useCallback((value: number) => `${symbol}${formatAmount(value)}`, [symbol]);
+  const money = useCallback((value: number) => formatCurrency(value, currencyCode), [currencyCode]);
 
   const toggleVisibility = useCallback(() => {
     const next = visible ? 'false' : 'true';
@@ -205,7 +219,7 @@ export default function HomeScreen() {
     <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: 90 + insets.bottom + Spacing.s6 }}
+        contentContainerStyle={{ paddingBottom: bottomClearance + Spacing.s6 }}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -466,7 +480,6 @@ export default function HomeScreen() {
                   expense={expense}
                   info={load?.categories[expense.category]}
                   visible={visible}
-                  symbol={symbol}
                   onPress={() => router.push({
                     pathname: '/expense/[id]',
                     params: { id: expense.id, origin: 'home', ids: visibleRecent.map(item => item.id).join(',') },
@@ -532,6 +545,7 @@ const SKELETON_RECENT_COUNT = 4;
 function HomeSkeleton() {
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
+  const bottomClearance = useBottomClearance();
   const heroTint = { backgroundColor: HERO_PLACEHOLDER };
 
   return (
@@ -544,7 +558,7 @@ function HomeSkeleton() {
     >
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: 90 + insets.bottom + Spacing.s6 }}
+        contentContainerStyle={{ paddingBottom: bottomClearance + Spacing.s6 }}
       >
         <LinearGradient
           colors={ts.isDark ? Gradients.dark : Gradients.light}
@@ -648,13 +662,11 @@ function TransactionRow({
   expense,
   info,
   visible,
-  symbol,
   onPress,
 }: {
   expense: Expense;
   info?: CategoryInfo;
   visible: boolean;
-  symbol: string;
   onPress: () => void;
 }) {
   const ts = useThemeStyles();
@@ -691,7 +703,7 @@ function TransactionRow({
         </View>
       </View>
       <Text style={[styles.transactionAmount, { color: ts.raw.onSurface }]} numberOfLines={1}>
-        {visible ? `-${symbol}${formatAmount(converted)}` : MASK}
+        {visible ? `-${formatCurrency(converted, currency)}` : MASK}
       </Text>
     </ScalePressable>
   );

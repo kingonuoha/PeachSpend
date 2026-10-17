@@ -18,6 +18,7 @@ import { Expense } from '../../types/database';
 import { ExpenseItem } from '../expense/ExpenseItem';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Colors } from '../../constants/tokens';
+import { formatCompactCurrency, formatMoneyNumber, getCurrencyPrefix } from '../../utils/currency';
 import { ChevronLeft, ChevronRight, X } from 'lucide-react-native';
 
 interface DayData {
@@ -28,7 +29,6 @@ interface DayData {
 
 interface ExpenseCalendarProps {
   expenses: Expense[];
-  currencySymbol: string;
   currency: string;
   pricesVisible: boolean;
   convertAmount: (amount: number, currency: string) => { amount: number };
@@ -39,7 +39,6 @@ const CELL_WIDTH = '14.28%';
 
 export const ExpenseCalendar: React.FC<ExpenseCalendarProps> = ({
   expenses,
-  currencySymbol,
   currency,
   pricesVisible,
   convertAmount,
@@ -190,7 +189,7 @@ export const ExpenseCalendar: React.FC<ExpenseCalendarProps> = ({
                   </Text>
                   {data && pricesVisible && (
                     <Text style={{ color: styles.text.onSurface }} className="font-manrope-bold text-[8px] mt-0.5" numberOfLines={1}>
-                      {currencySymbol}{Math.round(data.total)}
+                      {formatCompactCurrency(data.total, currency)}
                     </Text>
                   )}
                   {data && !pricesVisible && (
@@ -234,9 +233,9 @@ export const ExpenseCalendar: React.FC<ExpenseCalendarProps> = ({
 
             {selectedDayData && (
               <View className="mb-4 flex-row items-baseline">
-                <Text className="text-primary font-noto-serif-bold text-xs">{currencySymbol}</Text>
+                <Text className="text-primary font-noto-serif-bold text-xs">{getCurrencyPrefix(currency)}</Text>
                 <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-3xl tracking-tighter">
-                  {selectedDayData.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  {formatMoneyNumber(selectedDayData.total)}
                 </Text>
                 <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-medium text-xs ml-2">
                   {selectedDayData.count} {selectedDayData.count === 1 ? 'transaction' : 'transactions'}

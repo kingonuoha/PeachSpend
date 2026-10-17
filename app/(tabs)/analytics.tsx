@@ -1,9 +1,10 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
+  FlatList,
   Modal,
   Pressable,
   RefreshControl,
-  ScrollView,
   StyleSheet,
   Text,
   View,
@@ -26,11 +27,11 @@ import {
 
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { PeachButton } from '../../components/ui/PeachButton';
-import { Skeleton } from '../../components/ui/Skeleton';
 import { SearchFilterBar } from '../../components/ui/SearchFilterBar';
 import { DateRangePicker } from '../../components/ui/DateRangePicker';
 import { SpendingDonut } from '../../components/analytics/SpendingDonut';
@@ -39,16 +40,22 @@ import { ExpenseItem } from '../../components/expense/ExpenseItem';
 import { INSIGHT_SORT_OPTIONS, useInsights, type InsightSortKey } from '../../hooks/useInsights';
 import type { InsightTimeframe } from '../../data/InsightContracts';
 import type { Expense } from '../../types/database';
-import { formatCurrency, getCurrencyPrefix } from '../../utils/currency';
+import { formatCurrency } from '../../utils/currency';
 
 const GRADIENT_START = { x: 0.33, y: 0 };
 const GRADIENT_END = { x: 0.67, y: 1 };
+
+// Cashflow summary card decoration. Both cards sit on a saturated fill, so the
+// overlay, the watermark arrow and the label are all white at fixed alpha. These
+// are decorative and carry no data, so they are not theme tokens.
+const CARD_BLOB = 'rgba(255,255,255,0.08)';
+const CARD_WATERMARK = 'rgba(255,255,255,0.13)';
+const CARD_LABEL = 'rgba(255,255,255,0.72)';
+// Watermark arrow size and the blob diameter, as fractions of the square card.
+const CARD_WATERMARK_SIZE = 96;
+const CARD_BLOB_SIZE = 150;
 const GRADIENT_LOCATIONS: [number, number, number] = [0, 0.45, 1];
 const DONUT_SIZE = 112;
-// White at 15 percent, the existing hero and narrative glass convention. Skeleton
-// blocks over the deep purple gradient cards use this tint instead of the neutral
-// surface fill, which would be invisible on the dark gradient.
-const GLASS_PLACEHOLDER = `${Colors.white}26`;
 
 const TIMEFRAMES: { key: InsightTimeframe; label: string }[] = [
   { key: 'week', label: 'Week' },
@@ -82,6 +89,7 @@ export default function AnalyticsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
+  const bottomClearance = useBottomClearance();
   const { settings, currency: settingsCurrency } = useSettings();
   const params = useLocalSearchParams<{ category?: string }>();
 
@@ -123,7 +131,6 @@ export default function AnalyticsScreen() {
 
   const pricesVisible = settings.prices_visible !== 'false';
   const currency = snapshot?.currency ?? settingsCurrency;
-  const currencySymbol = getCurrencyPrefix(currency);
   const activeSort = INSIGHT_SORT_OPTIONS.find(option => option.key === sortKey) ?? INSIGHT_SORT_OPTIONS[0];
 
   const periodExpenses = useMemo(() => {
@@ -179,6 +186,28 @@ export default function AnalyticsScreen() {
     ? categoryMeta[categoryFilter]?.title ?? categoryFilter
     : null;
 
+  // The detail pager receives the visible order of the list it was opened from, so
+  // the list and the pager agree about swiping. Built once per change to the
+  // visible list rather than once per row: the previous per-row rebuild handed
+  // every row a brand new array, which defeated ExpenseItem's React.memo and made
+  // the render cost grow with the square of the list length.
+  const detailOrderIds = useMemo(() => visibleExpenses.map(expense => expense.id), [visibleExpenses]);
+
+  // One row renderer for the virtualized list. It carries no layout of its own:
+  // ExpenseItem owns its card, its margin and its press behaviour, exactly as it
+  // did when this list was a ScrollView child.
+  const renderExpenseRow = useCallback(
+    ({ item }: { item: Expense }) => (
+      <ExpenseItem
+        expense={item}
+        searchQuery={searchQuery}
+        detailOrigin="insights"
+        detailOrderIds={detailOrderIds}
+      />
+    ),
+    [searchQuery, detailOrderIds],
+  );
+
   const onSelectTimeframe = useCallback((timeframe: InsightTimeframe) => {
     if (timeframe === 'custom') {
       setDatePickerVisible(true);
@@ -202,158 +231,10 @@ export default function AnalyticsScreen() {
     router.push({ pathname: '/spending-recap', params: { origin: 'insights' } } as never);
   }, [router]);
 
-  // Rendered above the scroll content in both the loaded and loading states so the
-  // header never shifts when the ledger resolves.
-  const header = (
-    <View
-      style={[
-        styles.header,
-        { paddingTop: insets.top + Spacing.s1, borderBottomColor: ts.raw.outline, backgroundColor: ts.bg.screen },
-      ]}
-    >
-      <View style={styles.headerInner}>
-        <View style={styles.headerLeft}>
-          <Text style={[styles.headerEyebrow, { color: ts.raw.primary }]}>PeachSpend</Text>
-          <Text accessibilityRole="header" style={[styles.headerTitle, { color: ts.raw.onSurface }]}>Insights</Text>
-        </View>
-        <ScalePressable
-          accessibilityRole="button"
-          accessibilityLabel="Open Spending Recap"
-          onPress={openRecap}
-          style={styles.recapButton}
-        >
-          <LinearGradient
-            colors={ts.isDark ? Gradients.dark : Gradients.light}
-            locations={GRADIENT_LOCATIONS}
-            start={GRADIENT_START}
-            end={GRADIENT_END}
-            style={StyleSheet.absoluteFill}
-          />
-          <Zap size={14} color={Colors.white} />
-          <Text style={styles.recapLabel} numberOfLines={1}>Spending Recap</Text>
-        </ScalePressable>
-      </View>
-    </View>
-  );
-
   if (loading && !snapshot) {
-    // Placeholder mirrors the loaded Insights scroll (timeframe bar, narrative
-    // gradient card, cashflow and category cards) using the real card styles and
-    // tokens, so content arrives with no layout shift. The header renders above
-    // unchanged. Decorative blocks stay hidden from assistive tech; the content
-    // wrapper exposes one busy label.
-    const glassTint = { backgroundColor: GLASS_PLACEHOLDER };
     return (
-      <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
-        {header}
-        <ScrollView
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={{
-            paddingHorizontal: Spacing.s5,
-            paddingTop: Spacing.s3,
-            paddingBottom: 100 + insets.bottom,
-            alignSelf: 'center',
-            width: '100%',
-            maxWidth: 640,
-          }}
-        >
-          <View
-            accessible
-            accessibilityRole="progressbar"
-            accessibilityLabel="Loading insights"
-            accessibilityState={{ busy: true }}
-          >
-            {/* Timeframe segmented bar (FR-03.5) */}
-            <View style={[styles.timeframeBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
-              {TIMEFRAMES.map(timeframe => (
-                <View key={timeframe.key} style={styles.timeframeSegment}>
-                  <Skeleton width={40} height={12} />
-                </View>
-              ))}
-            </View>
-
-            {/* Narrative gradient card (FR-03.1) */}
-            <LinearGradient
-              colors={ts.isDark ? Gradients.dark : Gradients.light}
-              locations={GRADIENT_LOCATIONS}
-              start={GRADIENT_START}
-              end={GRADIENT_END}
-              style={styles.narrative}
-            >
-              <View pointerEvents="none" style={styles.narrativeBlob} />
-              <View style={styles.narrativeHeader}>
-                <Skeleton width={112} height={11} style={glassTint} />
-                <Skeleton width={64} height={18} borderRadius={Radii.full} style={glassTint} />
-              </View>
-              <Skeleton width="92%" height={16} style={glassTint} />
-              <Skeleton width="70%" height={12} style={[glassTint, styles.skeletonStackTight]} />
-              <View style={styles.narrativeFooter}>
-                <Skeleton width={120} height={11} style={glassTint} />
-                <Skeleton width={90} height={11} style={glassTint} />
-              </View>
-            </LinearGradient>
-
-            {/* Income vs Expense (FR-03.4) */}
-            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-              <View style={styles.cashflowHeader}>
-                <View style={[styles.skeletonStack, { flexShrink: 1, minWidth: 0 }]}>
-                  <Skeleton width={96} height={11} />
-                  <Skeleton width={128} height={14} />
-                </View>
-                <Skeleton width={88} height={22} borderRadius={Radii.full} />
-              </View>
-              <View style={styles.cashflowCards}>
-                <View style={[styles.cashflowCard, styles.cashflowCardIncome, { backgroundColor: ts.isDark ? ts.raw.surfaceContainerLowest : Colors.black }]}>
-                  <Skeleton width={52} height={11} style={glassTint} />
-                  <Skeleton width={92} height={18} style={[glassTint, styles.skeletonStackTight]} />
-                  <Skeleton width={80} height={10} style={[glassTint, styles.skeletonStackTight]} />
-                </View>
-                <LinearGradient
-                  colors={[ts.raw.primary, ts.raw.primaryContainer]}
-                  start={GRADIENT_START}
-                  end={GRADIENT_END}
-                  style={[styles.cashflowCard, { borderColor: ts.raw.primaryBorder + '4D' }]}
-                >
-                  <Skeleton width={52} height={11} style={glassTint} />
-                  <Skeleton width={92} height={18} style={[glassTint, styles.skeletonStackTight]} />
-                  <Skeleton width={80} height={10} style={[glassTint, styles.skeletonStackTight]} />
-                </LinearGradient>
-              </View>
-              <View style={styles.cashflowTrackRow}>
-                <Skeleton width="100%" height={10} borderRadius={Radii.full} />
-                <View style={styles.cashflowTrackLabels}>
-                  <Skeleton width={64} height={10} />
-                  <Skeleton width={110} height={10} />
-                </View>
-              </View>
-            </LuminousCard>
-
-            {/* Donut and category share (FR-03.3) */}
-            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-              <View style={styles.sectionHeaderRow}>
-                <View style={[styles.skeletonStack, { flexShrink: 1, minWidth: 0 }]}>
-                  <Skeleton width={84} height={11} />
-                  <Skeleton width={120} height={14} />
-                </View>
-                <Skeleton width={72} height={11} />
-              </View>
-              <View style={styles.shareRow}>
-                <Skeleton width={DONUT_SIZE} height={DONUT_SIZE} borderRadius={Radii.full} />
-                <View style={styles.shareLegend}>
-                  {Array.from({ length: 4 }).map((_, index) => (
-                    <View key={index} style={styles.skeletonLegendRow}>
-                      <View style={styles.skeletonLegendLeft}>
-                        <Skeleton width={10} height={10} borderRadius={Radii.full} />
-                        <Skeleton width={72} height={12} />
-                      </View>
-                      <Skeleton width={52} height={12} />
-                    </View>
-                  ))}
-                </View>
-              </View>
-            </LuminousCard>
-          </View>
-        </ScrollView>
+      <View style={[styles.loading, { backgroundColor: ts.bg.screen, paddingTop: insets.top }]}>
+        <ActivityIndicator color={ts.raw.primary} />
       </View>
     );
   }
@@ -368,14 +249,48 @@ export default function AnalyticsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
-      {header}
+      <View
+        style={[
+          styles.header,
+          { paddingTop: insets.top + Spacing.s1, borderBottomColor: ts.raw.outline, backgroundColor: ts.bg.screen },
+        ]}
+      >
+        <View style={styles.headerInner}>
+          <View style={styles.headerLeft}>
+            <Text style={[styles.headerEyebrow, { color: ts.raw.primary }]}>PeachSpend</Text>
+            <Text accessibilityRole="header" style={[styles.headerTitle, { color: ts.raw.onSurface }]}>Insights</Text>
+          </View>
+          <ScalePressable
+            accessibilityRole="button"
+            accessibilityLabel="Open Spending Recap"
+            onPress={openRecap}
+            style={styles.recapButton}
+          >
+            <LinearGradient
+              colors={ts.isDark ? Gradients.dark : Gradients.light}
+              locations={GRADIENT_LOCATIONS}
+              start={GRADIENT_START}
+              end={GRADIENT_END}
+              style={StyleSheet.absoluteFill}
+            />
+            <Zap size={14} color={Colors.white} />
+            <Text style={styles.recapLabel} numberOfLines={1}>Spending Recap</Text>
+          </ScalePressable>
+        </View>
+      </View>
 
-      <ScrollView
+      {/* BUG-09-11b. The transaction history can grow without bound, so it is a
+          virtualized list rather than a ScrollView that built every row up front.
+          Its header is the unchanged Insights content above the list, so the
+          screen's structure, spacing and copy are identical; only the rows below
+          the fold stop being rendered. */}
+      <FlatList
+        style={{ flex: 1 }}
         showsVerticalScrollIndicator={false}
         contentContainerStyle={{
           paddingHorizontal: Spacing.s5,
           paddingTop: Spacing.s3,
-          paddingBottom: 100 + insets.bottom,
+          paddingBottom: bottomClearance,
           alignSelf: 'center',
           width: '100%',
           maxWidth: 640,
@@ -383,7 +298,11 @@ export default function AnalyticsScreen() {
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={retry} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
         }
-      >
+        data={visibleExpenses}
+        keyExtractor={expense => expense.id}
+        renderItem={renderExpenseRow}
+        ListHeaderComponent={
+          <>
         {/* Timeframe selector (FR-03.5) */}
         <View style={[styles.timeframeBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
           {TIMEFRAMES.map(timeframe => {
@@ -520,7 +439,7 @@ export default function AnalyticsScreen() {
               </ScalePressable>
             </View>
             <View style={styles.digestBody}>
-              {digest.status === 'generating' ? <Skeleton width="60%" height={12} /> : null}
+              {digest.status === 'generating' ? <ActivityIndicator size="small" color={ts.raw.primary} /> : null}
               <Text style={[styles.digestText, { color: ts.raw.onSurface }]}>
                 {digest.status === 'available' && digest.text ? digest.text : digest.localText}
               </Text>
@@ -563,24 +482,39 @@ export default function AnalyticsScreen() {
             </View>
           </View>
 
+          {/*
+            Income and Expense summary cards, restyled to the owner-supplied
+            reference: white badge circle top-left, oversized watermark arrow
+            bleeding off the right, soft blob behind it, label and amount pinned
+            to the bottom-left. This departs from the locked S-03 pair
+            (peachspend_insights_analytics_s_03_interactive_prototype_spec/
+            code.html lines 226-244), which puts the icon badge in a header row
+            on the right and carries a sub-label under the amount. The sub-label
+            is dropped here; the Spent / Surplus track below still carries the
+            ratio, so no data leaves the screen.
+          */}
           <View style={styles.cashflowCards}>
             <View
               style={[
                 styles.cashflowCard,
-                styles.cashflowCardIncome,
-                { backgroundColor: ts.isDark ? ts.raw.surfaceContainerLowest : Colors.black },
+                { backgroundColor: ts.raw.purple900, borderColor: CARD_WATERMARK },
               ]}
             >
-              <View style={styles.cashflowCardHeader}>
-                <Text style={styles.cashflowLabelOnDark}>Income</Text>
-                <View style={[styles.cashflowIcon, styles.cashflowIconOnDark]}>
-                  <ArrowDown size={12} color={Colors.white} />
+              <View pointerEvents="none" style={styles.cashflowDecor}>
+                <View style={[styles.cashflowBlob, { backgroundColor: CARD_BLOB }]} />
+                <View style={styles.cashflowWatermark}>
+                  <ArrowDown size={CARD_WATERMARK_SIZE} color={CARD_WATERMARK} strokeWidth={2.4} />
                 </View>
               </View>
-              <Text style={styles.cashflowAmountLight} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-                {pricesVisible ? formatCurrency(snapshot?.totalIncome ?? 0, currency) : '••••'}
-              </Text>
-              <Text style={styles.cashflowSubOnDark} numberOfLines={1}>Earned this period</Text>
+              <View style={[styles.cashflowBadge, { backgroundColor: Colors.white }]}>
+                <ArrowDown size={14} color={ts.raw.purple900} strokeWidth={2.8} />
+              </View>
+              <View style={styles.cashflowFooter}>
+                <Text style={styles.cashflowLabel}>Income</Text>
+                <Text style={styles.cashflowAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
+                  {pricesVisible ? formatCurrency(snapshot?.totalIncome ?? 0, currency) : '••••'}
+                </Text>
+              </View>
             </View>
 
             <LinearGradient
@@ -589,20 +523,21 @@ export default function AnalyticsScreen() {
               end={GRADIENT_END}
               style={[styles.cashflowCard, { borderColor: ts.raw.primaryBorder + '4D' }]}
             >
-              <View style={styles.cashflowCardHeader}>
-                <Text style={styles.cashflowLabelLight}>Expenses</Text>
-                <View style={styles.cashflowIconLight}>
-                  <ArrowUp size={12} color={Colors.white} />
+              <View pointerEvents="none" style={styles.cashflowDecor}>
+                <View style={[styles.cashflowBlob, { backgroundColor: CARD_BLOB }]} />
+                <View style={styles.cashflowWatermark}>
+                  <ArrowUp size={CARD_WATERMARK_SIZE} color={CARD_WATERMARK} strokeWidth={2.4} />
                 </View>
               </View>
-              <Text style={styles.cashflowAmountLight} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-                {pricesVisible ? formatCurrency(snapshot?.totalSpent ?? 0, currency) : '••••'}
-              </Text>
-              <Text style={styles.cashflowSubLight} numberOfLines={1}>
-                {snapshot && snapshot.totalIncome > 0
-                  ? `${Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)}% of total inflow`
-                  : 'No inflow recorded'}
-              </Text>
+              <View style={[styles.cashflowBadge, { backgroundColor: Colors.white }]}>
+                <ArrowUp size={14} color={ts.raw.primary} strokeWidth={2.8} />
+              </View>
+              <View style={styles.cashflowFooter}>
+                <Text style={styles.cashflowLabel}>Expenses</Text>
+                <Text style={styles.cashflowAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
+                  {pricesVisible ? formatCurrency(snapshot?.totalSpent ?? 0, currency) : '••••'}
+                </Text>
+              </View>
             </LinearGradient>
           </View>
 
@@ -646,7 +581,7 @@ export default function AnalyticsScreen() {
               total={snapshot?.totalSpent ?? 0}
               distribution={distribution}
               pricesVisible={pricesVisible}
-              currencySymbol={currencySymbol}
+              currency={currency}
               centerTopLabel={topCategory ? 'Top' : 'No data'}
               centerLabel={topCategory?.label ?? '--'}
               centerValue={topCategory ? `${topCategory.percentage.toFixed(0)}%` : ''}
@@ -657,7 +592,7 @@ export default function AnalyticsScreen() {
                 variant="compact"
                 distribution={distribution}
                 pricesVisible={pricesVisible}
-                currencySymbol={currencySymbol}
+                currency={currency}
                 onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
               />
             </View>
@@ -706,8 +641,9 @@ export default function AnalyticsScreen() {
             <PeachButton title="Retry" variant="destructive" size="xs" onPress={retry} />
           </LuminousCard>
         ) : null}
-
-        {visibleExpenses.length === 0 ? (
+          </>
+        }
+        ListEmptyComponent={
           <LuminousCard style={[styles.emptyCard, { borderColor: ts.raw.outline }]}>
             <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
               <Search size={18} color={ts.raw.primary} />
@@ -731,20 +667,8 @@ export default function AnalyticsScreen() {
               </ScalePressable>
             ) : null}
           </LuminousCard>
-        ) : (
-          <View style={styles.transactionList}>
-            {visibleExpenses.map(expense => (
-              <ExpenseItem
-                key={expense.id}
-                expense={expense}
-                searchQuery={searchQuery}
-                detailOrigin="insights"
-                detailOrderIds={visibleExpenses.map(item => item.id)}
-              />
-            ))}
-          </View>
-        )}
-      </ScrollView>
+        }
+      />
 
       <SortSheet
         visible={sortVisible}
@@ -841,16 +765,7 @@ function SortSheet({
 }
 
 const styles = StyleSheet.create({
-  skeletonStack: { gap: Spacing.s2 },
-  skeletonStackTight: { marginTop: Spacing.s2 },
-  skeletonLegendRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: Spacing.s2,
-    minHeight: 22,
-  },
-  skeletonLegendLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
+  loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   header: {
     paddingHorizontal: Spacing.s5,
     paddingBottom: Spacing.s3,
@@ -949,17 +864,16 @@ const styles = StyleSheet.create({
   netPill: { paddingHorizontal: Spacing.s2, paddingVertical: 3, borderRadius: Radii.full },
   netPillText: { ...Typography.micro, fontFamily: 'Manrope_700Bold' },
   cashflowCards: { flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s3 },
-  cashflowCard: { flex: 1, minWidth: 0, borderRadius: Radii.sm, borderWidth: 1, padding: Spacing.s3 },
-  cashflowCardIncome: { borderColor: 'rgba(255,255,255,0.1)' },
-  cashflowCardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: Spacing.s1 },
-  cashflowLabelOnDark: { ...Typography.micro, color: 'rgba(255,255,255,0.7)' },
-  cashflowLabelLight: { ...Typography.micro, color: 'rgba(255,255,255,0.7)' },
-  cashflowIcon: { width: 20, height: 20, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
-  cashflowIconOnDark: { backgroundColor: 'rgba(255,255,255,0.15)' },
-  cashflowIconLight: { width: 20, height: 20, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.2)' },
-  cashflowAmountLight: { ...Typography.labelBold, color: Colors.white, letterSpacing: -0.3 },
-  cashflowSubOnDark: { ...Typography.micro, marginTop: 2, color: Colors.statusSuccessText },
-  cashflowSubLight: { ...Typography.micro, color: 'rgba(237,233,254,0.95)', marginTop: 2 },
+  // Square summary card, matching the reference. overflow hidden is what keeps
+  // the watermark arrow and the blob inside the rounded corners.
+  cashflowCard: { flex: 1, minWidth: 0, aspectRatio: 1, borderRadius: Radii.lg, borderWidth: 1, padding: Spacing.s3, overflow: 'hidden', justifyContent: 'space-between' },
+  cashflowDecor: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  cashflowBlob: { position: 'absolute', width: CARD_BLOB_SIZE, height: CARD_BLOB_SIZE, borderRadius: CARD_BLOB_SIZE / 2, right: -CARD_BLOB_SIZE / 3, top: -CARD_BLOB_SIZE / 6 },
+  cashflowWatermark: { position: 'absolute', right: Spacing.s1, top: '50%', marginTop: -CARD_WATERMARK_SIZE / 2 },
+  cashflowBadge: { width: 28, height: 28, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', alignSelf: 'flex-start' },
+  cashflowFooter: { gap: 1 },
+  cashflowLabel: { ...Typography.labelMd, color: CARD_LABEL },
+  cashflowAmount: { ...Typography.headlineSm, color: Colors.white, letterSpacing: -0.5 },
   cashflowTrackRow: { gap: Spacing.s1 },
   cashflowTrack: { height: 10, borderRadius: Radii.full, overflow: 'hidden' },
   cashflowFill: { height: '100%', borderRadius: Radii.full },
@@ -983,7 +897,6 @@ const styles = StyleSheet.create({
   errorRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 },
   errorText: { ...Typography.micro, flexShrink: 1 },
 
-  transactionList: { gap: 0 },
   emptyCard: { borderRadius: Radii.md, padding: Spacing.s5, borderWidth: 1, borderStyle: 'dashed', alignItems: 'center' },
   emptyIcon: { width: 40, height: 40, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', marginBottom: Spacing.s2 },
   emptyTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', textAlign: 'center' },

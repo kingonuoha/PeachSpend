@@ -23,6 +23,7 @@ import { Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { ScannedReceipt } from '../../types/gemini';
+import type { CaptureSource } from '../../data';
 import { formatCurrency, getCurrencyPrefix, resolveCurrency } from '../../utils/currency';
 import { PeachButton } from '../ui/PeachButton';
 import { CategoryPickerSheet, type CaptureCategory } from '../capture/CategoryPickerSheet';
@@ -49,6 +50,46 @@ const humanizeCategory = (id: string): string =>
     .trim()
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 
+// The confirm gate, extracted so the merchant rule is unit testable without
+// rendering the sheet. A scanned product legitimately has no merchant, because a
+// product photograph has no store name, so the merchant is required only for a
+// manual entry that has not been filled in yet (BUG-09-14). Scan and share
+// callers leave `source` unset, which is the scanned behaviour: the candidate is
+// confirmable with an empty merchant, and the empty value is passed through
+// as-is rather than replaced with a placeholder.
+export interface VerificationGateInput {
+  source?: CaptureSource;
+  merchant: string;
+  total: number;
+  categoryId: string;
+  itemCount: number;
+  saving: boolean;
+}
+
+export interface VerificationGate {
+  merchantRequired: boolean;
+  merchantError: boolean;
+  amountError: boolean;
+  categoryError: boolean;
+  canConfirm: boolean;
+}
+
+export function resolveVerificationGate(input: VerificationGateInput): VerificationGate {
+  const merchantRequired = input.source === 'manual';
+  const merchantError = merchantRequired && input.merchant.trim().length === 0;
+  const amountError = !(input.total > 0);
+  const categoryError = input.categoryId.trim().length === 0;
+  const canConfirm = !merchantError && !amountError && !categoryError && input.itemCount > 0 && !input.saving;
+  return { merchantRequired, merchantError, amountError, categoryError, canConfirm };
+}
+
+// The items the sheet hands to the data layer. An absent merchant stays an empty
+// string and is never replaced with a placeholder, so confirming a product with
+// no store name records nothing false into the user's own records (BUG-09-14).
+export function resolveConfirmItems(items: ScannedReceipt[]): ScannedReceipt[] {
+  return items.map((item) => ({ ...item, merchant: item.merchant ?? '' }));
+}
+
 interface VerificationSheetProps {
   isVisible: boolean;
   data: ScannedReceipt | ScannedReceipt[] | null | unknown;
@@ -56,6 +97,12 @@ interface VerificationSheetProps {
   onCancel: () => void;
   /** Source context only changes the header badge; the sheet identity is shared. */
   origin?: 'scan' | 'share';
+  /**
+   * Where the candidate came from. A manual entry must supply a merchant; a
+   * scanned product must not, because a product photograph has no store name.
+   * Scan and share callers leave this unset, which is the scanned behaviour.
+   */
+  source?: CaptureSource;
   /** Owned receipt image from the caller. The sheet never fabricates one. */
   imageUri?: string | null;
   /** Re-runs extraction. Omit to hide the affordance. */
@@ -68,6 +115,7 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
   onConfirm,
   onCancel,
   origin = 'scan',
+  source,
   imageUri = null,
   onRetry,
 }) => {
@@ -159,10 +207,14 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
   }, [categories, selectedCategoryId]);
 
   const merchant = items[0]?.merchant ?? '';
-  const merchantError = merchant.trim().length === 0;
-  const amountError = !(total > 0);
-  const categoryError = selectedCategoryId.trim().length === 0;
-  const canConfirm = !merchantError && !amountError && !categoryError && items.length > 0 && !saving;
+  const { merchantError, amountError, categoryError, canConfirm } = resolveVerificationGate({
+    source,
+    merchant,
+    total,
+    categoryId: selectedCategoryId,
+    itemCount: items.length,
+    saving,
+  });
 
   const updateItem = useCallback((index: number, patch: Partial<ScannedReceipt>) => {
     setItems((current) => current.map((item, i) => (i === index ? { ...item, ...patch } : item)));
@@ -219,7 +271,7 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
     if (!canConfirm) return;
     setSaving(true);
     try {
-      await onConfirm(items);
+      await onConfirm(resolveConfirmItems(items));
     } finally {
       if (mountedRef.current) setSaving(false);
     }

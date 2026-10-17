@@ -3,6 +3,7 @@ import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 import { geminiClient, openRouterClient } from '../ai/providerClients';
 import type { AiProvider } from '../ai/contracts';
 import { databaseService } from '../services/DatabaseService';
+import { useDataToken } from './useDataFreshness';
 import {
   InsightDataService,
   dismissInsightDigest,
@@ -46,6 +47,10 @@ export const INSIGHT_SORT_OPTIONS: InsightSortOption[] = [
 // Module singleton mirrors the Home data repository: the screen consumes the
 // Data and AI service, never SQL.
 const insightDataService = new InsightDataService(databaseService);
+
+// BUG-09-11b. Insights reads the ledger (expenses, their categories and the
+// period aggregates), so only a ledger write invalidates its snapshot.
+const INSIGHT_FRESHNESS_DOMAINS = ['ledger'] as const;
 
 // Provider context for the FR-03.2 digest. Gemini and OpenRouter run the same
 // injected boundary so both are first-class; the key is read only to pass into
@@ -125,9 +130,18 @@ export function useInsights() {
     }
   }, []);
 
+  // BUG-09-11b. The snapshot re-reads on a timeframe change and when the ledger
+  // itself changed. It is not re-run by a focus event, a tab switch or a plain
+  // re-render, which the mount effect could not tell apart from a real change.
+  // The change token is read from one place, so this screen is not reloading
+  // because it was remounted.
+  const ledgerToken = useDataToken(INSIGHT_FRESHNESS_DOMAINS);
+  const hasLoadedRef = useRef(false);
   useEffect(() => {
-    void load(query, 'initial');
-  }, [query, load]);
+    const mode = hasLoadedRef.current ? 'refresh' : 'initial';
+    hasLoadedRef.current = true;
+    void load(query, mode);
+  }, [query, ledgerToken, load]);
 
   // Digest generation. The local narrative is always kept so an offline or
   // provider-failed digest still renders a real local summary, never a blank card.

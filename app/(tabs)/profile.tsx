@@ -1,10 +1,13 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
+  AccessibilityInfo,
   Image,
+  Platform,
   ScrollView,
   Text,
   View,
+  type GestureResponderEvent,
+  type ViewStyle,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -26,13 +29,17 @@ import {
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
+import { Skeleton } from '../../components/ui/Skeleton';
 import { BadgeGlyph } from '../../components/ui/BadgeGlyph';
 import { BadgeDetailModal } from '../../components/ui/BadgeDetailModal';
 import AchievementCelebration from '../../components/ui/AchievementCelebration';
 import { EditProfileSheet } from '../../components/profile/EditProfileSheet';
 import { useSettings } from '../../components/ui/SettingsProvider';
+import { useToast } from '../../components/ui/ToastProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
-import { Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
+import { useTokenReload } from '../../hooks/useDataFreshness';
+import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { formatCurrency } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
 import { profileDataService, settingsPort } from '../../services/DataServices';
@@ -54,10 +61,246 @@ function formatEarnedDate(timestamp: number | null): string | null {
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+// The loaded screen and its loading skeleton share one content wrap so the
+// placeholder cannot drift from the layout it replaces (POLISH Section 6).
+const CONTENT_WRAP: ViewStyle = {
+  width: '100%',
+  maxWidth: 640,
+  alignSelf: 'center',
+  paddingHorizontal: Spacing.s5,
+};
+
+// White at 15%, the existing hero glass convention from the Home skeleton, so
+// placeholder blocks read as glass over the gradient instead of flat grey.
+const HERO_PLACEHOLDER = `${Colors.white}26`;
+
+// Fixed counts mirror the canonical three stat cards, the 2x3 badge grid, the
+// four pack picker and the two settings routes. The real counts are data, so
+// they are not knowable while the snapshot is loading.
+const SKELETON_STAT_COUNT = 3;
+const SKELETON_BADGE_COUNT = 6;
+const SKELETON_PACK_COUNT = 4;
+const SKELETON_SETTINGS_ROW_COUNT = 2;
+
+const THEME_PACK_FAILURE_MESSAGE = 'Could not change the theme pack. Please try again.';
+const THEME_MODE_FAILURE_MESSAGE = 'Could not change the appearance. Please try again.';
+
+// BUG-09-11b. The profile snapshot reads the ledger (expenses, streak, badges), so
+// only a ledger write invalidates it. Theme and appearance writes go straight to
+// this screen's own state and must not cause a re-read.
+const PROFILE_FRESHNESS_DOMAINS = ['ledger'] as const;
+
+// Loading placeholder. Mirrors the loaded screen section by section: the same
+// content wrap, hero gradient card, stat cards, recap row, badge grid, theme card
+// and settings rows. Every block height is the token line height (or element
+// size) of the real content it stands in for, so content arrives with no layout
+// shift at the canonical 390 width. Decorative blocks stay hidden from assistive
+// tech; the container exposes one busy label, matching the Home/Settings skeleton
+// convention.
+function ProfileSkeleton() {
+  const ts = useThemeStyles();
+  const bottomClearance = useBottomClearance();
+  const heroBlock = { backgroundColor: HERO_PLACEHOLDER };
+
+  return (
+    <SafeAreaView
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel="Loading your profile"
+      accessibilityState={{ busy: true }}
+      style={{ backgroundColor: ts.bg.screen, flex: 1 }}
+      edges={['top']}
+    >
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: bottomClearance }}>
+        <View style={CONTENT_WRAP}>
+          {/* Top bar. The title and the 40pt settings circle drive the same 64pt row as the loaded header. */}
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingTop: Spacing.s4, paddingBottom: Spacing.s2 }}>
+            <Skeleton width={96} height={20} />
+            <Skeleton width={40} height={40} borderRadius={Radii.full} />
+          </View>
+
+          {/* Identity hero */}
+          <View style={{ marginTop: Spacing.s2 }}>
+            <LinearGradient
+              colors={ts.isDark ? Gradients.dark : Gradients.light}
+              locations={[0, 0.45, 1]}
+              start={{ x: 0.33, y: 0 }}
+              end={{ x: 0.67, y: 1 }}
+              style={{ borderRadius: Radii.xl, padding: Spacing.s5, overflow: 'hidden' }}
+            >
+              <View
+                pointerEvents="none"
+                importantForAccessibility="no-hide-descendants"
+                style={{ position: 'absolute', right: -40, bottom: -40, width: 176, height: 176, borderRadius: 88, borderWidth: 1, borderColor: 'rgba(255,255,255,0.10)' }}
+              />
+              <View
+                pointerEvents="none"
+                importantForAccessibility="no-hide-descendants"
+                style={{ position: 'absolute', right: -16, bottom: -16, width: 112, height: 112, borderRadius: 56, borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)' }}
+              />
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s4 }}>
+                <Skeleton width={72} height={72} borderRadius={Radii.full} style={heroBlock} />
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s1 }}>
+                    <Skeleton width={140} height={16} style={heroBlock} />
+                    <Skeleton width={44} height={16} borderRadius={Radii.full} style={heroBlock} />
+                  </View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, marginTop: Spacing.s2 }}>
+                    <Skeleton width={140} height={17} borderRadius={Radii.full} style={heroBlock} />
+                  </View>
+                </View>
+              </View>
+              {/* Streak ribbon. The two real text lines (20 + 13) make the ribbon 33pt tall, which is what the card height hangs off. */}
+              <View style={{ marginTop: Spacing.s4, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.15)', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 }}>
+                  <Skeleton width={32} height={32} borderRadius={Radii.full} style={heroBlock} />
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Skeleton width={120} height={20} style={heroBlock} />
+                    <Skeleton width={180} height={13} style={heroBlock} />
+                  </View>
+                </View>
+                <Skeleton width={40} height={13} style={heroBlock} />
+              </View>
+            </LinearGradient>
+          </View>
+
+          {/* Real aggregate stats */}
+          <View style={{ marginTop: Spacing.s4 }}>
+            <View style={{ flexDirection: 'row', gap: Spacing.s2 }}>
+              {Array.from({ length: SKELETON_STAT_COUNT }).map((_, index) => (
+                <LuminousCard
+                  key={index}
+                  variant="high"
+                  style={{ flex: 1, minWidth: 0, paddingVertical: Spacing.s4, paddingHorizontal: Spacing.s2, alignItems: 'center' }}
+                >
+                  {/* The longest label wraps to two lines at the canonical width, so the label area reserves both token lines. */}
+                  <Skeleton width="80%" height={13} />
+                  <Skeleton width="60%" height={13} />
+                  <Skeleton width="70%" height={22} style={{ marginTop: Spacing.s1 }} />
+                </LuminousCard>
+              ))}
+            </View>
+          </View>
+
+          {/* Spending recap entry (S-23) */}
+          <View style={{ marginTop: Spacing.s4 }}>
+            <View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                borderRadius: Radii.lg,
+                borderWidth: 1,
+                borderColor: ts.raw.primary + '44',
+                backgroundColor: ts.raw.primary + '14',
+                padding: Spacing.s4,
+              }}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 }}>
+                <Skeleton width={36} height={36} borderRadius={Radii.sm} />
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Skeleton width={140} height={16} />
+                  <Skeleton width={200} height={11} />
+                </View>
+              </View>
+              <Skeleton width={16} height={16} />
+            </View>
+          </View>
+
+          {/* Badges and milestones (SH-05a) */}
+          <View style={{ marginTop: Spacing.s5 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: Spacing.s3 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1 }}>
+                <Skeleton width={140} height={20} />
+                <Skeleton width={84} height={17} borderRadius={Radii.full} />
+              </View>
+              <Skeleton width={104} height={13} />
+            </View>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.s2 }}>
+              {Array.from({ length: SKELETON_BADGE_COUNT }).map((_, index) => (
+                <View
+                  key={index}
+                  style={{ flexBasis: '30%', flexGrow: 1, minWidth: 84, borderRadius: Radii.lg, borderWidth: 1, borderStyle: 'dashed', borderColor: ts.raw.outline, padding: Spacing.s3, alignItems: 'center' }}
+                >
+                  <Skeleton width={44} height={44} borderRadius={Radii.full} style={{ marginBottom: Spacing.s2 }} />
+                  <Skeleton width="80%" height={13} />
+                  <Skeleton width="60%" height={13} style={{ marginTop: 2 }} />
+                </View>
+              ))}
+            </View>
+          </View>
+
+          {/* Theme pack switcher (FR-05.5) */}
+          <View style={{ marginTop: Spacing.s5 }}>
+            <LuminousCard variant="high">
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: Spacing.s1 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 }}>
+                  <Skeleton width={16} height={16} />
+                  <Skeleton width={112} height={20} />
+                </View>
+                <Skeleton width={88} height={16} />
+              </View>
+              <View style={{ marginBottom: Spacing.s3 }}>
+                <Skeleton width="100%" height={13} />
+                <Skeleton width="65%" height={13} />
+              </View>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.s2 }}>
+                {Array.from({ length: SKELETON_PACK_COUNT }).map((_, index) => (
+                  <Skeleton key={index} width="22%" height={61} borderRadius={Radii.sm} style={{ minWidth: 64 }} />
+                ))}
+              </View>
+              <View style={{ marginTop: Spacing.s4, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: ts.raw.outline, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
+                  <Skeleton width={108} height={16} />
+                  <Skeleton width={72} height={13} />
+                </View>
+                <View style={{ backgroundColor: ts.bg.low, borderWidth: 1, borderColor: ts.raw.outline, borderRadius: Radii.sm, padding: 2, flexDirection: 'row' }}>
+                  <Skeleton width={48} height={21} borderRadius={Radii.sm} />
+                  <Skeleton width={44} height={21} borderRadius={Radii.sm} />
+                </View>
+              </View>
+            </LuminousCard>
+          </View>
+
+          {/* Settings route (S-06) */}
+          <View style={{ marginTop: Spacing.s4 }}>
+            <LuminousCard variant="high" style={{ padding: 0 }}>
+              {Array.from({ length: SKELETON_SETTINGS_ROW_COUNT }).map((_, index) => (
+                <View key={index}>
+                  {index > 0 ? <View style={{ height: 1, backgroundColor: ts.raw.outline }} /> : null}
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: Spacing.s4 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 }}>
+                      <Skeleton width={32} height={32} borderRadius={Radii.sm} />
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Skeleton width={120} height={20} />
+                        <Skeleton width="95%" height={13} />
+                        <Skeleton width="70%" height={13} />
+                      </View>
+                    </View>
+                    <Skeleton width={16} height={16} />
+                  </View>
+                </View>
+              ))}
+            </LuminousCard>
+          </View>
+
+          {/* Version footer */}
+          <View style={{ marginTop: Spacing.s5, alignItems: 'center' }}>
+            <Skeleton width={120} height={13} />
+            <Skeleton width={200} height={13} style={{ marginTop: 2 }} />
+          </View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
 export default function ProfileScreen() {
   const ts = useThemeStyles();
   const router = useRouter();
+  const bottomClearance = useBottomClearance();
   const { refreshSettings } = useSettings();
+  const { showToast } = useToast();
 
   const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(null);
   const [reloading, setReloading] = useState(false);
@@ -65,21 +308,65 @@ export default function ProfileScreen() {
   const [selectedBadge, setSelectedBadge] = useState<AchievementState | null>(null);
   const [celebrating, setCelebrating] = useState<AchievementState | null>(null);
   const [themeBusy, setThemeBusy] = useState(false);
+  // POLISH Section 7: the theme controls are async, so each outcome is announced.
+  // iOS has no live region, so it speaks through announceForAccessibility; Android
+  // reads the polite live region rendered after the scroll view. A live region only
+  // speaks when its content changes, so every attempt clears this string at entry
+  // before the outcome is written, otherwise the first result is spoken and every
+  // identical repeat after it is silent on Android.
+  const [themeAnnouncement, setThemeAnnouncement] = useState('');
+
+  const announceThemeOutcome = useCallback((message: string) => {
+    if (Platform.OS === 'ios') {
+      AccessibilityInfo.announceForAccessibility(message);
+    } else {
+      setThemeAnnouncement(message);
+    }
+  }, []);
+
+  // A failed theme write must not leave the user with silence. The toast is the
+  // visible half, reusing the Settings screen's copy for the same failure, and the
+  // announcement is the screen-reader half.
+  const reportThemeFailure = useCallback(
+    (message: string) => {
+      showToast(message, 'error');
+      announceThemeOutcome(message);
+    },
+    [announceThemeOutcome, showToast],
+  );
+
+  // POLISH Section 7: remember the control that opened a modal so screen-reader
+  // focus can return to it when the modal closes. Only what a screen reader
+  // announces changes; nothing renders differently. Moving focus into the modal
+  // belongs to the modal component, not to this host.
+  const modalTriggerTag = useRef<number | null>(null);
+
+  const rememberFocusTrigger = useCallback((event: GestureResponderEvent) => {
+    // The shipped .d.ts types nativeEvent.target as string; at runtime it is the
+    // numeric node id (RN Flow: ?number), so narrow it before storing it.
+    const target = event.nativeEvent.target;
+    modalTriggerTag.current = typeof target === 'number' ? target : null;
+  }, []);
 
   const load = useCallback(async () => {
     const next = await profileDataService.getSnapshot();
     setSnapshot(next);
   }, []);
 
+  // BUG-09-11b. The profile snapshot reads the ledger, so it re-reads on first
+  // mount and when the ledger changed while this screen was mounted. It is not
+  // re-run by a focus event or by a re-render.
+  useTokenReload(PROFILE_FRESHNESS_DOMAINS, load);
+
+  // Focus return once no modal is open. Best effort, matching the import screen:
+  // setAccessibilityFocus takes the captured node id, and ScalePressable does not
+  // forward a ref, so the instance-based replacement is not reachable from here.
   useEffect(() => {
-    let active = true;
-    void profileDataService.getSnapshot().then((next) => {
-      if (active) setSnapshot(next);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
+    if (editing || selectedBadge !== null || celebrating !== null) return;
+    const triggerTag = modalTriggerTag.current;
+    modalTriggerTag.current = null;
+    if (triggerTag !== null) AccessibilityInfo.setAccessibilityFocus(triggerTag);
+  }, [editing, selectedBadge, celebrating]);
 
   const retry = async () => {
     setReloading(true);
@@ -97,13 +384,23 @@ export default function ProfileScreen() {
 
   const applyThemePack = async (id: string) => {
     if (themeBusy || !snapshot || snapshot.themePack.activePackId === id) return;
+    // See the themeAnnouncement declaration: clear at entry so the live region
+    // content differs on every attempt. The clear commits in the press handler
+    // and the outcome commits after the await, so they never batch together.
+    setThemeAnnouncement('');
     setThemeBusy(true);
     try {
       const result = await setThemePack(settingsPort, id);
       if (result.status === 'saved') {
         setSnapshot((prev) => (prev ? { ...prev, themePack: result.state } : prev));
         await refreshSettings();
+        const label = snapshot.themePack.packs.find((pack) => pack.id === id)?.label ?? id;
+        announceThemeOutcome(`Theme pack set to ${label}`);
+      } else {
+        reportThemeFailure(THEME_PACK_FAILURE_MESSAGE);
       }
+    } catch {
+      reportThemeFailure(THEME_PACK_FAILURE_MESSAGE);
     } finally {
       setThemeBusy(false);
     }
@@ -111,34 +408,37 @@ export default function ProfileScreen() {
 
   const applyThemeMode = async (mode: 'light' | 'dark') => {
     if (themeBusy) return;
+    // Same entry clear as applyThemePack, see the themeAnnouncement declaration.
+    setThemeAnnouncement('');
     setThemeBusy(true);
     try {
       const state = await setThemeMode(settingsPort, mode);
       setSnapshot((prev) => (prev ? { ...prev, themePack: state } : prev));
       await refreshSettings();
+      announceThemeOutcome(`Appearance set to ${mode === 'light' ? 'light' : 'dark'} mode`);
+    } catch {
+      reportThemeFailure(THEME_MODE_FAILURE_MESSAGE);
     } finally {
       setThemeBusy(false);
     }
   };
 
-  if (!snapshot) {
-    return (
-      <SafeAreaView style={{ backgroundColor: ts.bg.screen, flex: 1 }} edges={['top']}>
-        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-          <ActivityIndicator color={ts.raw.primary} />
-          <Text style={[Typography.labelMd, { color: ts.raw.onSurfaceVariant, marginTop: Spacing.s3 }]}>
-            Loading your profile
-          </Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
+  // Memoized on the achievements they are derived from: this used to re-filter and
+  // clone-sort the catalogue on every render, including renders caused by a press,
+  // a toast or a modal opening. Declared above the loading guard because a hook
+  // cannot be called conditionally; the empty account is what the guard renders.
+  const achievements = useMemo(() => snapshot?.achievements ?? [], [snapshot]);
+  const earnedCount = useMemo(() => achievements.filter((badge) => badge.earned).length, [achievements]);
+  const newestEarned = useMemo(
+    () => achievements
+      .filter((badge) => badge.earned && badge.earnedAt !== null)
+      .sort((a, b) => (b.earnedAt ?? 0) - (a.earnedAt ?? 0))[0] ?? null,
+    [achievements],
+  );
 
-  const achievements = snapshot.achievements;
-  const earnedCount = achievements.filter((badge) => badge.earned).length;
-  const newestEarned = achievements
-    .filter((badge) => badge.earned && badge.earnedAt !== null)
-    .sort((a, b) => (b.earnedAt ?? 0) - (a.earnedAt ?? 0))[0] ?? null;
+  if (!snapshot) {
+    return <ProfileSkeleton />;
+  }
 
   const avatarUri = resolveAvatarUri(snapshot.avatarFile);
   const initial = snapshot.displayName.trim() ? snapshot.displayName.trim().charAt(0).toUpperCase() : null;
@@ -186,9 +486,9 @@ export default function ProfileScreen() {
       <ScrollView
         style={{ flex: 1 }}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: Spacing.s8 }}
+        contentContainerStyle={{ paddingBottom: bottomClearance }}
       >
-        <View style={{ width: '100%', maxWidth: 640, alignSelf: 'center', paddingHorizontal: Spacing.s5 }}>
+        <View style={CONTENT_WRAP}>
           {/* Top bar */}
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingTop: Spacing.s4, paddingBottom: Spacing.s2 }}>
             <Text style={[Typography.headlineLg, { color: ts.raw.onSurface }]} accessibilityRole="header">
@@ -198,7 +498,7 @@ export default function ProfileScreen() {
               accessibilityRole="button"
               accessibilityLabel="Open settings"
               onPress={() => router.push('/settings')}
-              hitSlop={{ top: 2, bottom: 2, left: 2, right: 2 }}
+              hitSlop={4}
               style={{
                 width: 40,
                 height: 40,
@@ -237,7 +537,10 @@ export default function ProfileScreen() {
                 <ScalePressable
                   accessibilityRole="button"
                   accessibilityLabel="Edit profile photo and name"
-                  onPress={() => setEditing(true)}
+                  onPress={(event) => {
+                    rememberFocusTrigger(event);
+                    setEditing(true);
+                  }}
                   style={{ position: 'relative' }}
                 >
                   <View
@@ -288,10 +591,16 @@ export default function ProfileScreen() {
                     >
                       {snapshot.displayName || 'Add your name'}
                     </Text>
+                    {/* POLISH Section 7: the pill renders 21pt tall, so hitSlop lifts
+                        the target to 49pt without changing the rendered box. */}
                     <ScalePressable
                       accessibilityRole="button"
                       accessibilityLabel="Edit profile"
-                      onPress={() => setEditing(true)}
+                      onPress={(event) => {
+                        rememberFocusTrigger(event);
+                        setEditing(true);
+                      }}
+                      hitSlop={{ top: 14, bottom: 14, left: 8, right: 8 }}
                       style={{
                         flexDirection: 'row',
                         alignItems: 'center',
@@ -325,7 +634,10 @@ export default function ProfileScreen() {
                   accessibilityRole="button"
                   accessibilityLabel={newestEarned ? 'View achievement celebration' : 'Streak progress'}
                   disabled={!newestEarned}
-                  onPress={() => setCelebrating(newestEarned)}
+                  onPress={(event) => {
+                    rememberFocusTrigger(event);
+                    setCelebrating(newestEarned);
+                  }}
                   style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 }}
                 >
                   <View style={{ width: 32, height: 32, borderRadius: Radii.full, backgroundColor: 'rgba(255,255,255,0.20)', alignItems: 'center', justifyContent: 'center' }}>
@@ -343,10 +655,16 @@ export default function ProfileScreen() {
                   </View>
                 </ScalePressable>
                 {newestEarned ? (
+                  /* POLISH Section 7: the link renders about 43x21, so hitSlop lifts the
+                     target to about 55x49 without changing the rendered box. */
                   <ScalePressable
                     accessibilityRole="button"
                     accessibilityLabel="View achievement"
-                    onPress={() => setCelebrating(newestEarned)}
+                    onPress={(event) => {
+                      rememberFocusTrigger(event);
+                      setCelebrating(newestEarned);
+                    }}
+                    hitSlop={{ top: 14, bottom: 14, left: 6, right: 6 }}
                     style={{ paddingHorizontal: Spacing.s2, paddingVertical: 4 }}
                   >
                     <Text style={[Typography.micro, { color: '#FFFFFF', fontFamily: 'Manrope_600SemiBold', textDecorationLine: 'underline' }]}>
@@ -452,7 +770,10 @@ export default function ProfileScreen() {
                       key={badge.id}
                       accessibilityRole="button"
                       accessibilityLabel={`${badge.label}, ${badge.earned ? 'earned' : `progress ${badge.progress.current} of ${badge.progress.target}`}`}
-                      onPress={() => setSelectedBadge(badge)}
+                      onPress={(event) => {
+                        rememberFocusTrigger(event);
+                        setSelectedBadge(badge);
+                      }}
                       style={{
                         flexBasis: '30%',
                         flexGrow: 1,
@@ -530,7 +851,7 @@ export default function ProfileScreen() {
                       key={pack.id}
                       accessibilityRole="radio"
                       accessibilityLabel={pack.label}
-                      accessibilityState={{ selected }}
+                      accessibilityState={{ selected, disabled: themeBusy }}
                       disabled={themeBusy}
                       onPress={() => applyThemePack(pack.id)}
                       style={{
@@ -577,12 +898,15 @@ export default function ProfileScreen() {
                     return (
                       <ScalePressable
                         key={mode}
-                        accessibilityRole="button"
+                        accessibilityRole="radio"
                         accessibilityLabel={mode === 'light' ? 'Light mode' : 'Dark mode'}
-                        accessibilityState={{ selected }}
+                        accessibilityState={{ selected, disabled: themeBusy }}
                         disabled={themeBusy}
                         onPress={() => applyThemeMode(mode)}
-                        hitSlop={{ top: 6, bottom: 6 }}
+                        /* POLISH Section 7: the control renders 21pt tall, so hitSlop
+                           lifts the target to 49pt. Horizontal slop stays zero so the
+                           two adjacent segments never overlap each other. */
+                        hitSlop={{ top: 14, bottom: 14 }}
                         style={{
                           paddingHorizontal: Spacing.s3,
                           paddingVertical: Spacing.s1,
@@ -665,6 +989,13 @@ export default function ProfileScreen() {
           </View>
         </View>
       </ScrollView>
+
+      {/* POLISH Section 7: Android announces the async theme outcome through this
+          polite live region. The node is a 1x1 clipped transparent box, so it never
+          renders anything the locked pair does not show. */}
+      <View accessibilityLiveRegion="polite" style={{ position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' }}>
+        <Text>{themeAnnouncement}</Text>
+      </View>
 
       {editing ? (
         <EditProfileSheet

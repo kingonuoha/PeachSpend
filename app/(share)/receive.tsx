@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { AccessibilityInfo, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { useRouter, useLocalSearchParams, useFocusEffect } from 'expo-router';
@@ -11,6 +11,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { PeachButton } from '../../components/ui/PeachButton';
+import { ScalePressable } from '../../components/ui/ScalePressable';
 import { AIProcessingOverlay } from '../../components/capture/AIProcessingOverlay';
 import { VerificationSheet } from '../../components/expense/VerificationSheet';
 import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
@@ -31,7 +32,7 @@ import { consumeShareIntentHandoff, type ShareIntentFileRecord } from '../../uti
 import { ScannedReceipt } from '../../types/gemini';
 import type { Expense } from '../../types/database';
 import { resolveExpenseBatchSave, runCaptureSideEffects, normalizeCurrencyTotal, type CaptureCandidate, type DuplicateMatch } from '../../data';
-import { AiError, getAiErrorMessage, getReceiptOcrAvailability, normalizeAiError } from '../../ai/contracts';
+import { AiError, getAiErrorMessage, getReceiptOcrAvailability, normalizeAiError, type AiErrorCode } from '../../ai/contracts';
 
 // Recovery kind selects the honest primary action for a state the canonical pair
 // does not itself show (missing key, offline). Everything else uses the pair's
@@ -39,8 +40,59 @@ import { AiError, getAiErrorMessage, getReceiptOcrAvailability, normalizeAiError
 type RecoveryKind = 'generic' | 'missing_key' | 'offline';
 
 interface RecoveryState {
-  kind: RecoveryKind;
   message: string;
+  // The AI failure code behind this state, or null for the one non-AI state: a
+  // share handoff token that was already consumed. The kind is derived from it
+  // rather than stored beside it, so the two cannot disagree.
+  code: AiErrorCode | null;
+}
+
+// The manual entry route the scan surface and the offline state already use, so a
+// user whose shared image cannot be read still has a way to log the expense.
+export const RECOVERY_MANUAL_ROUTE = '/expense/manual';
+
+export function recoveryKind(code: AiErrorCode | null): RecoveryKind {
+  if (code === 'offline') return 'offline';
+  if (code === 'missing_key') return 'missing_key';
+  return 'generic';
+}
+
+// The app only ever establishes a photographic cause for `illegible_image`, where
+// the provider reported that the image itself could not be read. Every other
+// failure is about the provider request or the response it returned, so it is
+// answered with its own honest heading and no photographic remedy (DEC-B75).
+const PHOTOGRAPHIC_ADVICE = [
+  'Share an image with all four corners visible.',
+  'Avoid strong glare on thermal paper totals.',
+  'Ensure the merchant and grand total are legible.',
+] as const;
+
+export interface RecoveryPresentation {
+  // The heading names the same cause class as the body, so a response the app
+  // could not use is never headed as an image that could not be read.
+  heading: string;
+  // Photographic advice, empty unless the app established that the image itself
+  // could not be read.
+  advice: readonly string[];
+  // True when the card adds a manual entry action beside its primary action. The
+  // offline state already routes to manual entry as its primary action, and the
+  // missing key state keeps its provider settings action, so neither adds one.
+  manualEntry: boolean;
+}
+
+export function resolveRecoveryPresentation(code: AiErrorCode | null): RecoveryPresentation {
+  return {
+    heading: code === 'invalid_response' ? "Couldn't Use the AI Response" : "Couldn't Read Shared Image",
+    advice: code === 'illegible_image' ? PHOTOGRAPHIC_ADVICE : [],
+    manualEntry: recoveryKind(code) === 'generic',
+  };
+}
+
+// POLISH Section 7: a failure is async, so it is spoken rather than only rendered.
+// Building the spoken text from the same presentation the render uses keeps the heading
+// the screen reader hears identical to the heading on screen (DEC-B75).
+export function describeRecoveryAnnouncement(code: AiErrorCode | null, message: string): string {
+  return `${resolveRecoveryPresentation(code).heading}. ${message}`;
 }
 
 interface OwnedImageMeta {
@@ -56,6 +108,10 @@ const PROCESSING_COPY = {
   description: 'Matching line totals, calculating sales tax, and validating historical duplicates. Your expense stays unsaved until you confirm.',
 } as const;
 
+// The success block heading, shared by the render and the POLISH Section 7 announcement
+// so the two cannot drift.
+const SUCCESS_HEADING = 'Expense Saved to Ledger';
+
 // Upper bound for the image bed. The real height is driven by aspectRatio; this
 // only stops a tablet-width card from growing unreasonably tall.
 const IMAGE_MAX_HEIGHT = 340;
@@ -63,10 +119,12 @@ const CONTENT_MAX_WIDTH = 640;
 const RECOVERY_MAX_WIDTH = 360;
 const IMAGE_ASPECT_RATIO = 1.35;
 
-// Pair header close is a 36pt circle (w-9 h-9); the 44pt floor is earned through
-// hitSlop so the painted circle and the header row keep the canonical geometry.
+// Pair header close is a 36pt circle (w-9 h-9). The painted circle stays 36 so the
+// header row keeps its canonical geometry; the touch target is earned through hitSlop
+// alone, at 6pt a side, so the effective target is 48 and clears the 48dp Android floor
+// in POLISH Section 7 as well as the 44pt iOS one.
 const CLOSE_BUTTON_SIZE = 36;
-const CLOSE_HIT_SLOP = { top: 4, bottom: 4, left: 4, right: 4 };
+const CLOSE_HIT_SLOP = { top: 6, bottom: 6, left: 6, right: 6 };
 // Pair p-3.5 (14) is not on the token scale; the nearest step plus the same
 // half-step arithmetic already used by the callout and quick-fix cards.
 const PANEL_PADDING = Spacing.s3 + 2;
@@ -83,6 +141,19 @@ const humanizeCategory = (id: string): string => id
   .replace(/[-_]+/g, ' ')
   .trim()
   .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+// The success sentence in one place, used by the render and by the POLISH Section 7
+// announcement, so the rendered result and the spoken one cannot drift.
+export function describeSavedBatch(items: ScannedReceipt[]): { merchant: string | null; tail: string } {
+  const first = items[0];
+  if (items.length === 1 && first) {
+    return {
+      merchant: `${first.merchant} (${formatCurrency(first.amount, first.currency)})`,
+      tail: ` has been logged under ${humanizeCategory(first.category)}.`,
+    };
+  }
+  return { merchant: null, tail: `${items.length} shared receipts have been logged to your ledger.` };
+}
 
 function formatFileSize(bytes?: number): string | null {
   if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return null;
@@ -135,6 +206,13 @@ export default function ShareReceiveScreen() {
   const [savedWithImage, setSavedWithImage] = useState(false);
   const [ownedImageUri, setOwnedImageUri] = useState<string | null>(null);
   const [imageMeta, setImageMeta] = useState<OwnedImageMeta | null>(null);
+  // POLISH Section 7: the ingestion outcome is async, so it is spoken, not only
+  // rendered. iOS has no live region and speaks through announceForAccessibility;
+  // Android reads the polite live region rendered at the bottom of this screen. A live
+  // region speaks only when its content changes, so the previous outcome is cleared
+  // when a new attempt starts, which keeps a repeat of the same failure a distinct
+  // announcement on Android instead of silence.
+  const [outcomeAnnouncement, setOutcomeAnnouncement] = useState('');
 
   const ownedImageRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -184,16 +262,29 @@ export default function ShareReceiveScreen() {
     return { ...item, amount: normalized.total, currency: settings.currency };
   }), [conversionRates, settings.currency]);
 
+  const announceOutcome = useCallback((message: string) => {
+    if (Platform.OS === 'ios') AccessibilityInfo.announceForAccessibility(message);
+    else setOutcomeAnnouncement(message);
+  }, []);
+
+  const clearOutcomeAnnouncement = useCallback(() => setOutcomeAnnouncement(''), []);
+
+  // One commit point for every failure this screen can reach, so a failure always
+  // carries the same error haptic (POLISH Section 4, matching the sibling scan surface)
+  // and the same screen-reader announcement (POLISH Section 7), whichever of the four
+  // writers produced it. The AI-failure, offline, missing-key and consumed-token states
+  // each keep their own code and their own message.
+  const commitRecovery = useCallback((state: RecoveryState) => {
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    setRecovery(state);
+    announceOutcome(describeRecoveryAnnouncement(state.code, state.message));
+  }, [announceOutcome]);
+
   const applyAiError = useCallback((error: unknown) => {
     const normalized = normalizeAiError(error, 'gemini');
     logger.error('Failed to process shared image', normalized.code);
-    const kind: RecoveryKind = normalized.code === 'offline'
-      ? 'offline'
-      : normalized.code === 'missing_key'
-        ? 'missing_key'
-        : 'generic';
-    setRecovery({ kind, message: getAiErrorMessage(normalized.code, 'receipt') });
-  }, []);
+    commitRecovery({ code: normalized.code, message: getAiErrorMessage(normalized.code, 'receipt') });
+  }, [commitRecovery]);
 
   const checkAvailability = useCallback(async (): Promise<'ready' | 'offline' | 'missing_key'> => {
     let connected = false;
@@ -238,6 +329,7 @@ export default function ShareReceiveScreen() {
   const processRecord = useCallback(async (record: ShareIntentFileRecord) => {
     setProcessing(true);
     setRecovery(null);
+    clearOutcomeAnnouncement();
     try {
       const copied = await copyReceiptImageToAppCache(record.uri, record.mimeType, record.fileSize);
       ownedImageRef.current = copied;
@@ -252,7 +344,7 @@ export default function ShareReceiveScreen() {
     } finally {
       if (mountedRef.current) setProcessing(false);
     }
-  }, [applyAiError, cleanupOwnedImage, runOcr]);
+  }, [applyAiError, clearOutcomeAnnouncement, cleanupOwnedImage, runOcr]);
 
   // One-shot handoff: the opaque token is consumed exactly once and the raw native
   // URI never reaches state, params, or the UI. The guard also protects against a
@@ -266,7 +358,7 @@ export default function ShareReceiveScreen() {
         const record = token ? consumeShareIntentHandoff(token) : null;
         if (!record) {
           if (mountedRef.current) {
-            setRecovery({ kind: 'generic', message: 'This shared image is no longer available. Share it again to retry.' });
+            commitRecovery({ code: null, message: 'This shared image is no longer available. Share it again to retry.' });
             setProcessing(false);
           }
           return;
@@ -274,12 +366,12 @@ export default function ShareReceiveScreen() {
         const availability = await checkAvailability();
         if (!mountedRef.current) return;
         if (availability === 'offline') {
-          setRecovery({ kind: 'offline', message: getAiErrorMessage('offline', 'receipt') });
+          commitRecovery({ code: 'offline', message: getAiErrorMessage('offline', 'receipt') });
           setProcessing(false);
           return;
         }
         if (availability === 'missing_key') {
-          setRecovery({ kind: 'missing_key', message: 'Gemini API key missing. Open AI Provider Settings.' });
+          commitRecovery({ code: 'missing_key', message: 'Gemini API key missing. Open AI Provider Settings.' });
           setProcessing(false);
           return;
         }
@@ -305,7 +397,7 @@ export default function ShareReceiveScreen() {
             if ('merchant' in savedCandidate) {
               notificationService.scheduleExpenseNotification(
                 savedCandidate.merchant,
-                `${savedCandidate.currency} ${savedCandidate.amount.toFixed(2)}`,
+                `${formatCurrency(savedCandidate.amount, savedCandidate.currency)}`,
               );
             }
           },
@@ -326,8 +418,13 @@ export default function ShareReceiveScreen() {
     setSavedWithImage(hadImage);
     setSavedItems(items);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    // POLISH Section 7: a committed save is async, so the success is spoken, not only
+    // rendered. The sentence comes from the same helper the render uses, so the two
+    // cannot drift.
+    const saved = describeSavedBatch(items);
+    announceOutcome(`${SUCCESS_HEADING}. ${saved.merchant ?? ''}${saved.tail}`);
     showToast(`Saved ${items.length} expense${items.length > 1 ? 's' : ''} from shared receipt`, 'success');
-  }, [showToast]);
+  }, [announceOutcome, showToast]);
 
   // Save Anyway only. A clean confirm persists inside handleConfirm through the
   // same shared boundary, so calling this on a clean batch would insert twice.
@@ -381,6 +478,7 @@ export default function ShareReceiveScreen() {
       const asset = result.assets[0];
       if (!asset.mimeType) throw new Error('unsupported_image_type');
       setRecovery(null);
+      clearOutcomeAnnouncement();
       setProcessing(true);
       const copied = await copyReceiptImageToAppCache(asset.uri, asset.mimeType, asset.fileSize);
       ownedImageRef.current = copied;
@@ -394,7 +492,7 @@ export default function ShareReceiveScreen() {
       await cleanupOwnedImage();
       if (mountedRef.current) setProcessing(false);
     }
-  }, [applyAiError, cleanupOwnedImage, runOcr]);
+  }, [applyAiError, clearOutcomeAnnouncement, cleanupOwnedImage, runOcr]);
 
   const leaveWithCleanup = useCallback(() => {
     void (async () => {
@@ -432,23 +530,20 @@ export default function ShareReceiveScreen() {
 
   const showSuccess = savedItems !== null;
   const showRecovery = recovery !== null;
+  // Derived from the failure code rather than stored, so the presentation and the
+  // primary action can never disagree with the code the state carries.
+  const recoveryKindValue: RecoveryKind = recovery ? recoveryKind(recovery.code) : 'generic';
+  const recoveryView: RecoveryPresentation | null = recovery ? resolveRecoveryPresentation(recovery.code) : null;
   const headerSubtitle = showSuccess
     ? 'Saved to your ledger'
     : showRecovery
       ? 'Could not read image'
       : `From ${Platform.OS === 'ios' ? 'iOS' : 'Android'} share sheet`;
 
-  const firstSaved = savedItems?.[0];
-  const savedCount = savedItems?.length ?? 0;
-  const isSingleSaved = Boolean(firstSaved) && savedCount === 1;
   // Pair success body sets the merchant and amount in purple semibold ahead of
-  // the plain result sentence. Multi-item saves keep the honest count sentence.
-  const successMerchant = isSingleSaved && firstSaved
-    ? `${firstSaved.merchant} (${formatCurrency(firstSaved.amount, firstSaved.currency)})`
-    : null;
-  const successTail = isSingleSaved && firstSaved
-    ? ` has been logged under ${humanizeCategory(firstSaved.category)}.`
-    : `${savedCount} shared receipts have been logged to your ledger.`;
+  // the plain result sentence. Multi-item saves keep the honest count sentence. This
+  // is the one source for that sentence, shared with the Section 7 announcement.
+  const savedCopy = describeSavedBatch(savedItems ?? []);
 
   return (
     <View style={[styles.screen, { backgroundColor: ts.bg.screen }]}>
@@ -458,7 +553,7 @@ export default function ShareReceiveScreen() {
           { paddingTop: insets.top + PANEL_PADDING, backgroundColor: ts.bg.surface, borderBottomColor: ts.border.subtle },
         ]}
       >
-        <Pressable
+        <ScalePressable
           onPress={leaveWithCleanup}
           accessibilityRole="button"
           accessibilityLabel="Close shared receipt and return"
@@ -466,7 +561,7 @@ export default function ShareReceiveScreen() {
           style={[styles.closeButton, { backgroundColor: ts.bg.elevated }]}
         >
           <X size={20} color={ts.icon.default} />
-        </Pressable>
+        </ScalePressable>
         <View style={styles.headerText}>
           <Text accessibilityRole="header" numberOfLines={1} style={[styles.title, { color: ts.text.onSurface }]}>
             Shared Receipt
@@ -491,13 +586,13 @@ export default function ShareReceiveScreen() {
               <Check size={32} color={ts.raw.statusSuccessText} />
             </View>
             <Text accessibilityRole="header" style={[styles.recoveryTitle, { color: ts.text.onSurface }]}>
-              Expense Saved to Ledger
+              {SUCCESS_HEADING}
             </Text>
             <Text style={[styles.recoveryBody, { color: ts.text.onSurfaceVariant }]}>
-              {successMerchant ? (
-                <Text style={[styles.successMerchant, { color: ts.text.primary }]}>{successMerchant}</Text>
+              {savedCopy.merchant ? (
+                <Text style={[styles.successMerchant, { color: ts.text.primary }]}>{savedCopy.merchant}</Text>
               ) : null}
-              {successTail}
+              {savedCopy.tail}
             </Text>
             <View style={[styles.summaryCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
               <View style={styles.summaryRow}>
@@ -513,23 +608,19 @@ export default function ShareReceiveScreen() {
             </View>
             <PeachButton title="Return to Home Dashboard" onPress={handleGoHome} variant="primary" size="lg" fullWidth />
           </View>
-        ) : showRecovery && recovery ? (
+        ) : showRecovery && recovery && recoveryView ? (
           <View style={[styles.recoveryBlock, styles.errorBlock]}>
             <View style={[styles.recoveryIcon, { backgroundColor: ts.raw.dangerSoft }]}>
               <TriangleAlert size={32} color={ts.raw.danger} />
             </View>
             <Text accessibilityRole="header" style={[styles.recoveryTitle, { color: ts.text.onSurface }]}>
-              Couldn&apos;t Read Shared Image
+              {recoveryView.heading}
             </Text>
             <Text style={[styles.recoveryBody, { color: ts.text.onSurfaceVariant }]}>{recovery.message}</Text>
-            {recovery.kind === 'generic' ? (
+            {recoveryView.advice.length > 0 ? (
               <View style={[styles.fixCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
                 <Text style={[styles.fixTitle, { color: ts.text.onSurface }]}>Quick Fix Suggestions:</Text>
-                {[
-                  'Share an image with all four corners visible.',
-                  'Avoid strong glare on thermal paper totals.',
-                  'Ensure the merchant and grand total are legible.',
-                ].map((line) => (
+                {recoveryView.advice.map((line) => (
                   <View key={line} style={styles.fixRow}>
                     <View style={[styles.fixDot, { backgroundColor: ts.text.onSurfaceVariant }]} />
                     <Text style={[styles.fixText, { color: ts.text.onSurfaceVariant }]}>{line}</Text>
@@ -538,7 +629,7 @@ export default function ShareReceiveScreen() {
               </View>
             ) : null}
             <View style={styles.actionStack}>
-              {recovery.kind === 'missing_key' ? (
+              {recoveryKindValue === 'missing_key' ? (
                 <PeachButton
                   title="Open AI Provider Settings"
                   onPress={() => router.push('/settings/chat')}
@@ -546,10 +637,10 @@ export default function ShareReceiveScreen() {
                   size="lg"
                   fullWidth
                 />
-              ) : recovery.kind === 'offline' ? (
+              ) : recoveryKindValue === 'offline' ? (
                 <PeachButton
                   title="Enter Manually"
-                  onPress={() => router.push('/expense/manual')}
+                  onPress={() => router.push(RECOVERY_MANUAL_ROUTE)}
                   variant="primary"
                   size="lg"
                   fullWidth
@@ -565,6 +656,15 @@ export default function ShareReceiveScreen() {
                   icon={<ImageIcon size={16} color={Colors.white} />}
                 />
               )}
+              {recoveryView.manualEntry ? (
+                <PeachButton
+                  title="Enter Manually"
+                  onPress={() => router.push(RECOVERY_MANUAL_ROUTE)}
+                  variant="secondary"
+                  size="lg"
+                  fullWidth
+                />
+              ) : null}
               <PeachButton
                 title="Go Home"
                 onPress={handleGoHome}
@@ -677,6 +777,13 @@ export default function ShareReceiveScreen() {
           onDiscard={handleDuplicateDiscard}
         />
       ) : null}
+
+      {/* POLISH Section 7: Android speaks the async ingestion outcome through this
+          polite live region. The node is a 1x1 clipped transparent box, so it shows
+          nothing the locked pair does not show. */}
+      <View accessibilityLiveRegion="polite" style={styles.announcement}>
+        <Text>{outcomeAnnouncement}</Text>
+      </View>
     </View>
   );
 }
@@ -801,4 +908,8 @@ const styles = StyleSheet.create({
   summaryRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: Spacing.s3 },
   summaryLabel: { ...Typography.micro, flexShrink: 0 },
   summaryValue: { ...Typography.labelLg, flexShrink: 1, textAlign: 'right' },
+  // POLISH Section 7 screen-reader announcement channel. Absolutely positioned and
+  // clipped, matching the sibling spending-recap, support-center and profile units, so it
+  // renders nothing the locked pair does not show.
+  announcement: { position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' },
 });
