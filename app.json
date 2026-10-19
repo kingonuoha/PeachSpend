@@ -77,8 +77,15 @@
            "androidMultiIntentFilters": []
         }
       ],
-      "expo-background-task"
-      ,"./plugins/withAutoCapture"
+      "expo-background-task",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "PeachSpend uses Face ID to unlock the app when biometric unlock is turned on."
+        }
+      ],
+      "expo-notifications",
+      "./plugins/withAutoCapture"
     ],
     "experiments": {
       "typedRoutes": true
