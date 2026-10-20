@@ -23,7 +23,6 @@ const SNAP_BACK_SPRING = { duration: 400, dampingRatio: 0.8 } as const;
 const DISMISS_SPRING = { duration: 300, dampingRatio: 0.8, overshootClamping: true } as const;
 // Fraction of the sheet travel that commits a dismiss. Velocity can commit sooner.
 const DISMISS_PROGRESS = 0.4;
-const RUBBERBAND_CONSTANT = 0.55;
 
 // RECIPES.md worklets. Both run on the UI thread, so both carry the directive.
 function project(velocity: number, decelerationRate = 0.998): number {
@@ -31,7 +30,7 @@ function project(velocity: number, decelerationRate = 0.998): number {
   return ((velocity / 1000) * decelerationRate) / (1 - decelerationRate);
 }
 
-function rubberband(overshoot: number, dimension: number, constant = RUBBERBAND_CONSTANT): number {
+function rubberband(overshoot: number, dimension: number, constant = 0.55): number {
   'worklet';
   return (overshoot * dimension * constant) / (dimension + constant * Math.abs(overshoot));
 }

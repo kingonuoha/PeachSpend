@@ -138,7 +138,7 @@ export default function AnimatedSplashScreen({ onFinish }: AnimatedSplashScreenP
 
     const timer = setTimeout(() => {
       runOnJS(onFinish)();
-    }, 8000);
+    }, 2400);
 
     return () => clearTimeout(timer);
   }, [logoScale, logoTranslateY, circleScale, circleOpacity, textOpacity, textTranslateY, onFinish]);

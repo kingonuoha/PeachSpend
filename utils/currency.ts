@@ -125,3 +125,12 @@ export function getCurrencyName(currency?: string | null): string {
   if (!code) return '';
   return CURRENCY_NAMES[code] ?? code;
 }
+
+export function formatAmountInput(value: string): string {
+  if (!value) return '';
+  const parts = value.split('.');
+  const integerPart = parts[0];
+  const decimalPart = parts.length > 1 ? '.' + parts[1] : '';
+  const formattedInteger = integerPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return formattedInteger + decimalPart;
+}

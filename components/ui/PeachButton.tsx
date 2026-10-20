@@ -328,7 +328,7 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
   },
   fill: {
-    flex: 1,
+    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',

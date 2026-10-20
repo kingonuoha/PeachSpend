@@ -73,8 +73,10 @@
           "iosActivationRules": {
             "NSExtensionActivationSupportsImageWithMaxCount": 1
           },
-          "androidIntentFilters": ["image/*"],
-           "androidMultiIntentFilters": []
+          "androidIntentFilters": [
+            "image/*"
+          ],
+          "androidMultiIntentFilters": []
         }
       ],
       "expo-background-task",
@@ -85,7 +87,8 @@
         }
       ],
       "expo-notifications",
-      "./plugins/withAutoCapture"
+      "./plugins/withAutoCapture",
+      "@react-native-community/datetimepicker"
     ],
     "experiments": {
       "typedRoutes": true

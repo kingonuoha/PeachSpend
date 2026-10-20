@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  formatAmountInput,
   formatCompactCurrency,
   formatCurrency,
   formatMoneyNumber,
@@ -103,5 +104,17 @@ describe('formatCompactCurrency', () => {
 
   it('respects a suffix placement in the compact form too', () => {
     expect(formatCompactCurrency(12500, 'SEK')).toBe('12.5k kr');
+  });
+});
+
+describe('formatAmountInput', () => {
+  it('formats raw numeric strings with comma grouping as user types', () => {
+    expect(formatAmountInput('56335')).toBe('56,335');
+    expect(formatAmountInput('56335.')).toBe('56,335.');
+    expect(formatAmountInput('56335.5')).toBe('56,335.5');
+    expect(formatAmountInput('56335.50')).toBe('56,335.50');
+    expect(formatAmountInput('0')).toBe('0');
+    expect(formatAmountInput('0.00')).toBe('0.00');
+    expect(formatAmountInput('')).toBe('');
   });
 });

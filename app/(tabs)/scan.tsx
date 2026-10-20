@@ -305,27 +305,29 @@ function HudButton({ label, onPress, disabled, checked, children }: { label: str
   );
 }
 
-function PermissionRecovery({ onGrant, onManual, canAskAgain }: { onGrant: () => void; onManual: () => void; canAskAgain: boolean }) {
+function PermissionRecovery({ onGrant, onManual, canAskAgain, insets }: { onGrant: () => void; onManual: () => void; canAskAgain: boolean; insets: { top: number; bottom: number } }) {
   return (
-    <View style={styles.recoveryLayer}>
-      <View style={styles.recoveryIcon}>
-        <CameraOff size={30} color={Colors.primary} />
+    <View style={[styles.recoveryLayer, { paddingTop: insets.top + Spacing.s6, paddingBottom: insets.bottom + Spacing.s6 }]}>
+      <View style={styles.recoveryCard}>
+        <View style={styles.recoveryIcon}>
+          <CameraOff size={30} color={Colors.primary} />
+        </View>
+        <Text accessibilityRole="header" style={styles.recoveryTitle}>Camera Access Required</Text>
+        <Text style={styles.recoveryBody}>
+          Allow camera access to scan receipts. Your capture stays on this device until you confirm it.
+        </Text>
+        <PeachButton
+          title={canAskAgain ? 'Grant Camera Permission' : 'Open Settings'}
+          onPress={onGrant}
+          variant="primary"
+          size="lg"
+          fullWidth
+          style={styles.recoveryAction}
+        />
+        <Pressable onPress={onManual} accessibilityRole="button" accessibilityLabel="Enter expense manually" hitSlop={8} style={styles.recoveryLink}>
+          <Text style={styles.recoveryLinkText}>Enter Manually</Text>
+        </Pressable>
       </View>
-      <Text accessibilityRole="header" style={styles.recoveryTitle}>Camera Access Required</Text>
-      <Text style={styles.recoveryBody}>
-        Allow camera access to scan receipts. Your capture stays on this device until you confirm it.
-      </Text>
-      <PeachButton
-        title={canAskAgain ? 'Grant Camera Permission' : 'Open Settings'}
-        onPress={onGrant}
-        variant="primary"
-        size="lg"
-        fullWidth
-        style={styles.recoveryAction}
-      />
-      <Pressable onPress={onManual} accessibilityRole="button" accessibilityLabel="Enter expense manually" hitSlop={8} style={styles.recoveryLink}>
-        <Text style={styles.recoveryLinkText}>Enter Manually</Text>
-      </Pressable>
     </View>
   );
 }
@@ -806,6 +808,7 @@ export default function ScanScreen() {
           onGrant={() => { void handleGrantPermission(); }}
           onManual={() => router.push('/expense/manual')}
           canAskAgain={permission.canAskAgain !== false}
+          insets={insets}
         />
       )}
 
@@ -995,6 +998,7 @@ const styles = StyleSheet.create({
   shutterInnerRing: { flex: 1, width: '100%', borderRadius: Radii.full, borderWidth: 2, borderColor: 'rgba(255,255,255,0.9)', backgroundColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center' },
   shutterCore: { width: SHUTTER_CORE_SIZE, height: SHUTTER_CORE_SIZE, borderRadius: Radii.full, backgroundColor: Colors.white },
   recoveryLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', paddingHorizontal: Spacing.s8 },
+  recoveryCard: { width: '100%', maxWidth: RECOVERY_MAX_WIDTH, alignItems: 'center' },
   recoveryIcon: {
     width: 64,
     height: 64,

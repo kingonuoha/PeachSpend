@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -20,6 +20,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Briefcase, Calendar, ChevronLeft, ChevronRight, Repeat, Tag, X } from 'lucide-react-native';
 import { format, isToday } from 'date-fns';
+import DateTimePicker, { type DateTimePickerChangeEvent } from '@react-native-community/datetimepicker';
 import * as Haptics from 'expo-haptics';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
@@ -36,7 +37,14 @@ import { databaseService } from '../../services/DatabaseService';
 import { notificationService } from '../../services/NotificationService';
 import { logger } from '../../utils/logger';
 import { useAchievements } from '../../components/ui/AchievementProvider';
-import { formatCurrency } from '../../utils/currency';
+import { formatAmountInput, formatCurrency } from '../../utils/currency';
+import {
+  CLOSED_DATE_TIME_FIELD,
+  nextDateTimeFieldState,
+  type DateTimeFieldAction,
+  type DateTimeFieldPlatform,
+  type DateTimeFieldState,
+} from '../../utils/dateTimeField';
 import { resolveExpenseSave, runCaptureSideEffects, type DuplicateMatch } from '../../data';
 
 const SWITCH_TRACK_WIDTH = 44;
@@ -54,6 +62,17 @@ const RECURRENCE_OPTIONS = [
   { value: 'monthly', label: 'Monthly' },
   { value: 'weekly', label: 'Weekly' },
 ] as const;
+
+// The two halves of the date and time value, in the order the control edits them.
+const DATE_TIME_MODES = [
+  { value: 'date', label: 'Date' },
+  { value: 'time', label: 'Time' },
+] as const;
+
+// Android's picker is a system dialog that closes on every selection, so the date
+// step hands off to the time step. The dismissal has to settle before the second
+// dialog presents, otherwise the second one opens behind the first.
+const DATE_TIME_HANDOFF_MS = 100;
 
 function ToggleSwitch({
   value,
@@ -105,7 +124,6 @@ export default function ManualEntryScreen() {
   const { showToast } = useToast();
   const { checkForNewAchievements } = useAchievements();
 
-  const [enteredAt] = useState(() => Date.now());
   const [amount, setAmount] = useState('0.00');
   const [merchant, setMerchant] = useState('');
   const [note, setNote] = useState('');
@@ -119,7 +137,10 @@ export default function ManualEntryScreen() {
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateMatch | null>(null);
   const [saving, setSaving] = useState<'idle' | 'checking' | 'saving'>('idle');
   const [saveFailed, setSaveFailed] = useState(false);
-  const [keypadOpen, setKeypadOpen] = useState(false);
+  const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
+  const [enteredDate, setEnteredDate] = useState(() => new Date());
+  const [dateTimeField, setDateTimeField] = useState<DateTimeFieldState>(CLOSED_DATE_TIME_FIELD);
+  const handoffTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const enterOpacity = useSharedValue(reduceMotion ? 1 : 0);
   const enterOffset = useSharedValue(reduceMotion ? 0 : 16);
@@ -181,7 +202,8 @@ export default function ManualEntryScreen() {
 
   const symbol = getCurrencySymbol(currency);
   const originLabel = typeof params.origin === 'string' && params.origin.trim() ? params.origin.trim() : null;
-  const dateLabel = `${isToday(enteredAt) ? 'Today' : format(enteredAt, 'EEE, MMM d')} · ${format(enteredAt, 'h:mm a')}`;
+  const dateLabel = `${isToday(enteredDate) ? 'Today' : format(enteredDate, 'EEE, MMM d')} · ${format(enteredDate, 'h:mm a')}`;
+  const merchantNeedsAttention = hasAttemptedSave && !merchantValid;
 
   const tint = selectedCategory
     ? (CategoryTints[selectedCategory.id as keyof typeof CategoryTints] ?? CategoryTints.other)
@@ -221,7 +243,8 @@ export default function ManualEntryScreen() {
   }, []);
 
   const doSave = useCallback(async (allowDuplicate = false) => {
-    if (!selectedCategory) return;
+    setHasAttemptedSave(true);
+    if (!selectedCategory || !merchant.trim() || parsedAmount <= 0) return;
     setSaveFailed(false);
     setSaving(allowDuplicate ? 'saving' : 'checking');
     const candidate = {
@@ -232,7 +255,7 @@ export default function ManualEntryScreen() {
       note: note.trim() || undefined,
       source: 'manual' as const,
       origin: 'manual_expense' as const,
-      date: enteredAt,
+      date: enteredDate.getTime(),
       isRecurring,
       recurrenceInterval: isRecurring ? recurrenceInterval : undefined,
       isReimbursable,
@@ -268,7 +291,7 @@ export default function ManualEntryScreen() {
       setSaveFailed(true);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [merchant, parsedAmount, currency, selectedCategory, note, enteredAt, isRecurring, recurrenceInterval, isReimbursable, checkForNewAchievements, showToast, router]);
+  }, [merchant, parsedAmount, currency, selectedCategory, note, enteredDate, isRecurring, recurrenceInterval, isReimbursable, checkForNewAchievements, showToast, router]);
 
   const handleSave = useCallback(() => {
     if (!canSave || busy) return;
@@ -284,6 +307,55 @@ export default function ManualEntryScreen() {
     setMerchant('');
     void Haptics.selectionAsync();
   }, []);
+
+  const dateTimePlatform: DateTimeFieldPlatform = Platform.OS === 'ios' ? 'ios' : 'android';
+  const dateTimeThemeVariant = ts.isDark ? 'dark' : 'light';
+
+  // The queued Android hand-off must not fire into an unmounted screen.
+  useEffect(() => () => {
+    if (handoffTimer.current !== null) clearTimeout(handoffTimer.current);
+  }, []);
+
+  const applyDateTimeAction = useCallback((action: DateTimeFieldAction) => {
+    setDateTimeField(current => nextDateTimeFieldState(dateTimePlatform, current, action));
+  }, [dateTimePlatform]);
+
+  const handleDateChange = useCallback((_event: DateTimePickerChangeEvent, next: Date) => {
+    setEnteredDate(next);
+    const state = nextDateTimeFieldState(dateTimePlatform, dateTimeField, 'set');
+    if (dateTimePlatform === 'android' && state.visible && state.mode !== dateTimeField.mode) {
+      // One commit closes the date dialog, the next presents the clock. Presenting
+      // both at once leaves the second behind the first.
+      setDateTimeField({ visible: false, mode: dateTimeField.mode });
+      handoffTimer.current = setTimeout(() => {
+        handoffTimer.current = null;
+        setDateTimeField(state);
+      }, DATE_TIME_HANDOFF_MS);
+      return;
+    }
+    setDateTimeField(state);
+  }, [dateTimeField, dateTimePlatform]);
+
+  const selectDateTimeMode = useCallback((mode: DateTimeFieldState['mode']) => {
+    if (mode === dateTimeField.mode) return;
+    void Haptics.selectionAsync();
+    applyDateTimeAction('switchMode');
+  }, [applyDateTimeAction, dateTimeField.mode]);
+
+  const dismissDateTimeField = useCallback(() => {
+    applyDateTimeAction('dismissed');
+  }, [applyDateTimeAction]);
+
+  // Both mounts of the picker (the iOS card below the field, the Android dialog
+  // host at the end of the screen) configure themselves from this one object, so
+  // the value, the mode and the two event handlers cannot drift apart.
+  const datePickerProps = useMemo(() => ({
+    value: enteredDate,
+    mode: dateTimeField.mode,
+    is24Hour: false,
+    onValueChange: handleDateChange,
+    onDismiss: dismissDateTimeField,
+  }), [dismissDateTimeField, enteredDate, handleDateChange, dateTimeField.mode]);
 
   const sectionTitle = useMemo(() => (isRecurring ? `Recurring: ${RECURRENCE_OPTIONS.find(o => o.value === recurrenceInterval)?.label ?? 'Monthly'} schedule` : 'Create recurring schedule'), [isRecurring, recurrenceInterval]);
 
@@ -338,12 +410,8 @@ export default function ManualEntryScreen() {
               </View>
             ) : null}
 
-            <ScalePressable
-              haptic={false}
-              accessibilityRole="button"
+            <View
               accessibilityLabel="Amount spent"
-              accessibilityState={{ expanded: keypadOpen }}
-              onPress={() => setKeypadOpen(v => !v)}
               style={[styles.card, styles.heroCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
             >
               <View style={styles.rowBetween}>
@@ -355,29 +423,28 @@ export default function ManualEntryScreen() {
               <View style={styles.amountRow}>
                 <Text style={[Typography.headlineSm, { color: ts.text.primary }]}>{symbol}</Text>
                 <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.displayLg, styles.amountValue, { color: ts.text.onSurface }]}>
-                  {amount}
+                  {formatAmountInput(amount) || '0.00'}
                 </Text>
                 <Animated.View style={[styles.cursor, { backgroundColor: ts.text.primary }, cursorStyle]} />
               </View>
               <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
-                Tap to enter via virtual numpad below
+                Enter amount via quick keypad below
               </Text>
-            </ScalePressable>
+            </View>
 
             <View style={styles.formGroup}>
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
               <View style={styles.rowBetween}>
                 <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>Merchant</Text>
-                {!merchantValid ? (
+                {merchantNeedsAttention ? (
                   <Text style={[Typography.micro, { color: ts.text.error }]}>Required to save</Text>
                 ) : null}
               </View>
-              <View style={[styles.inputRow, { backgroundColor: ts.bg.screen, borderColor: merchantValid ? 'transparent' : ts.border.error20 }]}>
+              <View style={[styles.inputRow, { backgroundColor: ts.bg.screen, borderColor: merchantNeedsAttention ? ts.border.error20 : 'transparent' }]}>
                 <Tag size={16} color={ts.icon.muted} />
                 <TextInput
                   value={merchant}
-                  onChangeText={setMerchant}
-                  onFocus={() => setKeypadOpen(false)}
+                  onChangeText={(val) => { setMerchant(val); if (hasAttemptedSave && val.trim().length > 0) setHasAttemptedSave(false); }}
                   placeholder="e.g. Whole Foods, Blue Bottle Coffee"
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -437,7 +504,16 @@ export default function ManualEntryScreen() {
               ) : null}
             </View>
 
-            <View style={[styles.card, styles.dateCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+            <ScalePressable
+              haptic={false}
+              accessibilityRole="button"
+              accessibilityLabel={`Date and time: ${dateLabel}. Tap to change`}
+              onPress={() => {
+                void Haptics.selectionAsync();
+                applyDateTimeAction('open');
+              }}
+              style={[styles.card, styles.dateCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+            >
               <View style={styles.dateLeft}>
                 <View style={[styles.dateIcon, { backgroundColor: ts.raw.purple100 }]}>
                   <Calendar size={16} color={ts.text.primary} />
@@ -447,10 +523,53 @@ export default function ManualEntryScreen() {
                   <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{dateLabel}</Text>
                 </View>
               </View>
-              <View style={[styles.autoPill, { backgroundColor: ts.bg.elevated }]}>
-                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>Auto</Text>
+              <View style={styles.changeRow}>
+                <Text style={[Typography.labelMd, { color: ts.text.primary }]}>Change</Text>
+                <ChevronRight size={16} color={ts.text.primary} />
               </View>
-            </View>
+            </ScalePressable>
+
+            {/* The iOS wheels render inline and never dismiss themselves, so this
+                card carries the two controls iOS has no system equivalent for: an
+                explicit close and a way to reach the time half. Android gets the
+                same two steps from its own dialogs and mounts nothing here. */}
+            {dateTimePlatform === 'ios' && dateTimeField.visible ? (
+              <View style={[styles.card, styles.pickerCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+                <View accessibilityRole="radiogroup" style={styles.pickerModeRow}>
+                  {DATE_TIME_MODES.map(option => {
+                    const selected = dateTimeField.mode === option.value;
+                    return (
+                      <ScalePressable
+                        key={option.value}
+                        haptic={false}
+                        accessibilityRole="radio"
+                        accessibilityState={{ selected }}
+                        accessibilityLabel={`${option.label} picker`}
+                        onPress={() => selectDateTimeMode(option.value)}
+                        style={[styles.frequencyButton, styles.pickerModeButton, { backgroundColor: selected ? ts.bg.primary : ts.bg.screen }]}
+                      >
+                        <Text style={[Typography.labelBold, { color: selected ? ts.text.white : ts.text.onSurfaceVariant }]}>
+                          {option.label}
+                        </Text>
+                      </ScalePressable>
+                    );
+                  })}
+                </View>
+                <DateTimePicker
+                  {...datePickerProps}
+                  display="spinner"
+                  themeVariant={dateTimeThemeVariant}
+                />
+                <PeachButton
+                  title="Done"
+                  variant="primary"
+                  size="md"
+                  fullWidth
+                  accessibilityLabel="Done, close date and time picker"
+                  onPress={() => { void Haptics.selectionAsync(); applyDateTimeAction('done'); }}
+                />
+              </View>
+            ) : null}
 
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
               <View style={styles.rowBetween}>
@@ -461,7 +580,6 @@ export default function ManualEntryScreen() {
                 <TextInput
                   value={note}
                   onChangeText={setNote}
-                  onFocus={() => setKeypadOpen(false)}
                   placeholder="Add receipt notes or memo..."
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -548,27 +666,21 @@ export default function ManualEntryScreen() {
             </View>
             </View>
 
+            <View style={[styles.card, styles.keypadCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+              <View style={styles.keypadHeader}>
+                <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.onSurfaceVariant, textTransform: 'uppercase' }]}>
+                  Quick Keypad
+                </Text>
+                <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_600SemiBold' }]}>
+                  12-Key Virtual Pad
+                </Text>
+              </View>
+              <VirtualNumpad onKeyPress={handleKeyPress} />
+            </View>
           </Animated.View>
         </ScrollView>
 
-        {keypadOpen ? (
-          <View style={[styles.keypadDock, { backgroundColor: ts.bg.screen, borderTopColor: ts.border.card }]}>
-            <View style={styles.keypadHeader}>
-              <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.onSurfaceVariant, textTransform: 'uppercase' }]}>
-                Quick Keypad
-              </Text>
-              <ScalePressable
-                accessibilityRole="button"
-                accessibilityLabel="Close keypad"
-                onPress={() => setKeypadOpen(false)}
-                style={styles.keypadDone}
-              >
-                <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.primary }]}>Done</Text>
-              </ScalePressable>
-            </View>
-            <VirtualNumpad onKeyPress={handleKeyPress} />
-          </View>
-        ) : null}
+
 
         <View style={styles.footer} pointerEvents="box-none">
           <LinearGradient
@@ -604,6 +716,10 @@ export default function ManualEntryScreen() {
             </View>
           </View>
         </View>
+
+        {dateTimePlatform === 'android' && dateTimeField.visible ? (
+          <DateTimePicker {...datePickerProps} display="default" />
+        ) : null}
       </KeyboardAvoidingView>
 
       <CategoryPickerSheet
@@ -627,7 +743,7 @@ export default function ManualEntryScreen() {
             currency,
             category: selectedCategory?.id ?? '',
             type: 'expense',
-            date: enteredAt,
+            date: enteredDate.getTime(),
           }}
           onSaveAnyway={() => { setDuplicateWarning(null); void doSave(true); }}
           onDiscard={() => { setDuplicateWarning(null); showToast('Duplicate discarded', 'info'); }}
@@ -707,7 +823,6 @@ const styles = StyleSheet.create({
   dateCard: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   dateLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
   dateIcon: { width: 32, height: 32, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  autoPill: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s1, borderRadius: Radii.full },
   toggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3 },
   toggleLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
   toggleIcon: { width: 28, height: 28, borderRadius: 8, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -741,8 +856,13 @@ const styles = StyleSheet.create({
   },
   frequencyOptions: { flexDirection: 'row', gap: Spacing.s2 },
   frequencyButton: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, borderRadius: Radii.sm, minHeight: 44, justifyContent: 'center' },
-  keypadDock: { paddingHorizontal: Spacing.s5, paddingTop: Spacing.s3, paddingBottom: 120, borderTopWidth: 1 },
-  keypadDone: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, minHeight: 44, justifyContent: 'center' },
+  keypadCard: { gap: Spacing.s3 },
+  // The iOS date and time card. It holds the two mode chips, the native wheels and
+  // the explicit close, so its internal rhythm is the 12 step the pair uses between
+  // a card's own rows rather than the 8 the field cards use.
+  pickerCard: { gap: Spacing.s3 },
+  pickerModeRow: { flexDirection: 'row', gap: Spacing.s2 },
+  pickerModeButton: { flex: 1, alignItems: 'center' },
   keypadHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.s1 },
   errorBox: { borderWidth: 1, borderRadius: Radii.md, padding: Spacing.s3, gap: Spacing.s2 },
   retry: { minHeight: 44, justifyContent: 'center' },
