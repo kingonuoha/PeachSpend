@@ -1449,9 +1449,15 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     );
   }
 
+  // F-09, F-10. The newest rows regardless of period, served by idx_expenses_date and
+  // bounded in SQL, so a screen that shows "recent" does not depend on a period filter
+  // and does not pull the ledger into memory. A limit that is not a usable count asks
+  // for no rows: SQLite reads a negative LIMIT as "no limit", which would return the
+  // whole table to a caller that asked for five.
   async getRecentExpenses(limit = 10): Promise<Expense[]> {
     const db = await this.getDb();
-    return await db.getAllAsync<Expense>('SELECT * FROM expenses ORDER BY date DESC LIMIT ?', [limit]);
+    const boundedLimit = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 0;
+    return await db.getAllAsync<Expense>('SELECT * FROM expenses ORDER BY date DESC LIMIT ?', [boundedLimit]);
   }
 
   async getReimbursableTotal(): Promise<{ total: number; expenses: Expense[] }> {

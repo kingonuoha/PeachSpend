@@ -1174,6 +1174,36 @@ describe('DatabaseService period expense read (F-06)', () => {
   });
 });
 
+// F-09, F-10. The recent card's own read. It is bounded in SQL and carries no date
+// filter, so a record outside the displayed period still counts as recent, and the
+// ledger is never pulled into memory to find five rows.
+describe('DatabaseService recent expense read (F-09, F-10)', () => {
+  it('bounds the recent read in SQL and orders it date descending', async () => {
+    const rows = [{ id: 'newest', date: 3_000 }, { id: 'older', date: 1_000 }];
+    database.getAllAsync.mockResolvedValue(rows);
+
+    await expect(databaseService.getRecentExpenses(5)).resolves.toEqual(rows);
+
+    const [sql, params] = database.getAllAsync.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain('FROM expenses');
+    expect(sql).toContain('ORDER BY date DESC LIMIT ?');
+    // No date filter: recent is recent whatever period the row falls in.
+    expect(sql).not.toContain('WHERE');
+    expect(params).toEqual([5]);
+  });
+
+  it('asks for no rows rather than the whole table when the limit is not usable', async () => {
+    database.getAllAsync.mockResolvedValue([]);
+
+    await databaseService.getRecentExpenses(-1);
+    await databaseService.getRecentExpenses(Number.NaN);
+
+    // A negative value is SQLite's "no limit", which would return the whole table.
+    const params = database.getAllAsync.mock.calls.map(call => (call[1] as unknown[])[0]);
+    expect(params).toEqual([0, 0]);
+  });
+});
+
 describe('DatabaseService bulk currency conversion refuses a missing rate (S-05R-08)', () => {  it('throws with the missing currencies instead of converting at par', async () => {
     database.getAllAsync.mockResolvedValue([
       { id: 'a', amount: 10, currency: 'USD' },
