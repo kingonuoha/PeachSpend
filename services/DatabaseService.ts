@@ -399,6 +399,14 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     return await db.getAllAsync<Expense>('SELECT * FROM expenses ORDER BY date DESC');
   }
 
+  async getExpensesForPeriod(startDate: number, endDate: number): Promise<Expense[]> {
+    const db = await this.getDb();
+    return await db.getAllAsync<Expense>(
+      'SELECT * FROM expenses WHERE date >= ? AND date <= ? ORDER BY date DESC',
+      [startDate, endDate]
+    );
+  }
+
   async getExpenseById(id: string): Promise<Expense | null> {
     const db = await this.getDb();
     return await db.getFirstAsync<Expense>('SELECT * FROM expenses WHERE id = ?', [id]);
@@ -607,7 +615,15 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
 
   async updateSetting(key: string, value: string) {
     const db = await this.getDb();
-    if (isSecretSettingKey(key)) { await setSecret(key, value); return; }
+    if (isSecretSettingKey(key)) {
+      await setSecret(key, value);
+      // F-07. A provider key write changes what the AI layer will call, so it
+      // publishes the same settings token a public setting does and the screens
+      // that cache provider output drop it. The token carries no key material:
+      // it is a revision integer per domain, never a value.
+      markDataChanged('settings');
+      return;
+    }
     await this.writePublicSetting(db, key, value);
   }
 
@@ -1230,7 +1246,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     });
   }
 
-  async getBadgeProgress(): Promise<{
+  async getBadgeProgress(cachedSettings?: Record<string, string>): Promise<{
     id: string;
     label: string;
     description: string;
@@ -1244,7 +1260,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     // than a second read of the settings table (BUG-09-11a). The streak is
     // unconditional here, as it was before: the profile view shows streak progress even
     // with no budget set.
-    const allSettings = await this.getAllSettings();
+    const allSettings = cachedSettings ?? (await this.getAllSettings());
     const streak = streakFromSettings(allSettings);
     const totals = await this.readAchievementTotals(db);
     const expenseCount = totals.expense_count;

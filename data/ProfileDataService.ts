@@ -74,20 +74,30 @@ export class ProfileDataService {
 
   async getSnapshot(now = Date.now()): Promise<ProfileSnapshot> {
     try {
-      const [expenses, name, avatar, joinDateSetting, streak, pricesVisible, currency, rates, themePack, theme, badges, unreadNotificationCount] = await Promise.all([
+      const allSettings = this.source.getAllSettings ? await this.source.getAllSettings() : null;
+      const [expenses, streak, badges, unreadNotificationCount, nameFallback, avatarFallback, joinDateFallback, pricesVisibleFallback, currencyFallback, ratesFallback, themePackFallback, themeFallback] = await Promise.all([
         this.source.getExpenses(),
-        this.source.getSetting('profile_name'),
-        this.source.getSetting('profile_picture'),
-        this.source.getSetting('profile_join_date'),
-        this.source.getStreak(),
-        this.source.getSetting('prices_visible'),
-        this.source.getSetting('currency'),
-        this.source.getSetting('conversion_rates'),
-        this.source.getSetting('theme_pack'),
-        this.source.getSetting('theme'),
-        this.source.getBadgeProgress(),
+        allSettings ? Number(allSettings.last_streak ?? 0) : this.source.getStreak(),
+        this.source.getBadgeProgress(allSettings ?? undefined),
         this.source.getUnreadNotificationCount(),
+        allSettings ? null : this.source.getSetting('profile_name'),
+        allSettings ? null : this.source.getSetting('profile_picture'),
+        allSettings ? null : this.source.getSetting('profile_join_date'),
+        allSettings ? null : this.source.getSetting('prices_visible'),
+        allSettings ? null : this.source.getSetting('currency'),
+        allSettings ? null : this.source.getSetting('conversion_rates'),
+        allSettings ? null : this.source.getSetting('theme_pack'),
+        allSettings ? null : this.source.getSetting('theme'),
       ]);
+
+      const name = allSettings ? (allSettings.profile_name ?? null) : nameFallback;
+      const avatar = allSettings ? (allSettings.profile_picture ?? null) : avatarFallback;
+      const joinDateSetting = allSettings ? (allSettings.profile_join_date ?? null) : joinDateFallback;
+      const pricesVisible = allSettings ? (allSettings.prices_visible ?? null) : pricesVisibleFallback;
+      const currency = allSettings ? (allSettings.currency ?? null) : currencyFallback;
+      const rates = allSettings ? (allSettings.conversion_rates ?? null) : ratesFallback;
+      const themePack = allSettings ? (allSettings.theme_pack ?? null) : themePackFallback;
+      const theme = allSettings ? (allSettings.theme ?? null) : themeFallback;
       const displayCurrency = resolveDisplayCurrency(currency);
       return {
         state: expenses.length === 0 && badges.every(badge => badge.earned_at === null) ? 'empty' : 'ready',

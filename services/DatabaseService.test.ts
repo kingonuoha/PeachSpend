@@ -1086,8 +1086,95 @@ describe('DatabaseService achievement pass (BUG-09-11a)', () => {
   });
 });
 
-describe('DatabaseService bulk currency conversion refuses a missing rate (S-05R-08)', () => {
-  it('throws with the missing currencies instead of converting at par', async () => {
+// F-06. Profile reads the settings table once and hands the map to the badge pass,
+// so the profile view is not paying twice for the same rows over one serialized
+// connection. The seam is the same mocked handle the achievement tests use: it
+// records every statement the service issues.
+describe('DatabaseService badge progress from preloaded settings (F-06)', () => {
+  const settingsReads = () =>
+    database.getAllAsync.mock.calls.filter(call => (call[0] as string).includes('FROM settings'));
+
+  it('reads no settings row when the caller supplies the map', async () => {
+    const cached = { currency: 'EUR', last_streak: '7', export_count: '1' };
+    database.getFirstAsync.mockResolvedValue(POPULATED_FIXTURE);
+    database.getAllAsync.mockImplementation(async (sql: string) =>
+      sql.includes('FROM achievements') ? [{ id: 'first_step', earned_at: 111 }] : []);
+
+    const badges = await databaseService.getBadgeProgress(cached);
+
+    expect(settingsReads()).toHaveLength(0);
+    // One statement for the earned rows, one aggregate for the totals.
+    expect(database.getAllAsync).toHaveBeenCalledTimes(1);
+    expect(database.getFirstAsync).toHaveBeenCalledTimes(1);
+    // Every value comes from the supplied map: a revert to
+    // `await this.getAllSettings()` would read the empty settings stub instead and
+    // report streak 0, export 0 and the default currency.
+    expect(badges.find(badge => badge.id === 'week_warrior')?.current).toBe(7);
+    expect(badges.find(badge => badge.id === 'paper_trail')?.current).toBe(1);
+    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('€1,000 total spent');
+    expect(badges.find(badge => badge.id === 'first_step')?.earned_at).toBe(111);
+  });
+
+  it('still reads settings itself when the caller has none', async () => {
+    database.getFirstAsync.mockResolvedValue(POPULATED_FIXTURE);
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM achievements')) return [];
+      return POPULATED_SETTINGS;
+    });
+
+    const badges = await databaseService.getBadgeProgress();
+
+    expect(settingsReads()).toHaveLength(1);
+    expect(badges.find(badge => badge.id === 'week_warrior')?.current).toBe(7);
+    expect(badges.find(badge => badge.id === 'shopper')?.description).toBe('€1,000 total spent');
+  });
+
+  // F-07. A provider key write is a settings write, so it must wake the screens
+  // that cache provider output. It publishes the settings token and never the
+  // ledger token, and it never stores the key in the settings table.
+  it('publishes the settings token for a provider key write', async () => {
+    vi.restoreAllMocks();
+    freshness.markDataChanged.mockClear();
+    (databaseService as unknown as { db: MockDatabase }).db = database;
+
+    await databaseService.updateSetting('gemini_api_key', 'test-key-value');
+
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+    expect(freshness.markDataChanged).not.toHaveBeenCalledWith('ledger');
+    expect(secureStore.setItemAsync).toHaveBeenCalledWith('peachspend.gemini_api_key', 'test-key-value');
+    // The key reaches SecureStore only, never the public settings table.
+    expect(database.runAsync).not.toHaveBeenCalled();
+  });
+});
+
+// F-06. The Home period read replaced a full table scan with a bounded read on the
+// indexed date column. The bounds are inclusive at both ends because a period ends
+// at 23:59:59.999 of its last day, and an expense logged at exactly midnight on the
+// first day of a period belongs to it.
+describe('DatabaseService period expense read (F-06)', () => {
+  it('bounds the read inclusively at both ends and orders it date descending', async () => {
+    const start = new Date(2026, 8, 1).getTime();
+    const end = new Date(2026, 8, 30, 23, 59, 59, 999).getTime();
+    const rows = [
+      { id: 'later', date: end },
+      { id: 'earlier', date: start },
+    ];
+    database.getAllAsync.mockResolvedValue(rows);
+
+    await expect(databaseService.getExpensesForPeriod(start, end)).resolves.toEqual(rows);
+
+    const [sql, params] = database.getAllAsync.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual([start, end]);
+    expect(sql).toContain('FROM expenses');
+    expect(sql).toContain('WHERE date >= ? AND date <= ?');
+    expect(sql).toContain('ORDER BY date DESC');
+    // An exclusive operator would drop an expense dated exactly on a bound.
+    expect(sql).not.toMatch(/WHERE date > \?/);
+    expect(sql).not.toMatch(/AND date < \?/);
+  });
+});
+
+describe('DatabaseService bulk currency conversion refuses a missing rate (S-05R-08)', () => {  it('throws with the missing currencies instead of converting at par', async () => {
     database.getAllAsync.mockResolvedValue([
       { id: 'a', amount: 10, currency: 'USD' },
       { id: 'b', amount: 10, currency: 'JPY' },

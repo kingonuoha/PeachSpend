@@ -65,13 +65,19 @@ export class HomeDataService {
     const period = getPeriod(now);
     let userCurrency: string | null = null;
     try {
+      const previousPeriod = getPreviousPeriod(period);
       const [expenses, currency, amountsVisible, incomes, streak, unreadNotificationCount, rates] = await Promise.all([
-        this.source.getExpenses(), this.source.getSetting('currency'), this.source.getSetting('prices_visible'),
-        this.source.getIncomesForPeriod(period.start, period.end), this.source.getStreak(), this.source.getUnreadNotificationCount(),
+        this.source.getExpensesForPeriod
+          ? this.source.getExpensesForPeriod(previousPeriod.start, period.end)
+          : this.source.getExpenses(),
+        this.source.getSetting('currency'),
+        this.source.getSetting('prices_visible'),
+        this.source.getIncomesForPeriod(period.start, period.end),
+        this.source.getStreak(),
+        this.source.getUnreadNotificationCount(),
         this.source.getSetting('conversion_rates'),
       ]);
       userCurrency = currency;
-      const previousPeriod = getPreviousPeriod(period);
       const current = expenses.filter(expense => expense.date >= period.start && expense.date <= period.end);
       const previous = expenses.filter(expense => expense.date >= previousPeriod.start && expense.date <= previousPeriod.end);
       const displayCurrency = resolveDisplayCurrency(currency, current[0]?.currency);

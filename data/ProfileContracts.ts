@@ -51,8 +51,9 @@ export interface BadgeProgressRow {
 export interface ProfileDataSource {
   getExpenses(): Promise<Expense[]>;
   getSetting(key: string): Promise<string | null>;
+  getAllSettings?(): Promise<Record<string, string>>;
   getStreak(): Promise<number>;
-  getBadgeProgress(): Promise<BadgeProgressRow[]>;
+  getBadgeProgress(cachedSettings?: Record<string, string>): Promise<BadgeProgressRow[]>;
   getUnreadNotificationCount(): Promise<number>;
 }
 

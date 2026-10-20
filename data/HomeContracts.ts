@@ -64,6 +64,7 @@ export interface HomeSnapshot {
 
 export interface HomeDataSource {
   getExpenses(): Promise<Expense[]>;
+  getExpensesForPeriod?(startDate: number, endDate: number): Promise<Expense[]>;
   getSetting(key: string): Promise<string | null>;
   getIncomeForPeriod(start: number, end: number): Promise<number>;
   getIncomesForPeriod(start: number, end: number): Promise<Income[]>;
