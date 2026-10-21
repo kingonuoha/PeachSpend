@@ -3,7 +3,7 @@
     "name": "PeachSpend",
     "slug": "PeachSpend",
     "owner": "kingonuoha01",
-    "version": "2.3.0",
+    "version": "2.4.0",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -28,6 +28,7 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "package": "com.kingonuoha01.app",
+      "versionCode": 3,
       "allowBackup": false,
       "blockedPermissions": [
         "android.permission.SYSTEM_ALERT_WINDOW",
