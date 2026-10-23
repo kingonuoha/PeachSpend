@@ -48,6 +48,14 @@ export interface BadgeProgressRow {
   target: number;
 }
 
+export interface ProfileExpenseSummary {
+  transactionCount: number;
+  scansCount: number;
+  totalSpent: number;
+  earliestExpenseDate: number | null;
+  hasForeignCurrencies: boolean;
+}
+
 export interface ProfileDataSource {
   getExpenses(): Promise<Expense[]>;
   getSetting(key: string): Promise<string | null>;
@@ -55,6 +63,7 @@ export interface ProfileDataSource {
   getStreak(): Promise<number>;
   getBadgeProgress(cachedSettings?: Record<string, string>): Promise<BadgeProgressRow[]>;
   getUnreadNotificationCount(): Promise<number>;
+  getProfileExpenseSummary?(): Promise<ProfileExpenseSummary>;
 }
 
 // SH-05c save boundary (FR-05.4, FR-06.3). Only the canonical edit flow calls

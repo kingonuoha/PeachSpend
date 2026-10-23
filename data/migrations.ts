@@ -216,9 +216,10 @@ export const migrations: Migration[] = [migration1, migration2, migration3, migr
 export async function runMigrations(db: SQLite.SQLiteDatabase, list: Migration[] = migrations): Promise<void> {
   await db.execAsync('PRAGMA journal_mode = WAL;');
   await db.execAsync('PRAGMA synchronous = NORMAL;');
+  await db.execAsync('PRAGMA busy_timeout = 5000;');
   const current = (await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version'))?.user_version ?? 0;
   for (const migration of list.filter(item => item.version > current).sort((a, b) => a.version - b.version)) {
-    await db.execAsync('BEGIN');
+    await db.execAsync('BEGIN IMMEDIATE');
     try {
       await migration.up(db);
       await db.execAsync(`PRAGMA user_version = ${migration.version}`);

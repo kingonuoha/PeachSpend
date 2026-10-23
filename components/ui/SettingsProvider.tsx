@@ -9,6 +9,7 @@ import { getCurrencyPrefix, resolveCurrency } from '../../utils/currency';
 interface SettingsContextType {
   settings: Record<string, string>;
   updateSetting: (key: string, value: string) => Promise<void>;
+  updateSettings: (entries: Record<string, string>) => Promise<void>;
   // Read-only re-read of every setting. Lets a typed contract (for example the
   // theme-pack write) surface in the app without opening a second settings writer.
   refreshSettings: () => Promise<void>;
@@ -106,6 +107,22 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const updateSettings = async (entries: Record<string, string>) => {
+    try {
+      await databaseService.updateSettings(entries);
+      setSettings(prev => {
+        const next = { ...prev };
+        for (const [key, value] of Object.entries(entries)) {
+          next[key] = isSecretSettingKey(key) ? (maskSecret(value) || '') : value;
+        }
+        return next;
+      });
+    } catch (error) {
+      logger.error('settings_batch_write_failed');
+      throw error;
+    }
+  };
+
   // Single entry point for onboarding complete and skip. The store writes the
   // whole state in one transaction, then the provider mirrors it in one state
   // update so the re-entry guard never sees a partial result. No secret key is
@@ -146,6 +163,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       value={{ 
         settings, 
         updateSetting, 
+        updateSettings,
         refreshSettings: loadSettings,
         completeOnboarding,
         isLoading, 

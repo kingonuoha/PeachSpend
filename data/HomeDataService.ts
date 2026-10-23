@@ -63,9 +63,21 @@ export function buildCategories(expenses: Expense[], displayCurrency: string, ra
 }
 
 export class HomeDataService {
+  private inFlightSnapshot: Promise<HomeSnapshot> | null = null;
   constructor(private readonly source: HomeDataSource) {}
 
   async getSnapshot(now = Date.now()): Promise<HomeSnapshot> {
+    if (this.inFlightSnapshot) {
+      return this.inFlightSnapshot;
+    }
+    const fetchPromise = this.fetchSnapshot(now).finally(() => {
+      this.inFlightSnapshot = null;
+    });
+    this.inFlightSnapshot = fetchPromise;
+    return fetchPromise;
+  }
+
+  private async fetchSnapshot(now: number): Promise<HomeSnapshot> {
     const period = getPeriod(now);
     let userCurrency: string | null = null;
     try {

@@ -302,7 +302,7 @@ export default function ProfileScreen() {
   const { refreshSettings } = useSettings();
   const { showToast } = useToast();
 
-  const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(() => profileDataService.getCachedSnapshot());
   const [reloading, setReloading] = useState(false);
   const [editing, setEditing] = useState(false);
   const [selectedBadge, setSelectedBadge] = useState<AchievementState | null>(null);
@@ -370,12 +370,14 @@ export default function ProfileScreen() {
 
   const retry = async () => {
     setReloading(true);
-    await load();
+    const next = await profileDataService.getSnapshot(Date.now(), true);
+    setSnapshot(next);
     setReloading(false);
   };
 
   const handleSaved = async (result: { name: string; avatarFile: string | null }) => {
     setEditing(false);
+    profileDataService.updateCachedSnapshot((prev) => ({ ...prev, displayName: result.name, avatarFile: result.avatarFile }));
     setSnapshot((prev) => (prev ? { ...prev, displayName: result.name, avatarFile: result.avatarFile } : prev));
     // Home and Chat read profile_name from settings; refresh the read model so the
     // saved name is consistent everywhere without a second writer.
@@ -392,6 +394,7 @@ export default function ProfileScreen() {
     try {
       const result = await setThemePack(settingsPort, id);
       if (result.status === 'saved') {
+        profileDataService.updateCachedSnapshot((prev) => ({ ...prev, themePack: result.state }));
         setSnapshot((prev) => (prev ? { ...prev, themePack: result.state } : prev));
         await refreshSettings();
         const label = snapshot.themePack.packs.find((pack) => pack.id === id)?.label ?? id;
@@ -413,6 +416,7 @@ export default function ProfileScreen() {
     setThemeBusy(true);
     try {
       const state = await setThemeMode(settingsPort, mode);
+      profileDataService.updateCachedSnapshot((prev) => ({ ...prev, themePack: state }));
       setSnapshot((prev) => (prev ? { ...prev, themePack: state } : prev));
       await refreshSettings();
       announceThemeOutcome(`Appearance set to ${mode === 'light' ? 'light' : 'dark'} mode`);

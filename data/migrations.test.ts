@@ -12,7 +12,7 @@ class MigrationDatabase {
   inTransaction = false;
   async execAsync(sql: string): Promise<void> {
     this.statements.push(sql);
-    if (sql === 'BEGIN') { this.inTransaction = true; return; }
+    if (sql === 'BEGIN' || sql === 'BEGIN IMMEDIATE') { this.inTransaction = true; return; }
     if (sql === 'COMMIT') { this.inTransaction = false; return; }
     if (sql === 'ROLLBACK') { this.inTransaction = false; return; }
     const pragma = sql.match(/PRAGMA user_version = (\d+)/);
@@ -189,14 +189,14 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
 
     await runMigrations(db as never, migrations);
 
-    expect(db.statements.slice(0, 2)).toEqual(['PRAGMA journal_mode = WAL;', 'PRAGMA synchronous = NORMAL;']);
-    expect(db.statements.indexOf('PRAGMA synchronous = NORMAL;')).toBeLessThan(db.statements.indexOf('BEGIN'));
+    expect(db.statements.slice(0, 3)).toEqual(['PRAGMA journal_mode = WAL;', 'PRAGMA synchronous = NORMAL;', 'PRAGMA busy_timeout = 5000;']);
+    expect(db.statements.indexOf('PRAGMA synchronous = NORMAL;')).toBeLessThan(db.statements.indexOf('BEGIN IMMEDIATE'));
     expect(db.statements.at(-1)).toBe('PRAGMA optimize;');
 
     // Second open of an already current file: the connection setup repeats and the
     // migration bodies do not.
     db.statements.length = 0;
     await runMigrations(db as never, migrations);
-    expect(db.statements).toEqual(['PRAGMA journal_mode = WAL;', 'PRAGMA synchronous = NORMAL;', 'PRAGMA optimize;']);
+    expect(db.statements).toEqual(['PRAGMA journal_mode = WAL;', 'PRAGMA synchronous = NORMAL;', 'PRAGMA busy_timeout = 5000;', 'PRAGMA optimize;']);
   });
 });

@@ -48,7 +48,7 @@ describe('SqliteCaptureRepository duplicate detection', () => {
     const repository = new SqliteCaptureRepository({ execAsync } as never);
 
     await expect(repository.withTransaction(async () => { throw new Error('write_failed'); })).rejects.toThrow('write_failed');
-    expect(execAsync.mock.calls.map(([sql]) => sql)).toEqual(['BEGIN', 'ROLLBACK']);
+    expect(execAsync.mock.calls.map(([sql]) => sql)).toEqual(['BEGIN IMMEDIATE', 'ROLLBACK']);
   });
 });
 

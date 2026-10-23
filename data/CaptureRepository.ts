@@ -110,7 +110,7 @@ export class SqliteCaptureRepository implements CaptureRepository {
   }
 
   async withTransaction<T>(operation: () => Promise<T>): Promise<T> {
-    await this.db.execAsync('BEGIN');
+    await this.db.execAsync('BEGIN IMMEDIATE');
     try {
       const result = await operation();
       await this.db.execAsync('COMMIT');

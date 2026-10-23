@@ -321,7 +321,7 @@ export default function SettingsScreen() {
   const { settings, refreshSettings, getCurrencySymbol } = useSettings();
   const { showToast } = useToast();
 
-  const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<ProfileSnapshot | null>(() => profileDataService.getCachedSnapshot());
   const [reloading, setReloading] = useState(false);
   // BUG-09-11b. The export and currency-conversion flows are the only readers of
   // the full ledger on this screen, and both only when the user opens them. This

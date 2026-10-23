@@ -210,3 +210,79 @@ describe('profile edit save boundary', () => {  it('rejects an empty or over-lon
     expect(port.values.size).toBe(0);
   });
 });
+
+describe('ProfileDataService optimization and deduplication', () => {
+  it('uses getProfileExpenseSummary when available and avoids calling getExpenses', async () => {
+    const getExpenses = vi.fn(async () => []);
+    const getProfileExpenseSummary = vi.fn(async () => ({
+      transactionCount: 3,
+      scansCount: 1,
+      totalSpent: 45,
+      earliestExpenseDate: 1_650_000_000_000,
+      hasForeignCurrencies: false,
+    }));
+    const service = new ProfileDataService({
+      getExpenses,
+      getProfileExpenseSummary,
+      getSetting: async () => null,
+      getStreak: async () => 2,
+      getBadgeProgress: async () => [],
+      getUnreadNotificationCount: async () => 0,
+    });
+
+    const snapshot = await service.getSnapshot(1000);
+
+    expect(getProfileExpenseSummary).toHaveBeenCalledTimes(1);
+    expect(getExpenses).not.toHaveBeenCalled();
+    expect(snapshot.stats.transactionCount).toBe(3);
+    expect(snapshot.stats.scansCount).toBe(1);
+    expect(snapshot.stats.totalExpenses).toBe(45);
+    expect(snapshot.joinDate).toBe(1_650_000_000_000);
+  });
+
+  it('deduplicates concurrent in-flight getSnapshot calls', async () => {
+    let finishFirst: () => void = () => {};
+    const getAllSettings = vi.fn(() => new Promise<Record<string, string>>(resolve => {
+      finishFirst = () => resolve({ currency: 'USD' });
+    }));
+    const service = new ProfileDataService({
+      getExpenses: async () => [],
+      getAllSettings,
+      getSetting: async () => null,
+      getStreak: async () => 0,
+      getBadgeProgress: async () => [],
+      getUnreadNotificationCount: async () => 0,
+    });
+
+    const firstPromise = service.getSnapshot(1000);
+    const secondPromise = service.getSnapshot(1000);
+
+    finishFirst();
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(first).toBe(second);
+    expect(getAllSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves repeat reads from cache and refreshes when forced', async () => {
+    const getAllSettings = vi.fn(async () => ({ profile_name: 'Cached' }));
+    const service = new ProfileDataService({
+      getExpenses: async () => [],
+      getAllSettings,
+      getSetting: async () => null,
+      getStreak: async () => 0,
+      getBadgeProgress: async () => [],
+      getUnreadNotificationCount: async () => 0,
+    });
+
+    const first = await service.getSnapshot(1000);
+    expect(service.getCachedSnapshot()).toBe(first);
+
+    const second = await service.getSnapshot(1000);
+    expect(second).toBe(first);
+    expect(getAllSettings).toHaveBeenCalledTimes(1);
+
+    const third = await service.getSnapshot(1000, true);
+    expect(getAllSettings).toHaveBeenCalledTimes(2);
+  });
+});

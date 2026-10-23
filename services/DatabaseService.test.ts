@@ -864,7 +864,7 @@ describe('DatabaseService atomic onboarding completion', () => {
   it('writes every onboarding value inside one transaction and marks complete last', async () => {
     await databaseService.completeOnboarding({ profileName: ' Peach ', currency: 'USD', monthlyBudget: '1200' });
 
-    expect(database.execAsync).toHaveBeenNthCalledWith(1, 'BEGIN');
+    expect(database.execAsync).toHaveBeenNthCalledWith(1, 'BEGIN IMMEDIATE');
     expect(database.execAsync).toHaveBeenNthCalledWith(2, 'COMMIT');
     expect(database.runAsync).toHaveBeenNthCalledWith(1, upsert, ['currency', 'USD']);
     expect(database.runAsync).toHaveBeenNthCalledWith(2, upsert, ['budget_currency', 'USD']);
@@ -880,7 +880,7 @@ describe('DatabaseService atomic onboarding completion', () => {
 
     await expect(databaseService.completeOnboarding({ currency: 'EUR' })).rejects.toThrow('disk full');
 
-    expect(database.execAsync).toHaveBeenCalledWith('BEGIN');
+    expect(database.execAsync).toHaveBeenCalledWith('BEGIN IMMEDIATE');
     expect(database.execAsync).toHaveBeenCalledWith('ROLLBACK');
     expect(database.execAsync).not.toHaveBeenCalledWith('COMMIT');
     const completionWrites = database.runAsync.mock.calls.filter(call => call[1]?.[0] === 'onboarding_complete');
@@ -1246,7 +1246,7 @@ describe('DatabaseService Clear All Data scope (D8)', () => {
   it('clears expenses, income, chat confirmations, and capture rows in one transaction', async () => {
     await databaseService.clearAllData();
 
-    expect(database.execAsync).toHaveBeenNthCalledWith(1, 'BEGIN');
+    expect(database.execAsync).toHaveBeenNthCalledWith(1, 'BEGIN IMMEDIATE');
     expect(database.execAsync).toHaveBeenLastCalledWith('COMMIT');
     const deletes = database.runAsync.mock.calls.map(call => call[0] as string);
     expect(deletes).toEqual([
@@ -1275,7 +1275,7 @@ describe('DatabaseService Clear All Data scope (D8)', () => {
 
     await expect(databaseService.clearAllData()).rejects.toThrow('disk full');
 
-    expect(database.execAsync).toHaveBeenCalledWith('BEGIN');
+    expect(database.execAsync).toHaveBeenCalledWith('BEGIN IMMEDIATE');
     expect(database.execAsync).toHaveBeenCalledWith('ROLLBACK');
     expect(database.execAsync).not.toHaveBeenCalledWith('COMMIT');
   });
@@ -1598,6 +1598,20 @@ describe('DatabaseService freshness publishers', () => {
 
   it('publishes the settings token for an onboarding completion', async () => {
     await databaseService.completeOnboarding({ currency: 'USD', monthlyBudget: '1200', profileName: 'Peach' });
+  });
+
+  it('writes batch settings in a single transaction and publishes settings token once', async () => {
+    freshness.markDataChanged.mockClear();
+    database.execAsync.mockClear();
+    await databaseService.updateSettings({
+      last_streak: '3',
+      last_opened_date: '2026-03-15',
+    });
+
+    expect(database.execAsync).toHaveBeenNthCalledWith(1, 'BEGIN IMMEDIATE');
+    expect(database.execAsync).toHaveBeenNthCalledWith(2, 'COMMIT');
+    expect(freshness.markDataChanged).toHaveBeenCalledTimes(1);
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
 
     expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
   });

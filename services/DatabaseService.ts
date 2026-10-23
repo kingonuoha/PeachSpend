@@ -394,6 +394,38 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   }
 
   // Expenses
+  async getProfileExpenseSummary(): Promise<{
+    transactionCount: number;
+    scansCount: number;
+    totalSpent: number;
+    earliestExpenseDate: number | null;
+    hasForeignCurrencies: boolean;
+  }> {
+    const db = await this.getDb();
+    const totals = await db.getFirstAsync<{
+      transaction_count: number;
+      scans_count: number;
+      total_spent: number;
+      earliest_date: number | null;
+      distinct_currencies: number;
+    }>(`
+      SELECT
+        COUNT(*) AS transaction_count,
+        COALESCE(SUM(CASE WHEN scanned = 1 THEN 1 ELSE 0 END), 0) AS scans_count,
+        COALESCE(SUM(amount), 0) AS total_spent,
+        MIN(created_at) AS earliest_date,
+        COUNT(DISTINCT currency) AS distinct_currencies
+      FROM expenses
+    `);
+    return {
+      transactionCount: totals?.transaction_count ?? 0,
+      scansCount: totals?.scans_count ?? 0,
+      totalSpent: totals?.total_spent ?? 0,
+      earliestExpenseDate: totals?.earliest_date ?? null,
+      hasForeignCurrencies: (totals?.distinct_currencies ?? 0) > 1,
+    };
+  }
+
   async getExpenses(): Promise<Expense[]> {
     const db = await this.getDb();
     return await db.getAllAsync<Expense>('SELECT * FROM expenses ORDER BY date DESC');
@@ -601,7 +633,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     return (await getSecret(key)) !== null;
   }
 
-  private async writePublicSetting(db: SQLite.SQLiteDatabase, key: string, value: string): Promise<void> {
+  private async persistPublicSetting(db: SQLite.SQLiteDatabase, key: string, value: string, notify = true): Promise<void> {
     if (SENSITIVE_SETTING_KEYS.has(key)) registerSensitiveValue(value);
     await db.runAsync(
       'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
@@ -610,7 +642,32 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     // One publisher for the settings table: updateSetting, completeOnboarding and
     // the auto capture settings write all funnel through here, so a settings
     // change cannot reach the table without waking the screens that read it.
-    markDataChanged('settings');
+    if (notify) {
+      markDataChanged('settings');
+    }
+  }
+
+  private async writePublicSetting(db: SQLite.SQLiteDatabase, key: string, value: string): Promise<void> {
+    return this.persistPublicSetting(db, key, value, true);
+  }
+
+  async updateSettings(entries: Record<string, string>): Promise<void> {
+    const db = await this.getDb();
+    await db.execAsync('BEGIN IMMEDIATE');
+    try {
+      for (const [key, value] of Object.entries(entries)) {
+        if (isSecretSettingKey(key)) {
+          await setSecret(key, value);
+        } else {
+          await this.persistPublicSetting(db, key, value, false);
+        }
+      }
+      await db.execAsync('COMMIT');
+      markDataChanged('settings');
+    } catch (error) {
+      await db.execAsync('ROLLBACK');
+      throw error;
+    }
   }
 
   async updateSetting(key: string, value: string) {
@@ -646,15 +703,16 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     const profileName = settings.profileName?.trim();
     const storedBudget = toStoredBudget(settings.monthlyBudget);
 
-    await db.execAsync('BEGIN');
+    await db.execAsync('BEGIN IMMEDIATE');
     try {
-      await this.writePublicSetting(db, 'currency', settings.currency);
-      await this.writePublicSetting(db, 'budget_currency', settings.currency);
-      if (profileName) await this.writePublicSetting(db, 'profile_name', profileName);
-      if (storedBudget !== null) await this.writePublicSetting(db, 'monthly_budget', storedBudget);
-      await this.writePublicSetting(db, 'profile_join_date', String(Date.now()));
-      await this.writePublicSetting(db, 'onboarding_complete', 'true');
+      await this.persistPublicSetting(db, 'currency', settings.currency, false);
+      await this.persistPublicSetting(db, 'budget_currency', settings.currency, false);
+      if (profileName) await this.persistPublicSetting(db, 'profile_name', profileName, false);
+      if (storedBudget !== null) await this.persistPublicSetting(db, 'monthly_budget', storedBudget, false);
+      await this.persistPublicSetting(db, 'profile_join_date', String(Date.now()), false);
+      await this.persistPublicSetting(db, 'onboarding_complete', 'true', false);
       await db.execAsync('COMMIT');
+      markDataChanged('settings');
     } catch (error) {
       await db.execAsync('ROLLBACK');
       logger.error('Failed to complete onboarding settings', 'onboarding_write_failed');
@@ -1520,7 +1578,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // Reset App is a separate, wider boundary.
   async clearAllData() {
     const db = await this.getDb();
-    await db.execAsync('BEGIN');
+    await db.execAsync('BEGIN IMMEDIATE');
     try {
       const rows = await db.getAllAsync<{ image_uri: string | null }>('SELECT image_uri FROM expenses');
       const receiptImageUris = rows

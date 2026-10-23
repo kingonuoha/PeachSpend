@@ -63,6 +63,7 @@ export interface StreakDayDeps {
   today: string;
   readSettings: () => Promise<Record<string, string>>;
   writeSetting: (key: string, value: string) => Promise<void>;
+  writeSettings?: (entries: Record<string, string>) => Promise<void>;
   loadBadge: () => Promise<AchievementState | null>;
 }
 
@@ -83,11 +84,20 @@ export async function advanceStreakForToday(deps: StreakDayDeps): Promise<Streak
 
   if (decision.kind === 'earned') return null;
 
-  if (decision.kind === 'started') await deps.writeSetting('streak_start_date', decision.startDate);
-  await deps.writeSetting('last_streak', String(decision.streak));
-  // The day guard is written last, so a stored date always means the streak value
-  // above was written for that day.
-  await deps.writeSetting('last_opened_date', deps.today);
+  if (deps.writeSettings) {
+    const batch: Record<string, string> = {
+      last_streak: String(decision.streak),
+      last_opened_date: deps.today,
+    };
+    if (decision.kind === 'started') {
+      batch.streak_start_date = decision.startDate;
+    }
+    await deps.writeSettings(batch);
+  } else {
+    if (decision.kind === 'started') await deps.writeSetting('streak_start_date', decision.startDate);
+    await deps.writeSetting('last_streak', String(decision.streak));
+    await deps.writeSetting('last_opened_date', deps.today);
+  }
 
   const streakStartDate = decision.kind === 'started' ? decision.startDate : (stored.streak_start_date ?? null);
   return { streak: decision.streak, streakStartDate, badge: await deps.loadBadge() };
@@ -104,7 +114,7 @@ async function loadNextBadge(): Promise<AchievementState | null> {
 }
 
 export default function StreakGate({ children }: { children: React.ReactNode }) {
-  const { isLoading, updateSetting } = useSettings();
+  const { isLoading, updateSetting, updateSettings } = useSettings();
   const [splash, setSplash] = useState<StreakSplashState | null>(null);
   const [selectedBadge, setSelectedBadge] = useState<AchievementState | null>(null);
   // One day pass at a time, so a foreground return that arrives while a pass is
@@ -114,9 +124,11 @@ export default function StreakGate({ children }: { children: React.ReactNode }) 
   // one in a ref keeps this pass stable and still routes every write through the
   // provider, so in-memory settings no longer go stale (BUG-09-01, secondary).
   const writeSetting = useRef(updateSetting);
+  const writeSettingsRef = useRef(updateSettings);
   useEffect(() => {
     writeSetting.current = updateSetting;
-  }, [updateSetting]);
+    writeSettingsRef.current = updateSettings;
+  }, [updateSetting, updateSettings]);
 
   const evaluateDay = useCallback(async () => {
     if (running.current) return;
@@ -126,6 +138,7 @@ export default function StreakGate({ children }: { children: React.ReactNode }) 
         today: localDay(),
         readSettings: () => databaseService.getAllSettings(),
         writeSetting: (key, value) => writeSetting.current(key, value),
+        writeSettings: (entries) => writeSettingsRef.current(entries),
         loadBadge: loadNextBadge,
       });
       if (nextSplash) setSplash(nextSplash);
