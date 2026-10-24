@@ -283,6 +283,7 @@ describe('ProfileDataService optimization and deduplication', () => {
     expect(getAllSettings).toHaveBeenCalledTimes(1);
 
     const third = await service.getSnapshot(1000, true);
+    expect(third).not.toBe(first);
     expect(getAllSettings).toHaveBeenCalledTimes(2);
   });
 });

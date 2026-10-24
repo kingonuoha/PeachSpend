@@ -1,5 +1,4 @@
 import type { Expense } from '../types/database';
-import type { SettingsPort } from './SettingsContracts';
 import type { ThemePackState } from './ThemePackContracts';
 
 export type ProfileLoadState = 'ready' | 'empty' | 'failure';

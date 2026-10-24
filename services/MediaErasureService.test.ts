@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ownedMediaErasurePort } from './MediaErasureService';
+import { isOwnedReceiptImage, isOwnedReceiptImageName } from '../utils/ownedReceiptImage';
+import { isOwnedAvatarFile } from '../utils/profileAvatar';
+import { isOwnedExportFileName } from './CleanupService';
+
 const fileSystem = vi.hoisted(() => ({
   cacheDirectory: 'cache/' as string | null,
   documentDirectory: 'doc/' as string | null,
@@ -9,11 +14,6 @@ const fileSystem = vi.hoisted(() => ({
 }));
 
 vi.mock('expo-file-system/legacy', () => fileSystem);
-
-import { ownedMediaErasurePort } from './MediaErasureService';
-import { isOwnedReceiptImage, isOwnedReceiptImageName } from '../utils/ownedReceiptImage';
-import { isOwnedAvatarFile } from '../utils/profileAvatar';
-import { isOwnedExportFileName } from './CleanupService';
 
 beforeEach(() => {
   vi.clearAllMocks();
