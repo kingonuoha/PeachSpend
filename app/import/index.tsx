@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AccessibilityInfo,
+  FlatList,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -26,8 +27,10 @@ import {
   ArrowLeft,
   Check,
   ChevronRight,
+  ClipboardPaste,
   Copy,
   FileText,
+  ListChecks,
   Upload,
   X,
   Zap,
@@ -89,9 +92,30 @@ const LINK_HIT_SLOP = { top: 8, bottom: 8, left: 10, right: 10 };
 // needs vertical slop; horizontal slop would reach the 44pt checkbox beside it.
 const ROW_ACTION_HIT_SLOP = { top: 8, bottom: 8, left: 0, right: 0 };
 const SHEET_MAX_HEIGHT = 760;
-const AUTO_RETURN_MS = 2500;
 const CHECKBOX_SIZE = 22;
 const CHECKBOX_RADIUS = 6;
+
+// The four stages this surface actually moves through. The stepper reads the live
+// view, so it always reports real progress instead of a decorative bar.
+const IMPORT_STEPS = ['Source', 'Input', 'Review', 'Complete'] as const;
+type ImportStepIndex = 0 | 1 | 2 | 3;
+
+const VIEW_STEP: Record<ImportView, ImportStepIndex> = {
+  method: 0,
+  input: 1,
+  preview: 2,
+  success: 3,
+};
+
+// Sample statement shape, built from the column order this app's own CSV export
+// writes (date, merchant, amount, currency, category, note, tags, scanned,
+// has_receipt_image). The cells are placeholder tokens rather than invented
+// amounts or merchants, so nothing that looks like a real transaction is ever
+// staged for the user to commit by accident.
+const SAMPLE_STATEMENT = [
+  'date,merchant,amount,currency,category,note,tags,scanned,has_receipt_image',
+  'YYYY-MM-DD,Merchant name,amount,CURRENCY,category_id,,,,no',
+].join('\n');
 
 const ERROR_FIELD_LABEL: Record<string, string> = {
   merchant: 'merchant name',
@@ -139,6 +163,50 @@ interface PreviewRowProps {
   onToggle: (included: boolean) => void;
   /** Reports the pressed node tag so focus can return to this control on drawer close. */
   onEdit: (triggerTag?: number) => void;
+}
+
+// Four stage indicator. It reads the live view rather than a stored counter, so the
+// filled segments are real progress and not decoration.
+function ImportStepper({ current }: { current: ImportStepIndex }) {
+  const ts = useThemeStyles();
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityLabel={`Step ${current + 1} of ${IMPORT_STEPS.length}: ${IMPORT_STEPS[current]}`}
+      accessibilityValue={{ min: 1, max: IMPORT_STEPS.length, now: current + 1 }}
+      style={{ flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s1 }}
+    >
+      {IMPORT_STEPS.map((label, index) => {
+        const done = index < current;
+        const active = index === current;
+        return (
+          <View key={label} style={{ flex: 1, minWidth: 0, gap: Spacing.s1 }}>
+            <View
+              style={{
+                height: 4,
+                borderRadius: Radii.full,
+                backgroundColor: done || active ? ts.raw.primary : ts.bg.elevated,
+                opacity: done ? 0.55 : 1,
+              }}
+            />
+            <Text
+              numberOfLines={1}
+              style={[
+                Typography.micro,
+                {
+                  color: active ? ts.raw.primary : ts.text.onSurfaceVariant,
+                  fontFamily: active ? 'Manrope_700Bold' : 'Manrope_500Medium',
+                },
+              ]}
+            >
+              {label}
+            </Text>
+          </View>
+        );
+      })}
+    </View>
+  );
 }
 
 function PreviewRow({ item, category, onToggle, onEdit }: PreviewRowProps) {
@@ -298,7 +366,9 @@ export default function ImportScreen() {
   const [categories, setCategories] = useState<CaptureCategory[]>([]);
   const [aiAvailability, setAiAvailability] = useState<ImportAiAvailability | null | undefined>(undefined);
   const [copied, setCopied] = useState(false);
-  const [returnRemainingMs, setReturnRemainingMs] = useState(AUTO_RETURN_MS);
+  // Only set by an explicit paste action, so the clipboard is never read on mount,
+  // on focus, or on a timer.
+  const [pasteHint, setPasteHint] = useState<string | null>(null);
 
   const [editItemId, setEditItemId] = useState<string | null>(null);
   const [editMerchant, setEditMerchant] = useState('');
@@ -399,18 +469,11 @@ export default function ImportScreen() {
     else router.replace('/(tabs)/settings');
   }, [router]);
 
-  useEffect(() => {
-    if (view !== 'success' || !commitResult) return;
-    const startedAt = Date.now();
-    const interval = setInterval(() => {
-      setReturnRemainingMs(Math.max(0, AUTO_RETURN_MS - (Date.now() - startedAt)));
-    }, 100);
-    const timer = setTimeout(() => returnToOrigin(), AUTO_RETURN_MS);
-    return () => {
-      clearInterval(interval);
-      clearTimeout(timer);
-    };
-  }, [view, commitResult, returnToOrigin]);
+  // The imported rows are ledger rows, so the destination is the transaction list
+  // of the analytics surface, not its cashflow tab.
+  const goToLedger = useCallback(() => {
+    router.replace({ pathname: '/(tabs)/analytics', params: { tab: 'transactions' } } as never);
+  }, [router]);
 
   const handleBack = useCallback(() => {
     if (view === 'method' || view === 'success') returnToOrigin();
@@ -456,6 +519,43 @@ export default function ImportScreen() {
       showToast('Could not read the selected file.', 'error');
     }
   }, [showToast]);
+
+  // One tap fills the export's own column order so a user never has to guess the
+  // shape. The cells are placeholder tokens, so nothing resembling a real
+  // transaction is staged automatically.
+  const handleInsertSample = useCallback(() => {
+    setInputText(SAMPLE_STATEMENT);
+    setSelectedFileName(null);
+    setEmptyNotice(false);
+    setPasteHint('Sample format inserted. Replace the placeholder cells with real values before parsing.');
+  }, []);
+
+  // The user's press is the only thing that reads the clipboard. The text is then
+  // run through the same local parser the Parse action uses, so a suggestion is
+  // shown only when the clipboard really holds a statement this importer can read.
+  const handleUseClipboard = useCallback(async () => {
+    try {
+      const text = await Clipboard.getStringAsync();
+      const trimmed = text.trim();
+      if (!trimmed) {
+        setPasteHint('The clipboard is empty.');
+        return;
+      }
+      const probe = importDataSource.parseImportData(trimmed);
+      if (probe.expenses.length === 0) {
+        setPasteHint('The clipboard text is not a statement this importer can read. Nothing was pasted.');
+        return;
+      }
+      setInputText(trimmed);
+      setSelectedFileName(null);
+      setEmptyNotice(false);
+      setPasteHint(
+        `Pasted from the clipboard: ${probe.expenses.length} row${probe.expenses.length === 1 ? '' : 's'} recognised. Review, then Parse Data.`,
+      );
+    } catch {
+      setPasteHint('The clipboard could not be read.');
+    }
+  }, []);
 
   const handleParse = useCallback(async () => {
     if (!inputText.trim() || busy) return;
@@ -551,7 +651,6 @@ export default function ImportScreen() {
       await categoryService.ensure(names);
       const result = await commitImportItems(previewItems, repository);
       setCommitResult(result);
-      setReturnRemainingMs(AUTO_RETURN_MS);
       setView('success');
       if (result.failed > 0) {
         showToast(`${result.failed} item${result.failed === 1 ? '' : 's'} could not be imported.`, 'error');
@@ -579,7 +678,7 @@ export default function ImportScreen() {
           : 'Paste JSON or CSV'
         : view === 'preview'
           ? 'Review before saving'
-          : 'Returning to origin';
+          : 'Import finished';
 
   const importButtonLabel = (() => {
     if (busy === 'commit') return 'Importing...';
@@ -653,7 +752,7 @@ export default function ImportScreen() {
             <AlertTriangle size={14} color={ts.raw.warning} />
             <Text style={[Typography.micro, { color: ts.raw.warningContainerText, flex: 1 }]}>
               {aiAvailability.reason === 'missing_key'
-                ? 'No AI key configured. Add one in S-17, or use the external prompt fallback below.'
+                ? 'No AI key configured. Add one in AI settings, or use the external prompt fallback below.'
                 : 'You are offline. The in-app assistant needs a connection; use the external prompt fallback below.'}
             </Text>
           </View>
@@ -665,7 +764,7 @@ export default function ImportScreen() {
               ? 'Checking availability'
               : aiAvailability?.status === 'external'
                 ? aiAvailability.reason === 'missing_key'
-                  ? 'Open S-17'
+                  ? 'Open AI Settings'
                   : 'Use External Fallback'
                 : 'Continue to Chat'
           }
@@ -771,10 +870,35 @@ export default function ImportScreen() {
           ) : null}
         </ScalePressable>
       ) : (
-        <View style={{ gap: Spacing.s1 }}>
+        <View style={{ gap: Spacing.s2 }}>
+          {/* One tap each, both optional. The sample action fills the schema, the
+              clipboard action is the only path that reads the clipboard. */}
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.s2 }}>
+            <ScalePressable
+              haptic={false}
+              accessibilityRole="button"
+              accessibilityLabel="Insert a sample statement format"
+              onPress={handleInsertSample}
+              style={{ minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, paddingHorizontal: Spacing.s3, borderRadius: Radii.full, borderWidth: 1, borderColor: ts.raw.outline, backgroundColor: ts.raw.surface }}
+            >
+              <FileText size={13} color={ts.text.primary} />
+              <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Insert sample format</Text>
+            </ScalePressable>
+            <ScalePressable
+              haptic={false}
+              accessibilityRole="button"
+              accessibilityLabel="Paste the clipboard if it contains a statement"
+              onPress={() => { void handleUseClipboard(); }}
+              style={{ minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, paddingHorizontal: Spacing.s3, borderRadius: Radii.full, borderWidth: 1, borderColor: ts.raw.outline, backgroundColor: ts.raw.surface }}
+            >
+              <ClipboardPaste size={13} color={ts.text.primary} />
+              <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Use clipboard</Text>
+            </ScalePressable>
+          </View>
+
           <TextInput
             value={inputText}
-            onChangeText={(value) => { setInputText(value); setEmptyNotice(false); }}
+            onChangeText={(value) => { setInputText(value); setEmptyNotice(false); setPasteHint(null); }}
             placeholder="Paste JSON or CSV here..."
             placeholderTextColor={ts.text.onSurfaceVariant}
             selectionColor={ts.raw.primary}
@@ -783,6 +907,11 @@ export default function ImportScreen() {
             accessibilityLabel="Paste import data"
             style={[Typography.labelMd, { color: ts.text.onSurface, backgroundColor: ts.bg.low, borderColor: ts.border.subtle, borderWidth: 1, borderRadius: Radii.md, minHeight: 200, maxHeight: 320, padding: Spacing.s4 }]}
           />
+          {pasteHint ? (
+            <Text accessibilityLiveRegion="polite" style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+              {pasteHint}
+            </Text>
+          ) : null}
           {inputText.length > 0 ? (
             <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'right' }]}>{inputText.length} characters</Text>
           ) : null}
@@ -831,8 +960,11 @@ export default function ImportScreen() {
     </View>
   );
 
-  const renderPreview = () => (
-    <View style={{ gap: Spacing.s3 }}>
+  // The review list is virtualised: only the visible window of a large statement is
+  // mounted, and the tally and parse notice ride along as the list header so there is
+  // no scroll view wrapping the list.
+  const renderPreviewHeader = () => (
+    <View style={{ gap: Spacing.s3, marginBottom: Spacing.s3 }}>
       {parseNoticeOpen && parseMessages.length > 0 ? (
         <LuminousCard variant="low" style={{ padding: Spacing.s3, borderColor: ts.border.error20 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, marginBottom: Spacing.s1 }}>
@@ -888,18 +1020,22 @@ export default function ImportScreen() {
           </ScalePressable>
         </View>
       </LinearGradient>
-
-      {previewItems.map((item) => (
-        <PreviewRow
-          key={item.id}
-          item={item}
-          category={item.expense.category ? categoryById.get(item.expense.category) : undefined}
-          onToggle={(included) => handleToggleItem(item.id, included)}
-          onEdit={(triggerTag) => openEdit(item, triggerTag)}
-        />
-      ))}
     </View>
   );
+
+  const renderPreviewRow = useCallback(
+    ({ item }: { item: ImportPreviewItem }) => (
+      <PreviewRow
+        item={item}
+        category={item.expense.category ? categoryById.get(item.expense.category) : undefined}
+        onToggle={(included) => handleToggleItem(item.id, included)}
+        onEdit={(triggerTag) => openEdit(item, triggerTag)}
+      />
+    ),
+    [categoryById, handleToggleItem, openEdit],
+  );
+
+  const previewKeyExtractor = useCallback((item: ImportPreviewItem) => item.id, []);
 
   const renderSuccess = () => {
     if (!commitResult) return null;
@@ -929,16 +1065,19 @@ export default function ImportScreen() {
           </LuminousCard>
         ) : null}
 
-        <LuminousCard variant="high" style={{ padding: Spacing.s3, width: '100%', maxWidth: 360, gap: Spacing.s2 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s2 }}>
-            <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>Returning to origin</Text>
-            <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>{(returnRemainingMs / 1000).toFixed(1)}s</Text>
-          </View>
-          <View style={{ height: 6, borderRadius: Radii.full, backgroundColor: ts.bg.primary20, overflow: 'hidden' }}>
-            <View style={{ height: '100%', width: `${(returnRemainingMs / AUTO_RETURN_MS) * 100}%`, backgroundColor: ts.raw.primary }} />
-          </View>
-          <PeachButton title="Return Now" onPress={returnToOrigin} variant="secondary" size="sm" fullWidth />
-        </LuminousCard>
+        {/* No timer and no forced navigation: the result stays on screen until the
+            user chooses where to go. */}
+        <View style={{ width: '100%', maxWidth: 360, gap: Spacing.s2, marginTop: Spacing.s2 }}>
+          <PeachButton
+            title="Go to Ledger"
+            onPress={goToLedger}
+            variant="primary"
+            size="lg"
+            fullWidth
+            icon={<ListChecks size={16} color={Colors.white} />}
+          />
+          <PeachButton title="Done" onPress={returnToOrigin} variant="quiet" size="lg" fullWidth />
+        </View>
       </View>
     );
   };
@@ -1093,18 +1232,41 @@ export default function ImportScreen() {
         </View>
       </View>
 
-      <ScrollView
-        ref={scrollRef}
-        style={{ flex: 1 }}
-        contentContainerStyle={{ paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s4, paddingBottom: Spacing.s9, width: '100%', maxWidth: MAX_CONTENT_WIDTH, alignSelf: 'center' }}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-      >
-        {view === 'method' ? renderMethod() : null}
-        {view === 'input' ? renderInput() : null}
-        {view === 'preview' ? renderPreview() : null}
-        {view === 'success' ? renderSuccess() : null}
-      </ScrollView>
+      {/* Real stage indicator, driven by the live view. */}
+      <View style={{ paddingHorizontal: Spacing.s5, paddingTop: Spacing.s3 }}>
+        <View style={{ width: '100%', maxWidth: MAX_CONTENT_WIDTH, alignSelf: 'center' }}>
+          <ImportStepper current={VIEW_STEP[view]} />
+        </View>
+      </View>
+
+      {view === 'preview' ? (
+        <FlatList
+          style={{ flex: 1 }}
+          data={previewItems}
+          keyExtractor={previewKeyExtractor}
+          renderItem={renderPreviewRow}
+          ListHeaderComponent={renderPreviewHeader()}
+          contentContainerStyle={{ paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s4, paddingBottom: Spacing.s9, width: '100%', maxWidth: MAX_CONTENT_WIDTH, alignSelf: 'center' }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          initialNumToRender={12}
+          maxToRenderPerBatch={12}
+          windowSize={7}
+          removeClippedSubviews
+        />
+      ) : (
+        <ScrollView
+          ref={scrollRef}
+          style={{ flex: 1 }}
+          contentContainerStyle={{ paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s4, paddingBottom: Spacing.s9, width: '100%', maxWidth: MAX_CONTENT_WIDTH, alignSelf: 'center' }}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          {view === 'method' ? renderMethod() : null}
+          {view === 'input' ? renderInput() : null}
+          {view === 'success' ? renderSuccess() : null}
+        </ScrollView>
+      )}
 
       {view === 'preview' ? (
         <View style={{ paddingHorizontal: Spacing.s5, paddingTop: Spacing.s3, paddingBottom: Math.max(Spacing.s4, insets.bottom), borderTopWidth: 1, borderTopColor: ts.border.subtle, backgroundColor: ts.raw.surface }}>

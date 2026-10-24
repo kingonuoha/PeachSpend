@@ -13,6 +13,7 @@ import {
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Haptics from 'expo-haptics';
 import {
   ArrowDown,
   ArrowUp,
@@ -20,11 +21,15 @@ import {
   Calendar,
   Check,
   ChevronDown,
+  FileSpreadsheet,
+  PiggyBank,
+  Plus,
   RotateCcw,
   Search,
   Sparkles,
   TrendingDown,
   TrendingUp,
+  TriangleAlert,
   X,
   Zap,
 } from 'lucide-react-native';
@@ -40,6 +45,7 @@ import { SearchFilterBar } from '../../components/ui/SearchFilterBar';
 import { DateRangePicker } from '../../components/ui/DateRangePicker';
 import { SpendingDonut } from '../../components/analytics/SpendingDonut';
 import { CategoryBreakdown } from '../../components/analytics/CategoryBreakdown';
+import { ExpenseCalendar } from '../../components/analytics/ExpenseCalendar';
 import { ExpenseItem } from '../../components/expense/ExpenseItem';
 import { INSIGHT_SORT_OPTIONS, useInsights, type InsightSortKey } from '../../hooks/useInsights';
 import type { InsightTimeframe } from '../../data/InsightContracts';
@@ -56,6 +62,10 @@ const CARD_WATERMARK_SIZE = 96;
 const CARD_BLOB_SIZE = 150;
 const GRADIENT_LOCATIONS: [number, number, number] = [0, 0.45, 1];
 const DONUT_SIZE = 120;
+const MS_PER_DAY = 86_400_000;
+// Header controls sit in the top tap zone, so they carry the full 44pt floor
+// instead of the 38pt visual height the pair draws at 390px.
+const HEADER_CONTROL_SIZE = 44;
 
 export type InsightSectionTab = 'cashflow' | 'categories' | 'transactions';
 
@@ -98,8 +108,8 @@ export default function AnalyticsScreen() {
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
   const bottomClearance = useBottomClearance();
-  const { settings, currency: settingsCurrency } = useSettings();
-  const params = useLocalSearchParams<{ category?: string }>();
+  const { settings, currency: settingsCurrency, convertAmount } = useSettings();
+  const params = useLocalSearchParams<{ category?: string; tab?: string }>();
 
   const {
     snapshot,
@@ -117,7 +127,14 @@ export default function AnalyticsScreen() {
     requestAiDigest,
   } = useInsights();
 
-  const [activeTab, setActiveTab] = useState<InsightSectionTab>('cashflow');
+  const [manualTab, setManualTab] = useState<InsightSectionTab | null>(null);
+  // A caller can request a section, for example the import success screen sending the
+  // user to the ledger. The request is honoured until the user picks a tab, the same
+  // way the `category` arrival is honoured until it is cleared.
+  const paramTab = typeof params.tab === 'string' && SECTION_TABS.some(option => option.key === params.tab)
+    ? (params.tab as InsightSectionTab)
+    : null;
+  const activeTab: InsightSectionTab = manualTab ?? paramTab ?? 'cashflow';
   const [timeframeSheetVisible, setTimeframeSheetVisible] = useState(false);
 
   // Category filter handling
@@ -127,9 +144,12 @@ export default function AnalyticsScreen() {
   const categoryFilter = manualFilter ?? (paramCategory && paramCategory !== dismissedParam ? paramCategory : null);
 
   const applyCategoryFilter = useCallback((next: string | null) => {
+    // One selection haptic for every filter entry point (slice, legend row, clear
+    // action), so the three paths cannot drift into different feedback.
+    void Haptics.selectionAsync();
     setManualFilter(next);
     if (next === null) setDismissedParam(paramCategory);
-    if (next !== null) setActiveTab('transactions');
+    if (next !== null) setManualTab('transactions');
   }, [paramCategory]);
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -208,7 +228,13 @@ export default function AnalyticsScreen() {
     [searchQuery, detailOrderIds],
   );
 
+  const onSelectSection = useCallback((tab: InsightSectionTab) => {
+    void Haptics.selectionAsync();
+    setManualTab(tab);
+  }, []);
+
   const onSelectTimeframe = useCallback((timeframe: InsightTimeframe) => {
+    void Haptics.selectionAsync();
     setTimeframeSheetVisible(false);
     if (timeframe === 'custom') {
       setDatePickerVisible(true);
@@ -232,6 +258,14 @@ export default function AnalyticsScreen() {
     router.push({ pathname: '/spending-recap', params: { origin: 'insights' } } as never);
   }, [router]);
 
+  const openManualExpense = useCallback(() => {
+    router.push({ pathname: '/expense/manual', params: { origin: 'Insights' } } as never);
+  }, [router]);
+
+  const openImport = useCallback(() => {
+    router.push('/import');
+  }, [router]);
+
   if (loading && !snapshot) {
     return (
       <View style={[styles.loading, { backgroundColor: ts.bg.screen, paddingTop: insets.top }]}>
@@ -247,8 +281,76 @@ export default function AnalyticsScreen() {
   const changePercent = insight?.changePercent ?? null;
   const showDeltaBadge = direction === 'up' || direction === 'down';
   const deltaPositive = direction === 'down';
-  const isSurplus = (snapshot?.netBalance ?? 0) >= 0;
+  const netBalance = snapshot?.netBalance ?? 0;
+  const isSurplus = netBalance >= 0;
+  // A prior comparison only exists when the snapshot actually carries one. The
+  // percentage is never rendered without the real prior period total beside it.
+  const hasPriorPeriod = direction !== undefined && direction !== 'no_previous_data';
+  // Real days left in the loaded period, measured from the moment the snapshot
+  // was generated (a value the snapshot carries) so nothing reads the clock during
+  // render. A closed range, all-time or a custom window that already ended,
+  // resolves to zero and the daily row then says so instead of inventing a rate.
+  const daysRemaining = snapshot
+    ? Math.max(0, Math.ceil((snapshot.period.end - snapshot.generatedAt) / MS_PER_DAY))
+    : 0;
+  const dailyPace = daysRemaining > 0 ? Math.abs(netBalance) / daysRemaining : null;
+  // Share of inflow that went to expenses, as a whole percent. Null when there is
+  // no inflow to compare against, which is why the track labels can read "--".
+  const spentShare = snapshot && snapshot.totalIncome > 0
+    ? Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)
+    : null;
   const currentTimeframeLabel = TIMEFRAMES.find(t => t.key === query.timeframe)?.label ?? 'Period';
+
+  // Two distinct zero states. An empty period is an on-ramp, so it offers the two
+  // real routes into the ledger. A filtered list with no match keeps the recovery
+  // action instead, because the period itself does have rows.
+  const emptyState = periodExpenses.length === 0 ? (
+    <LuminousCard style={[styles.emptyCard, { borderColor: ts.raw.outline }]}>
+      <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
+        <Calendar size={18} color={ts.raw.primary} />
+      </View>
+      <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>No Transactions in This Period</Text>
+      <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
+        Log an expense or import a statement to unlock cashflow tracking, category shares and your digest.
+      </Text>
+      <View style={styles.emptyActions}>
+        <PeachButton
+          title="Add Expense"
+          variant="primary"
+          size="md"
+          fullWidth
+          icon={<Plus size={16} color={Colors.white} />}
+          onPress={openManualExpense}
+        />
+        <PeachButton
+          title="Import Statement"
+          variant="outline"
+          size="md"
+          fullWidth
+          icon={<FileSpreadsheet size={16} color={ts.raw.primary} />}
+          onPress={openImport}
+        />
+      </View>
+    </LuminousCard>
+  ) : (
+    <LuminousCard style={[styles.emptyCard, styles.emptyCardDashed, { borderColor: ts.raw.outline }]}>
+      <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
+        <Search size={18} color={ts.raw.primary} />
+      </View>
+      <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>No Matching Transactions</Text>
+      <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
+        Try adjusting your search terms or clearing the active category filter.
+      </Text>
+      <ScalePressable
+        accessibilityRole="button"
+        accessibilityLabel="Reset filters and search"
+        onPress={resetFilters}
+        style={styles.emptyReset}
+      >
+        <Text style={[styles.emptyResetText, { color: ts.raw.primary }]}>Reset Filters</Text>
+      </ScalePressable>
+    </LuminousCard>
+  );
 
   return (
     <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
@@ -271,6 +373,8 @@ export default function AnalyticsScreen() {
               accessibilityRole="button"
               accessibilityLabel={`Select timeframe, currently ${currentTimeframeLabel}`}
               onPress={() => setTimeframeSheetVisible(true)}
+              haptic={false}
+              hitSlop={{ top: 4, bottom: 4, left: 4, right: 4 }}
               style={[styles.durationPill, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
             >
               <Calendar size={13} color={ts.raw.primary} />
@@ -302,7 +406,8 @@ export default function AnalyticsScreen() {
                 accessibilityRole="button"
                 accessibilityState={{ selected: active }}
                 accessibilityLabel={`${tab.label} tab`}
-                onPress={() => setActiveTab(tab.key)}
+                onPress={() => onSelectSection(tab.key)}
+                haptic={false}
                 style={[styles.tabSegment, active ? { backgroundColor: ts.raw.primary } : null]}
               >
                 <Text
@@ -346,6 +451,7 @@ export default function AnalyticsScreen() {
                   { backgroundColor: isSurplus ? ts.raw.successContainer : ts.raw.dangerSoft },
                 ]}
               >
+                {!isSurplus ? <TriangleAlert size={12} color={ts.raw.danger} /> : null}
                 <Text
                   style={[
                     styles.netPillText,
@@ -354,7 +460,7 @@ export default function AnalyticsScreen() {
                   numberOfLines={1}
                 >
                   {pricesVisible
-                    ? `${isSurplus ? '+' : '-'}${formatCurrency(Math.abs(snapshot?.netBalance ?? 0), currency)} Net`
+                    ? `${isSurplus ? '+' : '-'}${formatCurrency(Math.abs(netBalance), currency)} Net`
                     : '••••'}
                 </Text>
               </View>
@@ -410,19 +516,71 @@ export default function AnalyticsScreen() {
                     styles.cashflowFill,
                     {
                       backgroundColor: ts.raw.primary,
-                      width: `${snapshot && snapshot.totalIncome > 0 ? Math.min(100, Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)) : 0}%`,
+                      width: `${spentShare === null ? 0 : Math.min(100, spentShare)}%`,
                     },
                   ]}
                 />
               </View>
               <View style={styles.cashflowTrackLabels}>
                 <Text style={[styles.cashflowTrackLabel, { color: ts.raw.onSurfaceVariant }]}>
-                  Spent: {snapshot && snapshot.totalIncome > 0 ? `${Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)}%` : '--'}
+                  Spent: {spentShare === null ? '--' : `${spentShare}%`}
                 </Text>
+                {/* A deficit is named as one. Reporting "Surplus: 0%" while the
+                    period is in the red would be a false label on a real number. */}
                 <Text style={[styles.cashflowTrackLabel, { color: ts.raw.onSurfaceVariant }]}>
-                  Surplus: {snapshot && snapshot.totalIncome > 0 ? `${Math.max(0, 100 - Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100))}%` : '--'}
+                  {spentShare === null
+                    ? 'Surplus: --'
+                    : isSurplus
+                      ? `Surplus: ${100 - spentShare}%`
+                      : `Overspend: ${spentShare - 100}%`}
                 </Text>
               </View>
+            </View>
+
+            {/* Daily pace: the remaining balance spread over the days actually left
+                in the loaded period, and a deficit reading when the period is in the
+                red. Both figures are arithmetic on snapshot values, never a
+                projection. */}
+            <View style={[styles.paceRow, { borderTopColor: ts.raw.outline }]}>
+              <View style={styles.paceIdentity}>
+                <View
+                  style={[
+                    styles.paceIcon,
+                    { backgroundColor: isSurplus ? ts.raw.successContainer : ts.raw.dangerSoft },
+                  ]}
+                >
+                  {isSurplus
+                    ? <PiggyBank size={14} color={ts.raw.successText} />
+                    : <TriangleAlert size={14} color={ts.raw.danger} />}
+                </View>
+                <View style={styles.paceCopy}>
+                  <Text style={[styles.paceLabel, { color: ts.raw.onSurfaceVariant }]}>
+                    {isSurplus ? 'Daily safe spend' : 'Daily shortfall'}
+                  </Text>
+                  <Text
+                    style={[styles.paceValue, { color: isSurplus ? ts.raw.onSurface : ts.raw.danger }]}
+                  >
+                    {!pricesVisible
+                      ? '••••'
+                      : dailyPace === null
+                        ? 'No days left in this range'
+                        : `${formatCurrency(dailyPace, currency)} per day${isSurplus ? ' left' : ' to recover'}`}
+                  </Text>
+                </View>
+              </View>
+              {!isSurplus && topCategory ? (
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Filter transactions by ${topCategory.label}`}
+                  onPress={() => applyCategoryFilter(topCategory.name)}
+                  hitSlop={6}
+                  style={[styles.paceAction, { borderColor: ts.raw.primaryBorder }]}
+                >
+                  <Text style={[styles.paceActionText, { color: ts.raw.primary }]} numberOfLines={1}>
+                    Review {topCategory.label}
+                  </Text>
+                </ScalePressable>
+              ) : null}
             </View>
           </LuminousCard>
 
@@ -437,11 +595,22 @@ export default function AnalyticsScreen() {
             <View pointerEvents="none" style={styles.narrativeBlob} />
             <View style={styles.narrativeHeader}>
               <Text style={styles.narrativeEyebrow}>Period Performance</Text>
-              {showDeltaBadge && changePercent !== null ? (
-                <View style={[styles.deltaBadge, deltaPositive ? styles.deltaBadgeGood : styles.deltaBadgeUp]}>
-                  {deltaPositive ? <TrendingDown size={13} color="#6EE7B7" /> : <TrendingUp size={13} color="#FCD34D" />}
-                  <Text style={[styles.deltaBadgeText, { color: deltaPositive ? '#6EE7B7' : '#FCD34D' }]}>
-                    {deltaPositive ? `${Math.abs(changePercent).toFixed(0)}% Less` : `+${changePercent.toFixed(0)}% More`}
+              {snapshot && !narrativeUnavailable ? (
+                <View style={styles.narrativeDeltaBlock}>
+                  {showDeltaBadge && changePercent !== null ? (
+                    <View style={[styles.deltaBadge, deltaPositive ? styles.deltaBadgeGood : styles.deltaBadgeUp]}>
+                      {deltaPositive ? <TrendingDown size={13} color="#6EE7B7" /> : <TrendingUp size={13} color="#FCD34D" />}
+                      <Text style={[styles.deltaBadgeText, { color: deltaPositive ? '#6EE7B7' : '#FCD34D' }]}>
+                        {deltaPositive ? `${Math.abs(changePercent).toFixed(0)}% Less` : `+${changePercent.toFixed(0)}% More`}
+                      </Text>
+                    </View>
+                  ) : null}
+                  {/* The percentage never stands alone: the real prior period total
+                      sits beside it, and its absence is stated rather than implied. */}
+                  <Text style={styles.narrativeBaseline}>
+                    {hasPriorPeriod
+                      ? `Prior period ${pricesVisible ? formatCurrency(insight?.previousTotal ?? 0, currency) : '••••'}`
+                      : 'No prior period to compare'}
                   </Text>
                 </View>
               ) : null}
@@ -463,6 +632,11 @@ export default function AnalyticsScreen() {
               </>
             )}
             <View style={styles.narrativeFooter}>
+              <Text style={styles.narrativePeriod}>
+                {snapshot
+                  ? `Total Spent: ${pricesVisible ? formatCurrency(snapshot.totalSpent, currency) : '••••'}`
+                  : null}
+              </Text>
               <Text style={styles.narrativePeriod}>{snapshot ? formatPeriod(snapshot.period) : null}</Text>
             </View>
           </LinearGradient>
@@ -552,9 +726,7 @@ export default function AnalyticsScreen() {
                 distribution={distribution}
                 pricesVisible={pricesVisible}
                 currency={currency}
-                centerTopLabel={topCategory ? 'Top' : 'No data'}
-                centerLabel={topCategory?.label ?? '--'}
-                centerValue={topCategory ? `${topCategory.percentage.toFixed(0)}%` : ''}
+                selectedName={categoryFilter}
                 onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
               />
               <View style={styles.shareLegend}>
@@ -564,9 +736,29 @@ export default function AnalyticsScreen() {
                   pricesVisible={pricesVisible}
                   currency={currency}
                   onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
+                  onAddExpense={openManualExpense}
                 />
               </View>
             </View>
+          </LuminousCard>
+
+          {/* DEC-11-06 directed delta: the calendar is a visible section with its own
+              header inside the categories tab, not a disclosure and not appended to
+              the cashflow tab. The S-03 pair governs tokens, type and spacing only;
+              the section layout itself is owner-authorised. */}
+          <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
+            <View style={styles.sectionHeaderRow}>
+              <View style={{ flexShrink: 1, minWidth: 0 }}>
+                <Text style={[styles.sectionEyebrow, { color: ts.raw.onSurfaceVariant }]}>Monthly Rhythm</Text>
+                <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Spending Calendar</Text>
+              </View>
+            </View>
+            <ExpenseCalendar
+              expenses={expenses}
+              currency={currency}
+              pricesVisible={pricesVisible}
+              convertAmount={convertAmount}
+            />
           </LuminousCard>
         </ScrollView>
       ) : (
@@ -660,31 +852,7 @@ export default function AnalyticsScreen() {
               ) : null}
             </>
           }
-          ListEmptyComponent={
-            <LuminousCard style={[styles.emptyCard, { borderColor: ts.raw.outline }]}>
-              <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
-                <Search size={18} color={ts.raw.primary} />
-              </View>
-              <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>
-                {periodExpenses.length === 0 ? 'No Transactions in This Period' : 'No Matching Transactions'}
-              </Text>
-              <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
-                {periodExpenses.length === 0
-                  ? 'Try selecting a wider duration from the top dropdown.'
-                  : 'Try adjusting your search terms or clearing the active category filter.'}
-              </Text>
-              {(categoryFilter || searchQuery.trim().length > 0) ? (
-                <ScalePressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Reset filters and search"
-                  onPress={resetFilters}
-                  style={styles.emptyReset}
-                >
-                  <Text style={[styles.emptyResetText, { color: ts.raw.primary }]}>Reset Filters</Text>
-                </ScalePressable>
-              ) : null}
-            </LuminousCard>
-          }
+          ListEmptyComponent={emptyState}
         />
       )}
 
@@ -862,15 +1030,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.s1,
-    minHeight: 38,
+    minHeight: HEADER_CONTROL_SIZE,
+    maxWidth: 180,
     paddingHorizontal: Spacing.s3,
     borderRadius: Radii.full,
     borderWidth: 1,
+    flexShrink: 1,
   },
-  durationPillText: { ...Typography.micro, fontFamily: 'Manrope_700Bold' },
+  durationPillText: { ...Typography.micro, fontFamily: 'Manrope_700Bold', flexShrink: 1 },
   recapIconBtn: {
-    width: 38,
-    height: 38,
+    width: HEADER_CONTROL_SIZE,
+    height: HEADER_CONTROL_SIZE,
     borderRadius: Radii.full,
     borderWidth: 1,
     alignItems: 'center',
@@ -886,7 +1056,7 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: 640,
   },
-  tabSegment: { flex: 1, minHeight: 38, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
+  tabSegment: { flex: 1, minHeight: 44, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
   tabLabel: { ...Typography.labelMd, fontFamily: 'Manrope_500Medium' },
   tabLabelActive: { fontFamily: 'Manrope_700Bold' },
 
@@ -929,6 +1099,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(139,92,246,0.25)',
   },
   narrativeHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: Spacing.s2, gap: Spacing.s2 },
+  narrativeDeltaBlock: { alignItems: 'flex-end', gap: 2, flexShrink: 1, maxWidth: '56%' },
+  narrativeBaseline: { ...Typography.micro, color: 'rgba(233,213,255,0.8)', textAlign: 'right' },
   narrativeEyebrow: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', color: 'rgba(233,213,255,0.8)', textTransform: 'uppercase', letterSpacing: 0.8 },
   deltaBadge: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, paddingHorizontal: Spacing.s2, paddingVertical: 2, borderRadius: Radii.full, borderWidth: 1 },
   deltaBadgeGood: { backgroundColor: 'rgba(16,185,129,0.2)', borderColor: 'rgba(52,211,153,0.3)' },
@@ -953,7 +1125,7 @@ const styles = StyleSheet.create({
   cashflowHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s2, marginBottom: Spacing.s3 },
   sectionEyebrow: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', textTransform: 'uppercase', letterSpacing: 0.8 },
   sectionTitle: { ...Typography.labelBold, marginTop: 1 },
-  netPill: { paddingHorizontal: Spacing.s2, paddingVertical: 3, borderRadius: Radii.full },
+  netPill: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, paddingHorizontal: Spacing.s2, paddingVertical: 3, borderRadius: Radii.full },
   netPillText: { ...Typography.micro, fontFamily: 'Manrope_700Bold' },
   cashflowCards: { flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s3 },
   cashflowCard: { flex: 1, minWidth: 0, aspectRatio: 1, borderRadius: Radii.lg, borderWidth: 1, padding: Spacing.s3, overflow: 'hidden', justifyContent: 'space-between' },
@@ -969,6 +1141,31 @@ const styles = StyleSheet.create({
   cashflowFill: { height: '100%', borderRadius: Radii.full },
   cashflowTrackLabels: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: Spacing.s2 },
   cashflowTrackLabel: { ...Typography.micro },
+
+  paceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    gap: Spacing.s2,
+    marginTop: Spacing.s3,
+    paddingTop: Spacing.s3,
+    borderTopWidth: 1,
+  },
+  paceIdentity: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
+  paceIcon: { width: 28, height: 28, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
+  paceCopy: { flexShrink: 1, minWidth: 0 },
+  paceLabel: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', textTransform: 'uppercase', letterSpacing: 0.6 },
+  paceValue: { ...Typography.labelBold, marginTop: 1 },
+  paceAction: {
+    minHeight: HEADER_CONTROL_SIZE,
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.s3,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    maxWidth: '100%',
+  },
+  paceActionText: { ...Typography.micro, fontFamily: 'Manrope_700Bold' },
 
   sectionHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s2, marginBottom: Spacing.s2 },
   sectionHint: { ...Typography.micro },
@@ -987,10 +1184,12 @@ const styles = StyleSheet.create({
   errorRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 },
   errorText: { ...Typography.micro, flexShrink: 1 },
 
-  emptyCard: { borderRadius: Radii.md, padding: Spacing.s5, borderWidth: 1, borderStyle: 'dashed', alignItems: 'center' },
+  emptyCard: { borderRadius: Radii.md, padding: Spacing.s5, borderWidth: 1, alignItems: 'center' },
+  emptyCardDashed: { borderStyle: 'dashed' },
   emptyIcon: { width: 40, height: 40, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', marginBottom: Spacing.s2 },
   emptyTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', textAlign: 'center' },
   emptyBody: { ...Typography.micro, textAlign: 'center', marginTop: Spacing.s1, maxWidth: 280 },
+  emptyActions: { marginTop: Spacing.s4, gap: Spacing.s2, width: '100%', maxWidth: 280 },
   emptyReset: { minHeight: 44, justifyContent: 'center', marginTop: Spacing.s2 },
   emptyResetText: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold' },
 

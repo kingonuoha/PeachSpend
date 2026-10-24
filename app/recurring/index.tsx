@@ -14,6 +14,7 @@ import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-re
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { differenceInCalendarDays } from 'date-fns';
+import * as Haptics from 'expo-haptics';
 import { v4 as uuid } from 'uuid';
 import {
   ArrowLeft, ChevronDown, Info, Plus, RefreshCw, Repeat, Trash2, TriangleAlert, X,
@@ -54,6 +55,31 @@ const CLOSE_SIZE = 32;
 const CLOSE_HIT_SLOP = { top: 6, bottom: 6, left: 6, right: 6 };
 const SHEET_MAX_HEIGHT = 760;
 const UPCOMING_WINDOW_DAYS = 7;
+
+// Occurrence counts used to annualise a commitment. Each interval counts the real
+// number of drafts it produces in a year: a weekly draft fires 52 times, a monthly
+// draft 12 times, and a daily draft 365 times, so a non monthly template is never
+// multiplied by 12 as if it were monthly.
+const DAYS_PER_YEAR = 365;
+const WEEKS_PER_YEAR = 52;
+const MONTHS_PER_YEAR = 12;
+
+// Empty state quick starts. A preset carries only a name and defaults: the amount
+// stays blank so nothing fake is ever pre-filled, and the category is resolved
+// against the live category rows at tap time.
+interface RecurringPreset {
+  label: string;
+  merchant: string;
+  categoryIds: string[];
+  categoryTitles: string[];
+}
+
+const RECURRING_PRESETS: RecurringPreset[] = [
+  { label: 'Rent', merchant: 'Rent', categoryIds: ['utilities', 'housing'], categoryTitles: ['utilities', 'housing', 'rent'] },
+  { label: 'Netflix', merchant: 'Netflix', categoryIds: ['entertainment'], categoryTitles: ['entertainment', 'subscriptions'] },
+  { label: 'Gym', merchant: 'Gym', categoryIds: ['health'], categoryTitles: ['health', 'fitness'] },
+  { label: 'Internet', merchant: 'Internet', categoryIds: ['utilities'], categoryTitles: ['utilities', 'bills'] },
+];
 
 const INTERVALS: { value: RecurrenceInterval; label: string }[] = [
   { value: 'daily', label: 'Daily' },
@@ -118,6 +144,29 @@ function nextDueLabel(nextDueDate: number, now: number): string {
 
 function pluralize(count: number, singular: string, plural: string): string {
   return `${count} ${count === 1 ? singular : plural}`;
+}
+
+// Drafts a template produces in a year, or null when its schedule carries no day
+// to count (a custom template with an empty weekday set).
+function occurrencesPerYear(record: RecurringRecord): number | null {
+  switch (record.interval) {
+    case 'daily':
+      return DAYS_PER_YEAR;
+    case 'weekly':
+      return WEEKS_PER_YEAR;
+    case 'monthly':
+      return MONTHS_PER_YEAR;
+    case 'custom':
+      // A custom schedule repeats on the stored weekday set, so the yearly count is
+      // the number of selected weekdays times the weeks in a year.
+      return record.recurrenceDays.length > 0 ? record.recurrenceDays.length * WEEKS_PER_YEAR : null;
+  }
+}
+
+// Yearly outflow for one template, in its own currency.
+function annualisedRecordAmount(record: RecurringRecord): number | null {
+  const occurrences = occurrencesPerYear(record);
+  return occurrences === null ? null : record.amount * occurrences;
 }
 
 function emptyForm(categoryId: string): FormState {
@@ -301,11 +350,29 @@ export default function RecurringScreen() {
     return templates;
   }, [templates, filter, now]);
 
+  // Commitment figures. Expenses only, and each template is annualised by its own
+  // real frequency first, so the monthly figure is the yearly total spread over
+  // twelve months rather than a blind sum of mixed intervals.
   const summary = useMemo(() => {
     const expenses = templates.filter((record) => record.type === 'expense');
     const income = templates.filter((record) => record.type === 'income');
-    const total = expenses.reduce((sum, record) => sum + convertAmount(record.amount, record.currency).amount, 0);
-    return { total, expenseCount: expenses.length, incomeCount: income.length };
+    let annual = 0;
+    let unscheduledCount = 0;
+    expenses.forEach((record) => {
+      const yearly = annualisedRecordAmount(record);
+      if (yearly === null) {
+        unscheduledCount += 1;
+        return;
+      }
+      annual += convertAmount(yearly, record.currency).amount;
+    });
+    return {
+      annual,
+      monthly: annual / MONTHS_PER_YEAR,
+      expenseCount: expenses.length,
+      incomeCount: income.length,
+      unscheduledCount,
+    };
   }, [templates, convertAmount]);
 
   const openAdd = useCallback(() => {
@@ -326,6 +393,29 @@ export default function RecurringScreen() {
       recurrenceDays: record.recurrenceDays,
     });
   }, []);
+
+  // Resolves a preset's category against the rows that exist right now. The default
+  // ids are tried first; a user whose category set uses other ids falls back to a
+  // title match, which still returns a real row id. When nothing matches, the editor
+  // opens with the category unselected rather than a literal string.
+  const resolvePresetCategory = useCallback((preset: RecurringPreset): string => {
+    const byId = preset.categoryIds
+      .map((id) => categoryById.get(id))
+      .find((category) => category !== undefined);
+    if (byId) return byId.id;
+    const titles = preset.categoryTitles.map((title) => title.toLowerCase());
+    const byTitle = categories.find((category) => titles.includes(category.title.toLowerCase()));
+    return byTitle?.id ?? '';
+  }, [categoryById, categories]);
+
+  const openPreset = useCallback((preset: RecurringPreset) => {
+    void Haptics.selectionAsync();
+    setFieldError(null);
+    setForm({
+      ...emptyForm(resolvePresetCategory(preset)),
+      merchant: preset.merchant,
+    });
+  }, [resolvePresetCategory]);
 
   const closeForm = useCallback(() => {
     setForm(null);
@@ -418,6 +508,9 @@ export default function RecurringScreen() {
   const deleteTarget = form?.mode === 'edit' && form.id
     ? templates.find((record) => record.id === form.id)
     : undefined;
+  // Capital recovered per year, in the template's own currency, from the real
+  // amount and its real frequency. Null when the schedule carries no day.
+  const deleteTargetAnnual = deleteTarget ? annualisedRecordAmount(deleteTarget) : null;
 
   const sheetMaxHeight = Math.min(height * 0.9, SHEET_MAX_HEIGHT);
   const editing = form?.mode === 'edit';
@@ -508,10 +601,23 @@ export default function RecurringScreen() {
 
           <LuminousCard variant="high" style={[styles.summaryCard, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
             <View style={styles.summaryLeft}>
-              <Text style={[Typography.micro, styles.summaryLabel, { color: ts.raw.onSurfaceVariant }]}>RECURRING COMMITMENTS</Text>
+              <Text style={[Typography.micro, styles.summaryLabel, { color: ts.raw.onSurfaceVariant }]}>MONTHLY COMMITMENT</Text>
               <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7} style={[Typography.displayMd, { color: ts.raw.onSurface }]}>
-                {formatCurrency(summary.total, currency)}
+                {formatCurrency(summary.monthly, currency)}
               </Text>
+              {/* The annual anchor sits beside the monthly figure so the drip cost is
+                  never read on its own. Both come from one derivation, per template
+                  frequency. */}
+              <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+                {`${formatCurrency(summary.annual, currency)} per year`}
+              </Text>
+              {summary.unscheduledCount > 0 ? (
+                <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+                  {summary.unscheduledCount === 1
+                    ? '1 template has no schedule day and is not counted'
+                    : `${summary.unscheduledCount} templates have no schedule day and are not counted`}
+                </Text>
+              ) : null}
             </View>
             <View style={styles.summaryRight}>
               <View style={[styles.summaryBadge, { backgroundColor: ts.raw.purple100 }]}>
@@ -535,7 +641,10 @@ export default function RecurringScreen() {
                 <ScalePressable
                   key={option.value}
                   haptic={false}
-                  onPress={() => setFilter(option.value)}
+                  onPress={() => {
+                    void Haptics.selectionAsync();
+                    setFilter(option.value);
+                  }}
                   accessibilityRole="tab"
                   accessibilityState={{ selected }}
                   accessibilityLabel={option.label}
@@ -563,6 +672,22 @@ export default function RecurringScreen() {
               <Text style={[Typography.labelMd, styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
                 Add recurring expenses or income to automate your cash flow. Items marked as Repeats when adding an expense or income also appear here.
               </Text>
+              <View style={styles.presetRow}>
+                {RECURRING_PRESETS.map((preset) => (
+                  <ScalePressable
+                    key={preset.label}
+                    haptic={false}
+                    onPress={() => openPreset(preset)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Start a ${preset.label} template`}
+                    style={[styles.presetChip, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
+                  >
+                    <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.raw.primary }]}>
+                      {preset.label}
+                    </Text>
+                  </ScalePressable>
+                ))}
+              </View>
               <PeachButton
                 title="Add Your First Template"
                 onPress={openAdd}
@@ -694,7 +819,10 @@ export default function RecurringScreen() {
                         <ScalePressable
                           key={type}
                           haptic={false}
-                          onPress={() => setForm((current) => (current ? { ...current, type } : current))}
+                          onPress={() => {
+                            void Haptics.selectionAsync();
+                            setForm((current) => (current ? { ...current, type } : current));
+                          }}
                           accessibilityRole="radio"
                           accessibilityState={{ selected }}
                           accessibilityLabel={type === 'expense' ? 'Expense' : 'Income'}
@@ -801,7 +929,10 @@ export default function RecurringScreen() {
                           <ScalePressable
                             key={option.value}
                             haptic={false}
-                            onPress={() => setForm((current) => (current ? { ...current, interval: option.value } : current))}
+                            onPress={() => {
+                              void Haptics.selectionAsync();
+                              setForm((current) => (current ? { ...current, interval: option.value } : current));
+                            }}
                             accessibilityRole="radio"
                             accessibilityState={{ selected }}
                             accessibilityLabel={option.label}
@@ -826,6 +957,7 @@ export default function RecurringScreen() {
                                 key={day.value}
                                 haptic={false}
                                 onPress={() => {
+                                  void Haptics.selectionAsync();
                                   setForm((current) => {
                                     if (!current) return current;
                                     const days = current.recurrenceDays.includes(day.value)
@@ -919,8 +1051,19 @@ export default function RecurringScreen() {
               <Trash2 size={22} color={ts.raw.danger} />
             </View>
             <Text style={[Typography.bodyBold, { color: ts.raw.onSurface, textAlign: 'center' }]}>Delete Recurring Template?</Text>
+            {/* Framed around the capital the user gets back, with the yearly figure
+                computed from this template's real amount and frequency. */}
             <Text style={[Typography.labelMd, styles.confirmBody, { color: ts.raw.onSurfaceVariant }]}>
-              {`Deleting "${deleteTarget?.merchant ?? ''}" stops future automated drafts. Existing ledger entries will remain untouched.`}
+              {deleteTargetAnnual !== null && deleteTarget
+                ? (deleteTarget.type === 'income'
+                  ? `Removing "${deleteTarget.merchant}" ends ${formatCurrency(deleteTargetAnnual, deleteTarget.currency)} of scheduled income a year.`
+                  : `Cancelling "${deleteTarget.merchant}" frees up ${formatCurrency(deleteTargetAnnual, deleteTarget.currency)} a year.`)
+                : `Deleting "${deleteTarget?.merchant ?? ''}" stops future automated drafts.`}
+            </Text>
+            <Text style={[Typography.micro, styles.confirmBodySecondary, { color: ts.raw.onSurfaceVariant }]}>
+              {deleteTargetAnnual !== null
+                ? 'Future drafts stop. Entries already in your ledger stay untouched.'
+                : 'Entries already in your ledger stay untouched.'}
             </Text>
             <View style={styles.confirmActions}>
               <PeachButton
@@ -1092,6 +1235,19 @@ const styles = StyleSheet.create({
   },
   emptyFilter: {
     paddingVertical: Spacing.s6,
+  },
+  presetRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: Spacing.s2,
+  },
+  presetChip: {
+    minHeight: 44,
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.s4,
+    borderRadius: Radii.full,
+    borderWidth: 1,
   },
   skeletonStack: {
     gap: Spacing.s1,
@@ -1346,6 +1502,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: Spacing.s2,
     lineHeight: 18,
+  },
+  confirmBodySecondary: {
+    textAlign: 'center',
+    marginTop: Spacing.s1,
+    lineHeight: 16,
   },
   confirmActions: {
     width: '100%',

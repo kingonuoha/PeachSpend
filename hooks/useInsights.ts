@@ -91,7 +91,10 @@ export function useInsights() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [categoryMeta, setCategoryMeta] = useState<Record<string, InsightCategoryMeta>>({});
   const [digest, setDigest] = useState<InsightDigest | null>(null);
-  const [query, setQuery] = useState<InsightTimeframeQuery>({ timeframe: 'week' });
+  // Month is the default basis: a single week is easily distorted by one rent or
+  // bulk grocery day, and most budgets run on a monthly cycle, so the first view
+  // is not skewed by an unrepresentative window.
+  const [query, setQuery] = useState<InsightTimeframeQuery>({ timeframe: 'month' });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(false);
