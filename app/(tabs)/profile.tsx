@@ -620,6 +620,14 @@ export default function ProfileScreen() {
                           rememberFocusTrigger(event);
                           setEditing(true);
                         }}
+                        /* QA O5. The pill renders 28pt tall (labelMd's 16pt line plus
+                           2pt padding inside a 28pt floor) and that was the whole touch
+                           box. Same pattern as the Edit pill below: hitSlop lifts the
+                           target to 44pt without changing the rendered box. Horizontal
+                           slop stays zero because the Edit pill sits 4pt away and
+                           already claims its own left slop, so growing this one sideways
+                           would overlap it and move the mis-tap, not remove it. */
+                        hitSlop={{ top: 8, bottom: 8 }}
                         style={{
                           flexShrink: 1,
                           minHeight: 28,
