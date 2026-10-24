@@ -13,11 +13,12 @@ import {
   type ChatActionKind, type ChatActionOutcome, type ChatActionResult, type ChatActionRequest, type ChatApprovalDecision,
 } from '../ai/chatActions';
 import {
-  buildConversationHistoryState, CHAT_HISTORY_AUTO_CLEAR_DAYS, refreshModels as refreshProviderModelList, toMaskedKeyState,
+  buildConversationHistoryState, refreshModels as refreshProviderModelList, toMaskedKeyState,
   type ConversationHistoryState, type ModelRefreshOutcome, type ProviderKeyState,
 } from '../data/ProviderSettings';
 import { formatCurrency, resolveDisplayCurrency } from '../utils/currency';
 import { parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
+import { answerLocalQuestion, type LocalAnswer } from '../ai/localAnswers';
 
 const MAX_HISTORY_MESSAGES = 50;
 const TRIM_HISTORY_TO = 40;
@@ -677,27 +678,26 @@ LEDGER_DATA>>>`;
   }
 
   async checkAutoExpiry(): Promise<boolean> {
-    const lastActive = await databaseService.getSetting('chat_last_active');
-    if (!lastActive) return false;
+    // Phase 11 D4, DEC-11-03. This is the chat maintenance entry point the app start
+    // path and the chat screen already call, so the retention sweep runs from the
+    // existing service bootstrap without a new call site in a screen. It used to clear
+    // the whole conversation after seven quiet days, which no longer happens: keep
+    // forever is the default and the only behaviour for a fresh install. With 7 or 30
+    // days selected, messages older than the window are deleted instead, which is age
+    // based and does not care whether the user was recently active.
+    // Returns true only when messages were actually removed.
+    const deleted = await databaseService.purgeExpiredChatMessages();
+    if (deleted > 0) logger.info('Chat history trimmed by the retention window');
+    return deleted > 0;
+  }
 
-    const lastActiveTime = parseInt(lastActive);
-    if (isNaN(lastActiveTime)) return false;
-
-    const daysSince = (Date.now() - lastActiveTime) / 86400000;
-    if (daysSince > CHAT_HISTORY_AUTO_CLEAR_DAYS) {
-      await databaseService.clearChatHistory();
-      await databaseService.saveChatMessage({
-        id: Math.random().toString(36).substring(2, 15),
-        role: 'assistant',
-        content: 'Your previous conversation was cleared after 7 days of inactivity.',
-        message_type: 'system',
-        created_at: Date.now(),
-      });
-      await databaseService.updateSetting('chat_last_active', Date.now().toString());
-      return true;
-    }
-
-    return false;
+  // Phase 11 D7 (B4-1). The offline analytical answer path. This delegates to
+  // ai/localAnswers, which reads through the ledger services and imports no provider
+  // client, so this method makes no network request and reads no API key. The chat
+  // surface calls it when there is no key or no connection, and renders the returned
+  // chart and rows with the same components a remote answer uses.
+  async answerLocally(question: string, now?: number): Promise<LocalAnswer> {
+    return answerLocalQuestion(databaseService, question, now);
   }
 
   private trimHistory(history: ChatMessage[]): ChatMessage[] {

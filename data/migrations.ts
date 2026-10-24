@@ -187,7 +187,37 @@ const migration7: Migration = {
   },
 };
 
-export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7];
+// Phase 11 D2, ESC-11-09. The offline receipt draft store. A captured receipt is
+// kept here when OCR cannot run at all (no connection, no provider key) so the
+// user's photo survives until it can be retried, which no existing table covers:
+// capture_queue holds auto-capture push payloads and is deliberately not
+// repurposed (see data/ReceiptDrafts.ts).
+//
+// The composite index serves the two statements this table has. The claim reads
+// `WHERE status = ? ORDER BY created_at ASC LIMIT 1`, and the list surface reads
+// `WHERE status = ? ORDER BY created_at DESC`. A single (status, created_at) index
+// serves both, because SQLite can scan an index in either direction.
+//
+// One way, with the reason stated rather than left for a reader to guess: there is
+// no down(). This table is the only pointer the app holds to a receipt image the
+// user captured but has not saved yet, and the image file lives outside the
+// database. A rollback that dropped the table would silently discard those
+// pending receipts and leave their images orphaned in the cache, so the table is
+// additive and stays. The same reasoning migration 3 records for the capture
+// queue.
+const migration8: Migration = {
+  version: 8,
+  name: 'receipt-draft-store',
+  oneWayReason: 'A rollback would delete the pending offline receipts the user captured and orphan their image files.',
+  async up(db) {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS receipt_drafts (id TEXT PRIMARY KEY NOT NULL, image_uri TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_receipt_drafts_status_created_at ON receipt_drafts(status, created_at);
+    `);
+  },
+};
+
+export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8];
 
 // Connection level setup, applied on every open so the settings cannot drift between
 // an install that migrated and one that opened an already current file.

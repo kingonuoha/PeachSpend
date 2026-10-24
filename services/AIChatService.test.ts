@@ -22,6 +22,10 @@ const mocks = vi.hoisted(() => ({
   getBudgetStatus: vi.fn(),
   hasSecret: vi.fn(),
   getSecret: vi.fn(),
+  clearChatHistory: vi.fn(),
+  purgeExpiredChatMessages: vi.fn(),
+  getExpensesByCategoryInRange: vi.fn(),
+  getCategories: vi.fn(),
 }));
 
 vi.mock('./DatabaseService', () => ({ databaseService: mocks }));
@@ -532,5 +536,64 @@ describe('AI chat intent alternatives match the lowercased message (BUG-09-13)',
   it('classifies "what did I spend" as recent_expenses', () => {
     expect(aiChatService.classifyIntent('what did I spend')).toEqual(['recent_expenses']);
     expect(aiChatService.classifyIntent('what did i spend')).toEqual(['recent_expenses']);
+  });
+});
+
+// Phase 11 D4 (DEC-11-03) and D7 (B4-1). The chat service is the existing bootstrap
+// entry point for the retention sweep, and the offline answer path it exposes must not
+// reach a provider or a key.
+describe('AI chat retention sweep (D4)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSetting.mockResolvedValue(null);
+  });
+
+  it('runs the retention sweep through the existing maintenance entry point', async () => {
+    mocks.purgeExpiredChatMessages.mockResolvedValue(3);
+
+    await expect(aiChatService.checkAutoExpiry()).resolves.toBe(true);
+
+    expect(mocks.purgeExpiredChatMessages).toHaveBeenCalledTimes(1);
+    // The old behaviour cleared the whole conversation and left a message saying it
+    // had. Neither is allowed any more: keep forever is the default.
+    expect(mocks.clearChatHistory).not.toHaveBeenCalled();
+    expect(mocks.saveChatMessage).not.toHaveBeenCalled();
+    expect(mocks.updateSetting).not.toHaveBeenCalled();
+  });
+
+  it('reports no change when nothing was older than the retention window', async () => {
+    mocks.purgeExpiredChatMessages.mockResolvedValue(0);
+
+    await expect(aiChatService.checkAutoExpiry()).resolves.toBe(false);
+    expect(mocks.clearChatHistory).not.toHaveBeenCalled();
+  });
+});
+
+describe('AI chat local answers (D7)', () => {
+  const now = new Date(2026, 9, 24, 12, 0, 0).getTime();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSetting.mockImplementation(async (key: string) => (key === 'currency' ? 'USD' : null));
+    mocks.getMonthlySummary.mockResolvedValue({ totalSpent: 90, totalIncome: 0, expenseCount: 2, topCategory: null, biggestExpense: null });
+  });
+
+  it('answers a supported question from the ledger with no provider call and no key read', async () => {
+    const answer = await aiChatService.answerLocally('How much did I spend this month?', now);
+
+    expect(answer.status).toBe('answered');
+    expect(answer.status === 'answered' && answer.text).toBe('This month you spent $90 across 2 expenses.');
+    expect(providerMocks.chatWithProvider).not.toHaveBeenCalled();
+    expect(providerMocks.listProviderModels).not.toHaveBeenCalled();
+    expect(mocks.getSecret).not.toHaveBeenCalled();
+    expect(mocks.getSetting).toHaveBeenCalledWith('currency');
+  });
+
+  it('returns the typed cannot answer result for a question outside the local set', async () => {
+    const answer = await aiChatService.answerLocally('What is my budget?', now);
+
+    expect(answer).toEqual({ status: 'cannot_answer', reason: 'unsupported_question' });
+    expect(mocks.getMonthlySummary).not.toHaveBeenCalled();
+    expect(providerMocks.chatWithProvider).not.toHaveBeenCalled();
   });
 });

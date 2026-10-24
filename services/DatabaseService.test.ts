@@ -1011,6 +1011,9 @@ describe('DatabaseService achievement pass (BUG-09-11a)', () => {
       ['novelist', 3, 5],
       ['on-track', 7, 7],
       ['disciplined', 7, 30],
+      // Phase 11 D5. The setup milestone is appended to the catalogue, so it sorts
+      // last here and no existing badge moves. It is not earned in this fixture.
+      ['vault_initialized', 0, 1],
     ];
 
     expect(badges.map(badge => [badge.id, badge.current, badge.target])).toEqual(expected);
@@ -1297,7 +1300,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v1', userVersion: 0, currentVersion: 7, hasRecords: false,
+      schema: 'v1', userVersion: 0, currentVersion: 8, hasRecords: false,
     });
   });
 
@@ -1310,7 +1313,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v2', userVersion: 6, currentVersion: 7, hasRecords: true,
+      schema: 'v2', userVersion: 6, currentVersion: 8, hasRecords: true,
     });
   });
 
@@ -1326,7 +1329,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v2', userVersion: 7, currentVersion: 7, hasRecords: true,
+      schema: 'v2', userVersion: 7, currentVersion: 8, hasRecords: true,
     });
   });
 
@@ -1339,7 +1342,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'none', userVersion: 0, currentVersion: 7, hasRecords: false,
+      schema: 'none', userVersion: 0, currentVersion: 8, hasRecords: false,
     });
   });
 
@@ -1633,5 +1636,333 @@ describe('DatabaseService freshness publishers', () => {
     await databaseService.getAllSettings();
 
     expect(freshness.markDataChanged).not.toHaveBeenCalled();
+  });
+});
+
+// Phase 11 D1 (B2-5). Correcting a merchant name on an existing expense. The write is
+// one column on one row, and the merchant memory is deliberately not a side effect.
+describe('DatabaseService merchant correction (D1)', () => {
+  it('stores the trimmed merchant on the requested expense', async () => {
+    await databaseService.updateExpenseMerchant('expense-1', '  Blue Bottle  ');
+
+    expect(database.runAsync).toHaveBeenCalledTimes(1);
+    expect(database.runAsync).toHaveBeenCalledWith('UPDATE expenses SET merchant = ? WHERE id = ?', ['Blue Bottle', 'expense-1']);
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('ledger');
+  });
+
+  it('refuses a blank merchant with the same typed error the expense writer uses', async () => {
+    await expect(databaseService.updateExpenseMerchant('expense-1', '   ')).rejects.toMatchObject({
+      name: 'CaptureValidationError', code: 'capture_validation', field: 'merchant',
+    });
+    expect(database.runAsync).not.toHaveBeenCalled();
+  });
+
+  it('never trains the merchant memory from a correction', async () => {
+    await databaseService.updateExpenseMerchant('expense-1', 'Blue Bottle');
+
+    const statements = [
+      ...database.runAsync.mock.calls.map(call => call[0] as string),
+      ...database.getAllAsync.mock.calls.map(call => call[0] as string),
+      ...database.getFirstAsync.mock.calls.map(call => call[0] as string),
+    ].join(' ');
+    expect(statements).not.toContain('merchant_category_memory');
+  });
+});
+
+// Phase 11 D2. The draft store is handed out over the service's own handle, so a
+// screen never opens a database of its own.
+describe('DatabaseService receipt draft store (D2)', () => {
+  it('exposes a draft store that writes through the service handle', async () => {
+    const store = await databaseService.getReceiptDraftStore();
+
+    const draft = await store.enqueueReceiptDraft({ imageUri: 'cache/peachspend-receipt-a.jpg', source: 'scan' });
+
+    expect(draft.status).toBe('pending_ocr');
+    const insert = database.runAsync.mock.calls.find(call => (call[0] as string).startsWith('INSERT INTO receipt_drafts'));
+    expect(insert?.[1]).toEqual([
+      draft.id, 'cache/peachspend-receipt-a.jpg', 'scan', 'pending_ocr', 0, null, draft.createdAt, draft.updatedAt,
+    ]);
+  });
+
+  it('keeps pending drafts through Clear All Data and removes them on Reset App', async () => {
+    await databaseService.clearAllData();
+    const clearStatements = database.runAsync.mock.calls.map(call => call[0] as string).join(' ');
+    expect(clearStatements).not.toContain('receipt_drafts');
+
+    vi.clearAllMocks();
+    (databaseService as unknown as { db: MockDatabase }).db = database;
+    await databaseService.resetApp();
+    const resetStatements = database.execAsync.mock.calls.map(call => call[0] as string).join(' ');
+    expect(resetStatements).toContain('DELETE FROM receipt_drafts');
+  });
+});
+
+// Phase 11 D3 (B4-4, B2-5). Category limits are settings rows, read and written
+// through the one settings writer so the limits screen and the detail anchor cannot
+// disagree.
+describe('DatabaseService category limits (D3)', () => {
+  it('writes a limit under the documented key as a plain numeric string', async () => {
+    await databaseService.setCategoryLimit('dining', 250);
+
+    expect(database.runAsync).toHaveBeenCalledWith('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['category_limit_dining', '250']);
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+  });
+
+  it('reads a stored limit and reports no limit for an absent or unreadable one', async () => {
+    database.getFirstAsync.mockResolvedValueOnce({ value: '250' });
+    await expect(databaseService.getCategoryLimit('dining')).resolves.toBe(250);
+
+    database.getFirstAsync.mockResolvedValueOnce({ value: 'nonsense' });
+    await expect(databaseService.getCategoryLimit('dining')).resolves.toBeNull();
+
+    database.getFirstAsync.mockResolvedValueOnce(null);
+    await expect(databaseService.getCategoryLimit('dining')).resolves.toBeNull();
+  });
+
+  it('clears a limit with a real delete of the key', async () => {
+    await databaseService.clearCategoryLimit('dining');
+
+    expect(database.runAsync).toHaveBeenCalledWith('DELETE FROM settings WHERE key = ?', ['category_limit_dining']);
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+  });
+
+  it('treats a zero amount as clearing rather than a limit of zero', async () => {
+    await databaseService.setCategoryLimit('dining', 0);
+
+    expect(database.runAsync).toHaveBeenCalledWith('DELETE FROM settings WHERE key = ?', ['category_limit_dining']);
+  });
+
+  it('refuses a negative amount without writing anything', async () => {
+    await expect(databaseService.setCategoryLimit('dining', -5)).rejects.toMatchObject({ code: 'category_limit_invalid' });
+    expect(database.runAsync).not.toHaveBeenCalled();
+  });
+
+  it('reads every limit from one settings pass', async () => {
+    database.getAllAsync.mockResolvedValue([
+      { key: 'currency', value: 'USD' },
+      { key: 'category_limit_dining', value: '250' },
+      { key: 'category_limit_transport', value: '40' },
+      { key: 'category_limit_broken', value: 'nope' },
+    ]);
+
+    await expect(databaseService.getAllCategoryLimits()).resolves.toEqual({ dining: 250, transport: 40 });
+    expect(database.getAllAsync).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Phase 11 D4 (B4-5, DEC-11-03). Retention is age based, keep forever is the default,
+// and the deletion is real when seven or thirty days is chosen.
+describe('DatabaseService chat retention (D4)', () => {
+  const now = 1_800_000_000_000;
+  const DAY = 86_400_000;
+  const retentionReads = () => database.getFirstAsync.mock.calls.filter(call => (call[1] as string[])?.[0] === 'chat_retention_days');
+  const deletes = () => database.getAllAsync.mock.calls.filter(call => (call[0] as string).startsWith('DELETE FROM chat_messages'));
+
+  it('resolves a fresh install to keep forever', async () => {
+    database.getFirstAsync.mockResolvedValue(null);
+
+    await expect(databaseService.getChatRetentionDays()).resolves.toBe(0);
+  });
+
+  it('deletes nothing and issues no delete statement while retention is keep forever', async () => {
+    database.getFirstAsync.mockResolvedValue({ value: '0' });
+
+    await expect(databaseService.purgeExpiredChatMessages(now)).resolves.toBe(0);
+    expect(deletes()).toHaveLength(0);
+  });
+
+  it('deletes messages older than seven days and keeps the newer ones', async () => {
+    database.getFirstAsync.mockResolvedValue({ value: '7' });
+    database.getAllAsync.mockResolvedValue([{ id: 'old-1' }, { id: 'old-2' }]);
+
+    await expect(databaseService.purgeExpiredChatMessages(now)).resolves.toBe(2);
+
+    expect(database.getAllAsync).toHaveBeenCalledTimes(1);
+    expect(database.getAllAsync).toHaveBeenCalledWith('DELETE FROM chat_messages WHERE created_at < ? RETURNING id', [now - 7 * DAY]);
+    expect(retentionReads()).toHaveLength(1);
+  });
+
+  it('uses the thirty day window when thirty days is selected', async () => {
+    database.getFirstAsync.mockResolvedValue({ value: '30' });
+    database.getAllAsync.mockResolvedValue([]);
+
+    await databaseService.purgeExpiredChatMessages(now);
+
+    expect(deletes()[0]?.[1]).toEqual([now - 30 * DAY]);
+  });
+
+  it('resolves an unparsable or unsupported stored value to keep forever', async () => {
+    for (const value of ['fourteen', '14', '-7', '']) {
+      database.getFirstAsync.mockResolvedValue({ value });
+      await expect(databaseService.getChatRetentionDays()).resolves.toBe(0);
+    }
+  });
+
+  it('stores an accepted retention window as a settings write', async () => {
+    await databaseService.setChatRetentionDays(30);
+
+    expect(database.runAsync).toHaveBeenCalledWith('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['chat_retention_days', '30']);
+    expect(freshness.markDataChanged).toHaveBeenCalledWith('settings');
+  });
+
+  it('refuses a retention value the interface cannot offer instead of silently storing it', async () => {
+    await expect(databaseService.setChatRetentionDays(14)).rejects.toMatchObject({ code: 'chat_retention_invalid' });
+    expect(database.runAsync).not.toHaveBeenCalled();
+  });
+});
+
+// Phase 11 D5 (DEC-11-05). One setup milestone, seeded once by onboarding completion
+// inside its transaction, and never derived from a ledger count.
+describe('DatabaseService setup milestone (D5)', () => {
+  const SETUP_ID = 'vault_initialized';
+  const awardCalls = () => database.getFirstAsync.mock.calls.filter(call => (call[0] as string).includes('INSERT OR IGNORE INTO achievements'));
+
+  // Models the one part of a transaction this feature depends on: an insert is staged
+  // until COMMIT and discarded on ROLLBACK, and a repeated insert of the same primary
+  // key is ignored.
+  const transactionModel = () => {
+    const committed = new Set<string>();
+    let staged: string[] = [];
+    database.getFirstAsync.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (!sql.includes('INSERT OR IGNORE INTO achievements')) return { count: 0 };
+      const id = (params as [string])[0];
+      if (committed.has(id) || staged.includes(id)) return null;
+      staged.push(id);
+      return { id };
+    });
+    database.execAsync.mockImplementation(async (sql: string) => {
+      if (sql === 'COMMIT') {
+        staged.forEach(id => committed.add(id));
+        staged = [];
+      }
+      if (sql === 'ROLLBACK') staged = [];
+    });
+    return { committed, staged: () => staged };
+  };
+
+  it('awards the badge once, inside the onboarding transaction and before the completion flag', async () => {
+    const model = transactionModel();
+
+    await databaseService.completeOnboarding({ currency: 'USD' });
+
+    expect(awardCalls()).toHaveLength(1);
+    expect(awardCalls()[0]?.[1]).toEqual([SETUP_ID, expect.any(Number)]);
+    expect([...model.committed]).toEqual([SETUP_ID]);
+
+    const awardOrder = database.getFirstAsync.mock.invocationCallOrder[database.getFirstAsync.mock.calls.findIndex(call => (call[0] as string).includes('INSERT OR IGNORE INTO achievements'))];
+    const beginOrder = database.execAsync.mock.invocationCallOrder[database.execAsync.mock.calls.findIndex(call => call[0] === 'BEGIN IMMEDIATE')];
+    const flagOrder = database.runAsync.mock.invocationCallOrder[database.runAsync.mock.calls.findIndex(call => (call[1] as string[])?.[0] === 'onboarding_complete')];
+    const commitOrder = database.execAsync.mock.invocationCallOrder[database.execAsync.mock.calls.findIndex(call => call[0] === 'COMMIT')];
+
+    expect(awardOrder).toBeGreaterThan(beginOrder);
+    expect(awardOrder).toBeLessThan(flagOrder);
+    expect(flagOrder).toBeLessThan(commitOrder);
+  });
+
+  it('awards no second row when onboarding completion runs twice', async () => {
+    const model = transactionModel();
+
+    await databaseService.completeOnboarding({ currency: 'USD' });
+    const firstPublish = freshness.markDataChanged.mock.calls.filter(call => call[0] === 'ledger').length;
+    await databaseService.completeOnboarding({ currency: 'USD' });
+
+    expect([...model.committed]).toEqual([SETUP_ID]);
+    // The second run inserts nothing, so it publishes no ledger change token.
+    expect(freshness.markDataChanged.mock.calls.filter(call => call[0] === 'ledger')).toHaveLength(firstPublish);
+  });
+
+  it('leaves no badge behind when the onboarding transaction rolls back', async () => {
+    const model = transactionModel();
+    // The completion flag is written after the badge, so failing it rolls the badge back.
+    database.runAsync.mockImplementation(async (_sql: string, params?: unknown[]) => {
+      if ((params as string[])?.[0] === 'onboarding_complete') throw new Error('disk full');
+    });
+
+    await expect(databaseService.completeOnboarding({ currency: 'USD' })).rejects.toThrow('disk full');
+
+    expect(database.execAsync).toHaveBeenCalledWith('ROLLBACK');
+    expect(database.execAsync).not.toHaveBeenCalledWith('COMMIT');
+    expect([...model.committed]).toEqual([]);
+    expect(model.staged()).toEqual([]);
+  });
+
+  it('reports the setup badge in the catalogue and counts the real catalog size', async () => {
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM achievements')) return [{ id: SETUP_ID, earned_at: 111 }];
+      return POPULATED_SETTINGS;
+    });
+    database.getFirstAsync.mockResolvedValue(POPULATED_FIXTURE);
+
+    const badges = await databaseService.getBadgeProgress();
+
+    expect(badges).toHaveLength(28);
+    expect(badges.find(badge => badge.id === SETUP_ID)).toEqual({
+      id: SETUP_ID,
+      label: 'Vault Initialized',
+      description: 'Setup completed on this device',
+      icon: 'Badge',
+      current: 1,
+      target: 1,
+      earned_at: 111,
+    });
+  });
+
+  it('never awards the setup badge from a ledger save, so an older install keeps no unearned badge', async () => {
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM achievements')) return [];
+      return POPULATED_SETTINGS;
+    });
+    database.getFirstAsync.mockResolvedValue(POPULATED_FIXTURE);
+
+    const newBadges = await databaseService.checkAchievements();
+
+    expect(newBadges.length).toBeGreaterThan(0);
+    expect(newBadges).not.toContain(SETUP_ID);
+  });
+
+  it('lists the setup badge in the earned rows read for the profile grid', async () => {
+    database.getAllAsync.mockResolvedValue([{ id: SETUP_ID, earned_at: 111 }]);
+
+    const rows = await databaseService.getAchievements();
+
+    expect(rows).toHaveLength(28);
+    expect(rows.at(-1)).toEqual({ id: SETUP_ID, earned_at: 111 });
+  });
+});
+
+// Phase 11 D6 (B4-3). A suggestion comes from real spending or not at all.
+describe('DatabaseService suggested monthly budget (D6)', () => {
+  it('suggests nothing for an empty ledger', async () => {
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM settings')) return [{ key: 'currency', value: 'USD' }];
+      return [];
+    });
+    database.getFirstAsync.mockResolvedValue({ earliest: null });
+
+    await expect(databaseService.getSuggestedMonthlyBudget()).resolves.toBeNull();
+  });
+
+  it('suggests a rounded amount in the settings currency for a real ledger', async () => {
+    const now = Date.now();
+    const row = (amount: number) => ({ id: `e${amount}`, merchant: 'Cafe', amount, currency: 'USD', category: 'dining', scanned: 0, date: now - 86_400_000, created_at: now });
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM settings')) return [{ key: 'currency', value: 'USD' }];
+      return [row(100), row(100), row(100), row(100), row(100)];
+    });
+    database.getFirstAsync.mockResolvedValue({ earliest: now - 60 * 86_400_000 });
+
+    await expect(databaseService.getSuggestedMonthlyBudget()).resolves.toEqual({ amount: 500, currency: 'USD' });
+  });
+
+  it('suggests nothing when the account is too new to have a full window', async () => {
+    const now = Date.now();
+    const row = { id: 'e1', merchant: 'Cafe', amount: 100, currency: 'USD', category: 'dining', scanned: 0, date: now, created_at: now };
+    database.getAllAsync.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM settings')) return [{ key: 'currency', value: 'USD' }];
+      return [row, row, row, row, row];
+    });
+    database.getFirstAsync.mockResolvedValue({ earliest: now - 86_400_000 });
+
+    await expect(databaseService.getSuggestedMonthlyBudget()).resolves.toBeNull();
   });
 });

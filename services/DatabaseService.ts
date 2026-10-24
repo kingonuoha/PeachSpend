@@ -18,8 +18,19 @@ import { computeNextDueDate, normalizeInterval, parseRecurrenceDays } from '../d
 import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/MediaErasure';
 import { eraseOwnedMediaForScope } from './MediaErasureService';
 import { markDataChanged } from '../hooks/useDataFreshness';
+import { SqliteReceiptDraftStore, type ReceiptDraftStore } from '../data/ReceiptDrafts';
+import { CategoryLimitService } from '../data/CategoryLimits';
+import { assertChatRetentionDays, chatRetentionCutoff, CHAT_RETENTION_KEY, parseChatRetentionDays, type ChatRetentionDays } from '../data/ChatRetention';
+import { BUDGET_SUGGESTION_WINDOW_DAYS, buildSuggestedMonthlyBudget, type BudgetSuggestion } from '../data/BudgetSuggestion';
 
 const DATABASE_NAME = 'peachspend.db';
+
+// Phase 11 D5, DEC-11-05. The one setup milestone. It is earned by existing, and the
+// only writer that creates it is completeOnboarding, so no ledger count and no
+// amount can make its label false. It is deliberately not one of the existing ids:
+// `first_step` means "first expense logged" and reusing it would make a badge the
+// user has not earned read as earned.
+const SETUP_ACHIEVEMENT_ID = 'vault_initialized';
 const ACHIEVEMENT_THRESHOLDS = {
   saver: 3,
   shopper: 1_000,
@@ -206,10 +217,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // through init(), so they all await this one promise instead.
   private initPromise: Promise<void> | null = null;
   // Schema state captured before the migration runner advances the file. A v1
-  // file reports 'v1' here even though user_version is 7 by the time any reader
-  // sees it.
+  // file reports 'v1' here even though user_version is the current migration
+  // version by the time any reader sees it.
   private startupSchema: ContinuitySchemaState | null = null;
   private startupUserVersion = 0;
+  // Phase 11 D3. One instance for the life of the service, over this service's own
+  // settings read/write methods, so category limits cannot drift onto a second writer.
+  private readonly categoryLimits = new CategoryLimitService(this);
 
   // One aggregate read shared by both achievement passes: checkAchievements and
   // getBadgeProgress ask for the same nine numbers.
@@ -220,6 +234,12 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
 
   async getCaptureRepository(): Promise<CaptureRepository> {
     return new PublishingCaptureRepository(new SqliteCaptureRepository(await this.getDb()));
+  }
+
+  // Phase 11 D2. The offline receipt draft store, handed out the same way the capture
+  // repository is, so no screen holds the database handle or writes its own SQL.
+  async getReceiptDraftStore(): Promise<ReceiptDraftStore> {
+    return new SqliteReceiptDraftStore(await this.getDb());
   }
 
   // The single accessor for the open handle. The init() call inside is
@@ -517,6 +537,23 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     markDataChanged('ledger');
   }
 
+  // Phase 11 D1 (S-08, B2-5). Correcting the merchant name on an existing expense.
+  // The value is trimmed and a blank one is refused with the same typed error every
+  // other expense writer uses, because a merchant is the row's identity for duplicate
+  // detection and an empty value would silently remove it.
+  //
+  // merchant_category_memory is deliberately not touched here. Correcting a name is
+  // not a categorisation decision, and writing the memory from an edit would change
+  // how future captures are categorised without the user asking for that. The memory
+  // stays the capture paths' record of what the user chose while logging.
+  async updateExpenseMerchant(id: string, merchant: string): Promise<void> {
+    const trimmed = merchant.trim();
+    if (!trimmed) throw new CaptureValidationError('merchant');
+    const db = await this.getDb();
+    await db.runAsync('UPDATE expenses SET merchant = ? WHERE id = ?', [trimmed, id]);
+    markDataChanged('ledger');
+  }
+
   async updateExpenseReimbursable(id: string, isReimbursable: boolean): Promise<void> {
     const db = await this.getDb();
     await db.runAsync('UPDATE expenses SET is_reimbursable = ? WHERE id = ?', [isReimbursable ? 1 : 0, id]);
@@ -684,6 +721,65 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     await this.writePublicSetting(db, key, value);
   }
 
+  // The removal half of the settings writer, so a key that means "unset" is deleted
+  // instead of being stored as an empty string or a sentinel. Publishes the settings
+  // token like every other public settings write, which the private
+  // deleteStoredSetting above deliberately does not (it runs during secret migration
+  // before any screen is listening). A secret key is refused rather than deleted
+  // through the public settings table, because keys never live there.
+  async deleteSetting(key: string): Promise<void> {
+    if (isSecretSettingKey(key)) return;
+    const db = await this.getDb();
+    await db.runAsync('DELETE FROM settings WHERE key = ?', [key]);
+    markDataChanged('settings');
+  }
+
+  // Phase 11 D3 (B4-4, B2-5). Category spending limits live in the settings table as
+  // `category_limit_{id}` with a plain numeric string value, so no schema change was
+  // needed for a per-category preference. Every read and write routes through the one
+  // settings writer above.
+  async getCategoryLimit(categoryId: string): Promise<number | null> {
+    return this.categoryLimits.getCategoryLimit(categoryId);
+  }
+
+  // An amount of zero clears the limit rather than storing a limit of zero.
+  async setCategoryLimit(categoryId: string, amount: number): Promise<void> {
+    return this.categoryLimits.setCategoryLimit(categoryId, amount);
+  }
+
+  async clearCategoryLimit(categoryId: string): Promise<void> {
+    return this.categoryLimits.clearCategoryLimit(categoryId);
+  }
+
+  // One settings pass, so a category list renders every limit without a query per card.
+  async getAllCategoryLimits(): Promise<Record<string, number>> {
+    return this.categoryLimits.getAllCategoryLimits();
+  }
+
+  // Phase 11 D4 (B4-5, DEC-11-03). Keep forever (0) is the default and the value a
+  // fresh install reads, because retention that deletes must be an explicit choice.
+  async getChatRetentionDays(): Promise<ChatRetentionDays> {
+    return parseChatRetentionDays(await this.getSetting(CHAT_RETENTION_KEY));
+  }
+
+  async setChatRetentionDays(days: number): Promise<void> {
+    const accepted = assertChatRetentionDays(days);
+    await this.updateSetting(CHAT_RETENTION_KEY, String(accepted));
+  }
+
+  // The real deletion. Two statements at most, never one per message: the retention
+  // read and one range delete. Nothing is deleted while retention is keep forever.
+  // The delete returns the ids it removed, so the count is the statement's own result
+  // and no separate count query is added.
+  async purgeExpiredChatMessages(now = Date.now()): Promise<number> {
+    const days = await this.getChatRetentionDays();
+    const cutoff = chatRetentionCutoff(days, now);
+    if (cutoff === null) return 0;
+    const db = await this.getDb();
+    const removed = await db.getAllAsync<{ id: string }>('DELETE FROM chat_messages WHERE created_at < ? RETURNING id', [cutoff]);
+    return removed.length;
+  }
+
   async isOnboardingComplete(): Promise<boolean> {
     return (await this.getSetting('onboarding_complete')) === 'true';
   }
@@ -710,14 +806,31 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       if (profileName) await this.persistPublicSetting(db, 'profile_name', profileName, false);
       if (storedBudget !== null) await this.persistPublicSetting(db, 'monthly_budget', storedBudget, false);
       await this.persistPublicSetting(db, 'profile_join_date', String(Date.now()), false);
+      // Phase 11 D5, DEC-11-05. The setup milestone is awarded inside the same
+      // transaction as the profile writes and before the completion flag, so either
+      // both land or neither does. INSERT OR IGNORE makes a second completion a no-op
+      // rather than a duplicate row.
+      const setupAwarded = await this.awardSetupAchievement(db);
       await this.persistPublicSetting(db, 'onboarding_complete', 'true', false);
       await db.execAsync('COMMIT');
       markDataChanged('settings');
+      // Achievements are part of the ledger domain (see hooks/useDataFreshness), so
+      // the newly earned badge wakes the profile read as well as the settings read.
+      if (setupAwarded) markDataChanged('ledger');
     } catch (error) {
       await db.execAsync('ROLLBACK');
       logger.error('Failed to complete onboarding settings', 'onboarding_write_failed');
       throw error;
     }
+  }
+
+  // Phase 11 D5. Returns true only when a row was actually inserted, so a repeat call
+  // publishes no change token for a badge that was already earned. The statement
+  // reports the row it wrote, which is how an idempotent INSERT tells the caller
+  // whether it was the one that inserted.
+  private async awardSetupAchievement(db: SQLite.SQLiteDatabase): Promise<boolean> {
+    const inserted = await db.getFirstAsync<{ id: string }>('INSERT OR IGNORE INTO achievements (id, earned_at) VALUES (?, ?) RETURNING id', [SETUP_ACHIEVEMENT_ID, Date.now()]);
+    return inserted !== null;
   }
 
   async getAutoCaptureSettings(): Promise<AutoCaptureSettings> {
@@ -1237,8 +1350,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
 
     const badgeDefs: { id: string; check: () => boolean }[] = [
       // Existing
-      { id: 'first_step', check: () => totals.expense_count >= 1 },
-      { id: 'eagle_eye', check: () => totals.scanned_count >= 1 },
+      { id: 'first_step', check: () => totals.expense_count >= 1 },      { id: 'eagle_eye', check: () => totals.scanned_count >= 1 },
       { id: 'on_repeat', check: () => totals.recurring_count >= 1 },
       { id: 'paper_trail', check: () => exportCount >= 1 },
       { id: 'detail_devil', check: () => totals.detail_count >= 1 },
@@ -1271,6 +1383,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       // Budget
       { id: 'on-track', check: () => streak >= 7 },
       { id: 'disciplined', check: () => streak >= 30 },
+      // Setup (D5, DEC-11-05). The earning predicate is row existence, not a ledger
+      // count: completeOnboarding writes the row inside its transaction and nothing
+      // else ever does. Because this pass skips ids that are already earned, the
+      // predicate can never award the badge here, and an install that completed
+      // onboarding before this change keeps no badge rather than being awarded one
+      // retroactively for setup it cannot prove.
+      { id: SETUP_ACHIEVEMENT_ID, check: () => earnedIds.has(SETUP_ACHIEVEMENT_ID) },
     ];
 
     const newBadges: string[] = [];
@@ -1297,6 +1416,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       'saver', 'shopper', 'big-league',
       'habit', 'loyalist', 'novelist',
       'on-track', 'disciplined',
+      // Setup (D5). Appended rather than inserted so no existing badge moves, which
+      // keeps the order every earlier reader already renders.
+      SETUP_ACHIEVEMENT_ID,
     ];
     return allBadges.map(id => {
       const found = all.find(a => a.id === id);
@@ -1371,6 +1493,10 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       // Budget
       { id: 'on-track', label: 'On Track', description: '7-day budget streak', icon: 'Trend', current: Math.min(streak, 7), target: 7 },
       { id: 'disciplined', label: 'Disciplined', description: '30-day budget streak', icon: 'Mindful', current: Math.min(streak, 30), target: 30 },
+      // Setup (D5, DEC-11-05). The copy states only what is true: setup finished on
+      // this device. The icon name is one the existing badge glyph map already
+      // translates, so the new badge needs no shared component change.
+      { id: SETUP_ACHIEVEMENT_ID, label: 'Vault Initialized', description: 'Setup completed on this device', icon: 'Badge', current: achievements.some(achievement => achievement.id === SETUP_ACHIEVEMENT_ID) ? 1 : 0, target: 1 },
     ];
 
     return badgeData.map(b => ({
@@ -1553,6 +1679,28 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
     return { spent, remaining, usedPercent, dailySpendRate, daysRemaining };
   }
 
+  // Phase 11 D6 (B4-3). A starting monthly budget suggested from the trailing 30 days
+  // of real spending, or null when the ledger cannot support one. The thresholds and
+  // the rounding live in data/BudgetSuggestion.ts with their reasons; this method only
+  // supplies the reads.
+  async getSuggestedMonthlyBudget(): Promise<BudgetSuggestion | null> {
+    const db = await this.getDb();
+    const now = Date.now();
+    const windowStart = now - BUDGET_SUGGESTION_WINDOW_DAYS * 86400000;
+    const [windowExpenses, earliest, settings] = await Promise.all([
+      db.getAllAsync<Expense>('SELECT * FROM expenses WHERE date >= ? AND date <= ?', [windowStart, now]),
+      db.getFirstAsync<{ earliest: number | null }>('SELECT MIN(date) AS earliest FROM expenses'),
+      this.getAllSettings(),
+    ]);
+    return buildSuggestedMonthlyBudget({
+      windowExpenses,
+      earliestExpenseDate: earliest?.earliest ?? null,
+      rates: settings.conversion_rates ?? null,
+      currency: settings.currency ?? null,
+      now,
+    });
+  }
+
   async getIncomeForPeriod(startDate: number, endDate: number): Promise<number> {
     const db = await this.getDb();
     const result = await db.getFirstAsync<{ total: number }>(
@@ -1576,6 +1724,13 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // imagery leave together. Categories, settings, API keys, achievements, avatars,
   // and merchant-category memory are deliberately kept (see CLEAR_ALL_DATA_SCOPE).
   // Reset App is a separate, wider boundary.
+  //
+  // Phase 11 D2: pending receipt drafts are kept here, for two reasons that have to
+  // agree. A draft holds no financial record, so nothing this clear is scoped to
+  // remove it, and its image is not in the row-driven erase list above (that list is
+  // built from the expense rows this clear removes). Deleting the draft rows would
+  // therefore orphan images on disk with no pointer left to them. Reset App below is
+  // the boundary that owns both.
   async clearAllData() {
     const db = await this.getDb();
     await db.execAsync('BEGIN IMMEDIATE');
@@ -1604,6 +1759,9 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
 
   async resetApp() {
     const db = await this.getDb();
+    // Phase 11 D2. Reset App is the widest boundary and sweeps every owned image
+    // below, so a draft row must not outlive it: the row would point at a file that
+    // no longer exists. Clear All Data keeps drafts for the reasons stated above.
     await db.execAsync(`
       DELETE FROM expenses;
       DELETE FROM categories;
@@ -1615,6 +1773,7 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
       DELETE FROM merchant_category_memory;
       DELETE FROM capture_events;
       DELETE FROM capture_queue;
+      DELETE FROM receipt_drafts;
     `);
     await Promise.all(SECRET_SETTING_KEYS.map(deleteSecret));
     await this.seedCategories();
