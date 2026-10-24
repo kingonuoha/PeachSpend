@@ -24,6 +24,10 @@ export const DarkTheme = {
   primaryBorder: '#A78BFA',
   textSecondary: '#9C97AE', textTertiary: '#9C97AE',
   primary: '#9163F5', primaryContainer: '#8B5CF6',
+  // purple-900, the design system's income summary card background
+  // (peachspend_design_system_1.md line 16 and line 188). Not a semantic token,
+  // so it is named after the palette entry like purple100 already is.
+  purple900: '#2B1150',
   purple100: '#2A1F52', danger: '#F87171', dangerSoft: '#3A1A1A',
   disabledBg: '#241D3D', disabledText: '#655E7A',
 } as const;
@@ -52,6 +56,10 @@ export const LightTheme = {
   primaryBorder: '#7C3AED',
   textSecondary: '#8B8B99', textTertiary: '#8B8B99',
   primary: '#7C3AED', primaryContainer: '#8B5CF6',
+  // purple-900, the design system's income summary card background
+  // (peachspend_design_system_1.md line 16 and line 188). Not a semantic token,
+  // so it is named after the palette entry like purple100 already is.
+  purple900: '#2B1150',
   purple100: '#EDE9FE', danger: '#EF4444', dangerSoft: '#FEE2E2',
   disabledBg: '#ECECF3', disabledText: '#8B8B99', secondaryPressed: '#E2D9FD',
 } as const;

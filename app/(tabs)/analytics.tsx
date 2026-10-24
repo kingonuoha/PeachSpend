@@ -1,5 +1,7 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
+  FlatList,
   Modal,
   Pressable,
   RefreshControl,
@@ -11,50 +13,73 @@ import {
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Haptics from 'expo-haptics';
 import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
   Calendar,
   Check,
+  ChevronDown,
+  FileSpreadsheet,
+  PiggyBank,
+  Plus,
   RotateCcw,
   Search,
   Sparkles,
+  TrendingDown,
+  TrendingUp,
+  TriangleAlert,
   X,
   Zap,
 } from 'lucide-react-native';
 
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useBottomClearance } from '../../components/navigation/useBottomClearance';
 import { useSettings } from '../../components/ui/SettingsProvider';
 import { LuminousCard } from '../../components/ui/LuminousCard';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { PeachButton } from '../../components/ui/PeachButton';
-import { Skeleton } from '../../components/ui/Skeleton';
 import { SearchFilterBar } from '../../components/ui/SearchFilterBar';
 import { DateRangePicker } from '../../components/ui/DateRangePicker';
 import { SpendingDonut } from '../../components/analytics/SpendingDonut';
 import { CategoryBreakdown } from '../../components/analytics/CategoryBreakdown';
+import { ExpenseCalendar } from '../../components/analytics/ExpenseCalendar';
 import { ExpenseItem } from '../../components/expense/ExpenseItem';
 import { INSIGHT_SORT_OPTIONS, useInsights, type InsightSortKey } from '../../hooks/useInsights';
 import type { InsightTimeframe } from '../../data/InsightContracts';
 import type { Expense } from '../../types/database';
-import { formatCurrency, getCurrencyPrefix } from '../../utils/currency';
+import { formatCurrency } from '../../utils/currency';
 
 const GRADIENT_START = { x: 0.33, y: 0 };
 const GRADIENT_END = { x: 0.67, y: 1 };
+
+const CARD_BLOB = 'rgba(255,255,255,0.08)';
+const CARD_WATERMARK = 'rgba(255,255,255,0.13)';
+const CARD_LABEL = 'rgba(255,255,255,0.72)';
+const CARD_WATERMARK_SIZE = 96;
+const CARD_BLOB_SIZE = 150;
 const GRADIENT_LOCATIONS: [number, number, number] = [0, 0.45, 1];
-const DONUT_SIZE = 112;
-// White at 15 percent, the existing hero and narrative glass convention. Skeleton
-// blocks over the deep purple gradient cards use this tint instead of the neutral
-// surface fill, which would be invisible on the dark gradient.
-const GLASS_PLACEHOLDER = `${Colors.white}26`;
+const DONUT_SIZE = 120;
+const MS_PER_DAY = 86_400_000;
+// Header controls sit in the top tap zone, so they carry the full 44pt floor
+// instead of the 38pt visual height the pair draws at 390px.
+const HEADER_CONTROL_SIZE = 44;
+
+export type InsightSectionTab = 'cashflow' | 'categories' | 'transactions';
 
 const TIMEFRAMES: { key: InsightTimeframe; label: string }[] = [
-  { key: 'week', label: 'Week' },
-  { key: 'month', label: 'Month' },
-  { key: 'all', label: 'All' },
-  { key: 'custom', label: 'Custom' },
+  { key: 'week', label: 'This Week' },
+  { key: 'month', label: 'This Month' },
+  { key: 'all', label: 'All Time' },
+  { key: 'custom', label: 'Custom Range' },
+];
+
+const SECTION_TABS: { key: InsightSectionTab; label: string }[] = [
+  { key: 'cashflow', label: 'Cashflow' },
+  { key: 'categories', label: 'Categories' },
+  { key: 'transactions', label: 'Transactions' },
 ];
 
 interface PeriodLike {
@@ -82,8 +107,9 @@ export default function AnalyticsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
-  const { settings, currency: settingsCurrency } = useSettings();
-  const params = useLocalSearchParams<{ category?: string }>();
+  const bottomClearance = useBottomClearance();
+  const { settings, currency: settingsCurrency, convertAmount } = useSettings();
+  const params = useLocalSearchParams<{ category?: string; tab?: string }>();
 
   const {
     snapshot,
@@ -98,22 +124,32 @@ export default function AnalyticsScreen() {
     setTimeframe,
     retry,
     dismissDigest,
-    retryDigest,
+    requestAiDigest,
   } = useInsights();
 
-  // Category-tap arrival from Home pre-filters the list. The active filter is
-  // surfaced in the badge below so the reason for the shortened list is visible.
-  // The route param is treated as the initial filter; a manual legend selection
-  // overrides it, and clearing records the dismissed param so a later arrival
-  // with a new category still applies.
+  const [manualTab, setManualTab] = useState<InsightSectionTab | null>(null);
+  // A caller can request a section, for example the import success screen sending the
+  // user to the ledger. The request is honoured until the user picks a tab, the same
+  // way the `category` arrival is honoured until it is cleared.
+  const paramTab = typeof params.tab === 'string' && SECTION_TABS.some(option => option.key === params.tab)
+    ? (params.tab as InsightSectionTab)
+    : null;
+  const activeTab: InsightSectionTab = manualTab ?? paramTab ?? 'cashflow';
+  const [timeframeSheetVisible, setTimeframeSheetVisible] = useState(false);
+
+  // Category filter handling
   const paramCategory = typeof params.category === 'string' && params.category.length > 0 ? params.category : null;
   const [manualFilter, setManualFilter] = useState<string | null>(null);
   const [dismissedParam, setDismissedParam] = useState<string | null>(null);
   const categoryFilter = manualFilter ?? (paramCategory && paramCategory !== dismissedParam ? paramCategory : null);
 
   const applyCategoryFilter = useCallback((next: string | null) => {
+    // One selection haptic for every filter entry point (slice, legend row, clear
+    // action), so the three paths cannot drift into different feedback.
+    void Haptics.selectionAsync();
     setManualFilter(next);
     if (next === null) setDismissedParam(paramCategory);
+    if (next !== null) setManualTab('transactions');
   }, [paramCategory]);
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -123,7 +159,6 @@ export default function AnalyticsScreen() {
 
   const pricesVisible = settings.prices_visible !== 'false';
   const currency = snapshot?.currency ?? settingsCurrency;
-  const currencySymbol = getCurrencyPrefix(currency);
   const activeSort = INSIGHT_SORT_OPTIONS.find(option => option.key === sortKey) ?? INSIGHT_SORT_OPTIONS[0];
 
   const periodExpenses = useMemo(() => {
@@ -179,7 +214,28 @@ export default function AnalyticsScreen() {
     ? categoryMeta[categoryFilter]?.title ?? categoryFilter
     : null;
 
+  const detailOrderIds = useMemo(() => visibleExpenses.map(expense => expense.id), [visibleExpenses]);
+
+  const renderExpenseRow = useCallback(
+    ({ item }: { item: Expense }) => (
+      <ExpenseItem
+        expense={item}
+        searchQuery={searchQuery}
+        detailOrigin="insights"
+        detailOrderIds={detailOrderIds}
+      />
+    ),
+    [searchQuery, detailOrderIds],
+  );
+
+  const onSelectSection = useCallback((tab: InsightSectionTab) => {
+    void Haptics.selectionAsync();
+    setManualTab(tab);
+  }, []);
+
   const onSelectTimeframe = useCallback((timeframe: InsightTimeframe) => {
+    void Haptics.selectionAsync();
+    setTimeframeSheetVisible(false);
     if (timeframe === 'custom') {
       setDatePickerVisible(true);
       return;
@@ -202,158 +258,18 @@ export default function AnalyticsScreen() {
     router.push({ pathname: '/spending-recap', params: { origin: 'insights' } } as never);
   }, [router]);
 
-  // Rendered above the scroll content in both the loaded and loading states so the
-  // header never shifts when the ledger resolves.
-  const header = (
-    <View
-      style={[
-        styles.header,
-        { paddingTop: insets.top + Spacing.s1, borderBottomColor: ts.raw.outline, backgroundColor: ts.bg.screen },
-      ]}
-    >
-      <View style={styles.headerInner}>
-        <View style={styles.headerLeft}>
-          <Text style={[styles.headerEyebrow, { color: ts.raw.primary }]}>PeachSpend</Text>
-          <Text accessibilityRole="header" style={[styles.headerTitle, { color: ts.raw.onSurface }]}>Insights</Text>
-        </View>
-        <ScalePressable
-          accessibilityRole="button"
-          accessibilityLabel="Open Spending Recap"
-          onPress={openRecap}
-          style={styles.recapButton}
-        >
-          <LinearGradient
-            colors={ts.isDark ? Gradients.dark : Gradients.light}
-            locations={GRADIENT_LOCATIONS}
-            start={GRADIENT_START}
-            end={GRADIENT_END}
-            style={StyleSheet.absoluteFill}
-          />
-          <Zap size={14} color={Colors.white} />
-          <Text style={styles.recapLabel} numberOfLines={1}>Spending Recap</Text>
-        </ScalePressable>
-      </View>
-    </View>
-  );
+  const openManualExpense = useCallback(() => {
+    router.push({ pathname: '/expense/manual', params: { origin: 'Insights' } } as never);
+  }, [router]);
+
+  const openImport = useCallback(() => {
+    router.push('/import');
+  }, [router]);
 
   if (loading && !snapshot) {
-    // Placeholder mirrors the loaded Insights scroll (timeframe bar, narrative
-    // gradient card, cashflow and category cards) using the real card styles and
-    // tokens, so content arrives with no layout shift. The header renders above
-    // unchanged. Decorative blocks stay hidden from assistive tech; the content
-    // wrapper exposes one busy label.
-    const glassTint = { backgroundColor: GLASS_PLACEHOLDER };
     return (
-      <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
-        {header}
-        <ScrollView
-          showsVerticalScrollIndicator={false}
-          contentContainerStyle={{
-            paddingHorizontal: Spacing.s5,
-            paddingTop: Spacing.s3,
-            paddingBottom: 100 + insets.bottom,
-            alignSelf: 'center',
-            width: '100%',
-            maxWidth: 640,
-          }}
-        >
-          <View
-            accessible
-            accessibilityRole="progressbar"
-            accessibilityLabel="Loading insights"
-            accessibilityState={{ busy: true }}
-          >
-            {/* Timeframe segmented bar (FR-03.5) */}
-            <View style={[styles.timeframeBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
-              {TIMEFRAMES.map(timeframe => (
-                <View key={timeframe.key} style={styles.timeframeSegment}>
-                  <Skeleton width={40} height={12} />
-                </View>
-              ))}
-            </View>
-
-            {/* Narrative gradient card (FR-03.1) */}
-            <LinearGradient
-              colors={ts.isDark ? Gradients.dark : Gradients.light}
-              locations={GRADIENT_LOCATIONS}
-              start={GRADIENT_START}
-              end={GRADIENT_END}
-              style={styles.narrative}
-            >
-              <View pointerEvents="none" style={styles.narrativeBlob} />
-              <View style={styles.narrativeHeader}>
-                <Skeleton width={112} height={11} style={glassTint} />
-                <Skeleton width={64} height={18} borderRadius={Radii.full} style={glassTint} />
-              </View>
-              <Skeleton width="92%" height={16} style={glassTint} />
-              <Skeleton width="70%" height={12} style={[glassTint, styles.skeletonStackTight]} />
-              <View style={styles.narrativeFooter}>
-                <Skeleton width={120} height={11} style={glassTint} />
-                <Skeleton width={90} height={11} style={glassTint} />
-              </View>
-            </LinearGradient>
-
-            {/* Income vs Expense (FR-03.4) */}
-            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-              <View style={styles.cashflowHeader}>
-                <View style={[styles.skeletonStack, { flexShrink: 1, minWidth: 0 }]}>
-                  <Skeleton width={96} height={11} />
-                  <Skeleton width={128} height={14} />
-                </View>
-                <Skeleton width={88} height={22} borderRadius={Radii.full} />
-              </View>
-              <View style={styles.cashflowCards}>
-                <View style={[styles.cashflowCard, styles.cashflowCardIncome, { backgroundColor: ts.isDark ? ts.raw.surfaceContainerLowest : Colors.black }]}>
-                  <Skeleton width={52} height={11} style={glassTint} />
-                  <Skeleton width={92} height={18} style={[glassTint, styles.skeletonStackTight]} />
-                  <Skeleton width={80} height={10} style={[glassTint, styles.skeletonStackTight]} />
-                </View>
-                <LinearGradient
-                  colors={[ts.raw.primary, ts.raw.primaryContainer]}
-                  start={GRADIENT_START}
-                  end={GRADIENT_END}
-                  style={[styles.cashflowCard, { borderColor: ts.raw.primaryBorder + '4D' }]}
-                >
-                  <Skeleton width={52} height={11} style={glassTint} />
-                  <Skeleton width={92} height={18} style={[glassTint, styles.skeletonStackTight]} />
-                  <Skeleton width={80} height={10} style={[glassTint, styles.skeletonStackTight]} />
-                </LinearGradient>
-              </View>
-              <View style={styles.cashflowTrackRow}>
-                <Skeleton width="100%" height={10} borderRadius={Radii.full} />
-                <View style={styles.cashflowTrackLabels}>
-                  <Skeleton width={64} height={10} />
-                  <Skeleton width={110} height={10} />
-                </View>
-              </View>
-            </LuminousCard>
-
-            {/* Donut and category share (FR-03.3) */}
-            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-              <View style={styles.sectionHeaderRow}>
-                <View style={[styles.skeletonStack, { flexShrink: 1, minWidth: 0 }]}>
-                  <Skeleton width={84} height={11} />
-                  <Skeleton width={120} height={14} />
-                </View>
-                <Skeleton width={72} height={11} />
-              </View>
-              <View style={styles.shareRow}>
-                <Skeleton width={DONUT_SIZE} height={DONUT_SIZE} borderRadius={Radii.full} />
-                <View style={styles.shareLegend}>
-                  {Array.from({ length: 4 }).map((_, index) => (
-                    <View key={index} style={styles.skeletonLegendRow}>
-                      <View style={styles.skeletonLegendLeft}>
-                        <Skeleton width={10} height={10} borderRadius={Radii.full} />
-                        <Skeleton width={72} height={12} />
-                      </View>
-                      <Skeleton width={52} height={12} />
-                    </View>
-                  ))}
-                </View>
-              </View>
-            </LuminousCard>
-          </View>
-        </ScrollView>
+      <View style={[styles.loading, { backgroundColor: ts.bg.screen, paddingTop: insets.top }]}>
+        <ActivityIndicator color={ts.raw.primary} />
       </View>
     );
   }
@@ -365,387 +281,637 @@ export default function AnalyticsScreen() {
   const changePercent = insight?.changePercent ?? null;
   const showDeltaBadge = direction === 'up' || direction === 'down';
   const deltaPositive = direction === 'down';
+  const netBalance = snapshot?.netBalance ?? 0;
+  const isSurplus = netBalance >= 0;
+  // A prior comparison only exists when the snapshot actually carries one. The
+  // percentage is never rendered without the real prior period total beside it.
+  const hasPriorPeriod = direction !== undefined && direction !== 'no_previous_data';
+  // Real days left in the loaded period, measured from the moment the snapshot
+  // was generated (a value the snapshot carries) so nothing reads the clock during
+  // render. A closed range, all-time or a custom window that already ended,
+  // resolves to zero and the daily row then says so instead of inventing a rate.
+  const daysRemaining = snapshot
+    ? Math.max(0, Math.ceil((snapshot.period.end - snapshot.generatedAt) / MS_PER_DAY))
+    : 0;
+  const dailyPace = daysRemaining > 0 ? Math.abs(netBalance) / daysRemaining : null;
+  // Share of inflow that went to expenses, as a whole percent. Null when there is
+  // no inflow to compare against, which is why the track labels can read "--".
+  const spentShare = snapshot && snapshot.totalIncome > 0
+    ? Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)
+    : null;
+  const currentTimeframeLabel = TIMEFRAMES.find(t => t.key === query.timeframe)?.label ?? 'Period';
+
+  // Two distinct zero states. An empty period is an on-ramp, so it offers the two
+  // real routes into the ledger. A filtered list with no match keeps the recovery
+  // action instead, because the period itself does have rows.
+  const emptyState = periodExpenses.length === 0 ? (
+    <LuminousCard style={[styles.emptyCard, { borderColor: ts.raw.outline }]}>
+      <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
+        <Calendar size={18} color={ts.raw.primary} />
+      </View>
+      <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>No Transactions in This Period</Text>
+      <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
+        Log an expense or import a statement to unlock cashflow tracking, category shares and your digest.
+      </Text>
+      <View style={styles.emptyActions}>
+        <PeachButton
+          title="Add Expense"
+          variant="primary"
+          size="md"
+          fullWidth
+          icon={<Plus size={16} color={Colors.white} />}
+          onPress={openManualExpense}
+        />
+        <PeachButton
+          title="Import Statement"
+          variant="outline"
+          size="md"
+          fullWidth
+          icon={<FileSpreadsheet size={16} color={ts.raw.primary} />}
+          onPress={openImport}
+        />
+      </View>
+    </LuminousCard>
+  ) : (
+    <LuminousCard style={[styles.emptyCard, styles.emptyCardDashed, { borderColor: ts.raw.outline }]}>
+      <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
+        <Search size={18} color={ts.raw.primary} />
+      </View>
+      <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>No Matching Transactions</Text>
+      <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
+        Try adjusting your search terms or clearing the active category filter.
+      </Text>
+      <ScalePressable
+        accessibilityRole="button"
+        accessibilityLabel="Reset filters and search"
+        onPress={resetFilters}
+        style={styles.emptyReset}
+      >
+        <Text style={[styles.emptyResetText, { color: ts.raw.primary }]}>Reset Filters</Text>
+      </ScalePressable>
+    </LuminousCard>
+  );
 
   return (
     <View style={{ flex: 1, backgroundColor: ts.bg.screen }}>
-      {header}
-
-      <ScrollView
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={{
-          paddingHorizontal: Spacing.s5,
-          paddingTop: Spacing.s3,
-          paddingBottom: 100 + insets.bottom,
-          alignSelf: 'center',
-          width: '100%',
-          maxWidth: 640,
-        }}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={retry} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
-        }
+      {/* Top Header */}
+      <View
+        style={[
+          styles.header,
+          { paddingTop: insets.top + Spacing.s1, borderBottomColor: ts.raw.outline, backgroundColor: ts.bg.screen },
+        ]}
       >
-        {/* Timeframe selector (FR-03.5) */}
-        <View style={[styles.timeframeBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
-          {TIMEFRAMES.map(timeframe => {
-            const active = query.timeframe === timeframe.key;
+        <View style={styles.headerInner}>
+          <View style={styles.headerLeft}>
+            <Text style={[styles.headerEyebrow, { color: ts.raw.primary }]}>PeachSpend</Text>
+            <Text accessibilityRole="header" style={[styles.headerTitle, { color: ts.raw.onSurface }]}>Insights</Text>
+          </View>
+
+          <View style={styles.headerRightActions}>
+            {/* Duration Selector Dropdown Pill */}
+            <ScalePressable
+              accessibilityRole="button"
+              accessibilityLabel={`Select timeframe, currently ${currentTimeframeLabel}`}
+              onPress={() => setTimeframeSheetVisible(true)}
+              haptic={false}
+              hitSlop={{ top: 4, bottom: 4, left: 4, right: 4 }}
+              style={[styles.durationPill, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
+            >
+              <Calendar size={13} color={ts.raw.primary} />
+              <Text numberOfLines={1} style={[styles.durationPillText, { color: ts.raw.onSurface }]}>
+                {currentTimeframeLabel}
+              </Text>
+              <ChevronDown size={14} color={ts.raw.onSurfaceVariant} />
+            </ScalePressable>
+
+            {/* Compact Spending Recap Action */}
+            <ScalePressable
+              accessibilityRole="button"
+              accessibilityLabel="Open Spending Recap"
+              onPress={openRecap}
+              style={[styles.recapIconBtn, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
+            >
+              <Zap size={16} color={ts.raw.primary} />
+            </ScalePressable>
+          </View>
+        </View>
+
+        {/* 3-Tab Segment Control */}
+        <View style={[styles.tabBar, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}>
+          {SECTION_TABS.map(tab => {
+            const active = activeTab === tab.key;
             return (
               <ScalePressable
-                key={timeframe.key}
+                key={tab.key}
                 accessibilityRole="button"
                 accessibilityState={{ selected: active }}
-                accessibilityLabel={`${timeframe.label} timeframe`}
-                onPress={() => onSelectTimeframe(timeframe.key)}
-                style={[styles.timeframeSegment, active ? { backgroundColor: ts.raw.primary } : null]}
+                accessibilityLabel={`${tab.label} tab`}
+                onPress={() => onSelectSection(tab.key)}
+                haptic={false}
+                style={[styles.tabSegment, active ? { backgroundColor: ts.raw.primary } : null]}
               >
-                <View style={styles.timeframeInner}>
-                  <Text
-                    numberOfLines={1}
-                    style={[
-                      styles.timeframeLabel,
-                      { color: active ? Colors.white : ts.raw.onSurfaceVariant },
-                      active ? styles.timeframeLabelActive : null,
-                    ]}
-                  >
-                    {timeframe.label}
-                  </Text>
-                  {timeframe.key === 'custom' ? (
-                    <Calendar size={12} color={active ? Colors.white : ts.raw.onSurfaceVariant} />
-                  ) : null}
-                </View>
+                <Text
+                  numberOfLines={1}
+                  style={[
+                    styles.tabLabel,
+                    { color: active ? Colors.white : ts.raw.onSurfaceVariant },
+                    active ? styles.tabLabelActive : null,
+                  ]}
+                >
+                  {tab.label}
+                </Text>
               </ScalePressable>
             );
           })}
         </View>
+      </View>
 
-        {/* Active filter indicator (FR-03.7) */}
-        {activeCategoryLabel ? (
-          <View style={[styles.filterBadge, { backgroundColor: ts.raw.purple100, borderColor: ts.raw.primaryBorder + '44' }]}>
-            <View style={styles.filterBadgeLeft}>
-              <View style={[styles.filterDot, { backgroundColor: ts.raw.primary }]} />
-              <Text style={[styles.filterText, { color: ts.raw.primary }]} numberOfLines={1}>
-                Filter: {activeCategoryLabel}
-              </Text>
-            </View>
-            <ScalePressable
-              accessibilityRole="button"
-              accessibilityLabel="Clear category filter"
-              onPress={() => applyCategoryFilter(null)}
-              hitSlop={10}
-              style={styles.filterClear}
-            >
-              <Text style={[styles.filterClearText, { color: ts.raw.primary }]}>Clear</Text>
-              <X size={12} color={ts.raw.primary} />
-            </ScalePressable>
-          </View>
-        ) : null}
-
-        {/* Narrative comparative statement (FR-03.1), always above the charts */}
-        <LinearGradient
-          colors={ts.isDark ? Gradients.dark : Gradients.light}
-          locations={GRADIENT_LOCATIONS}
-          start={GRADIENT_START}
-          end={GRADIENT_END}
-          style={styles.narrative}
+      {/* Main Tab Content */}
+      {activeTab === 'cashflow' ? (
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={[
+            styles.scrollContent,
+            { paddingBottom: bottomClearance },
+          ]}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={retry} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
+          }
         >
-          <View pointerEvents="none" style={styles.narrativeBlob} />
-          <View style={styles.narrativeHeader}>
-            <Text style={styles.narrativeEyebrow}>Period Comparison</Text>
-            {showDeltaBadge && changePercent !== null ? (
-              <View style={[styles.deltaBadge, deltaPositive ? styles.deltaBadgeGood : styles.deltaBadgeUp]}>
-                {deltaPositive ? <ArrowDown size={12} color="#6EE7B7" /> : <ArrowUp size={12} color="#FCD34D" />}
-                <Text style={[styles.deltaBadgeText, { color: deltaPositive ? '#6EE7B7' : '#FCD34D' }]}>
-                  {deltaPositive ? `${Math.abs(changePercent).toFixed(0)}% Less` : `+${changePercent.toFixed(0)}% More`}
-                </Text>
+          {/* Pronounced Cashflow Hero Card */}
+          <LuminousCard style={[styles.card, styles.heroCard, { borderColor: ts.raw.outline }]}>
+            <View style={styles.cashflowHeader}>
+              <View style={{ flexShrink: 1, minWidth: 0 }}>
+                <Text style={[styles.sectionEyebrow, { color: ts.raw.onSurfaceVariant }]}>Cashflow Overview</Text>
+                <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Net Balance</Text>
               </View>
-            ) : null}
-          </View>
-          {narrativeUnavailable || !narrativeText ? (
-            <Text style={styles.narrativeHeadline}>
-              {snapshot?.state === 'offline'
-                ? 'Insights are unavailable offline. Your saved data stays on this device.'
-                : 'Could not load this period. Pull to refresh and try again.'}
-            </Text>
-          ) : (
-            <>
-              <Text style={styles.narrativeHeadline}>{narrativeText}</Text>
-              <Text style={styles.narrativeDetail}>
-                {topCategory
-                  ? `Largest category: ${topCategory.label} at ${pricesVisible ? formatCurrency(topCategory.amount, currency) : '••••'}.`
-                  : `${snapshot?.transactionCount ?? 0} transactions tracked in this period.`}
-              </Text>
-            </>
-          )}
-          <View style={styles.narrativeFooter}>
-            <Text style={styles.narrativeTotalLabel}>
-              Total Spent:{' '}
-              <Text style={styles.narrativeTotalAmount}>
-                {pricesVisible ? formatCurrency(snapshot?.totalSpent ?? 0, currency) : '••••'}
-              </Text>
-            </Text>
-            {snapshot ? <Text style={styles.narrativePeriod}>{formatPeriod(snapshot.period)}</Text> : null}
-          </View>
-        </LinearGradient>
-
-        {/* Digest relocated from Home (FR-03.2) */}
-        {digest && digest.status !== 'dismissed' ? (
-          <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-            <View style={styles.digestHeader}>
-              <View style={styles.digestIdentity}>
-                <View style={[styles.digestIcon, { backgroundColor: ts.raw.purple100 }]}>
-                  <Sparkles size={16} color={ts.raw.primary} />
-                </View>
-                <View style={{ flexShrink: 1, minWidth: 0 }}>
-                  <Text style={[styles.digestTitle, { color: ts.raw.onSurface }]} numberOfLines={1}>
-                    {snapshot ? digestTitle(query.timeframe, snapshot.period) : 'Digest'}
-                  </Text>
-                  <Text style={[styles.digestMeta, { color: ts.raw.onSurfaceVariant }]}>
-                    {digest.status === 'generating'
-                      ? 'Generating now'
-                      : digest.generatedAt
-                        ? `Generated ${new Date(digest.generatedAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`
-                        : digest.status === 'available'
-                          ? 'Generated'
-                          : 'Local summary'}
-                  </Text>
-                </View>
-              </View>
-              <ScalePressable
-                accessibilityRole="button"
-                accessibilityLabel="Dismiss digest"
-                onPress={dismissDigest}
-                hitSlop={10}
-                style={styles.digestDismiss}
-              >
-                <X size={14} color={ts.raw.onSurfaceVariant} />
-              </ScalePressable>
-            </View>
-            <View style={styles.digestBody}>
-              {digest.status === 'generating' ? <Skeleton width="60%" height={12} /> : null}
-              <Text style={[styles.digestText, { color: ts.raw.onSurface }]}>
-                {digest.status === 'available' && digest.text ? digest.text : digest.localText}
-              </Text>
-            </View>
-            {digest.status === 'unavailable' && digest.retryable ? (
-              <View style={styles.digestRetry}>
-                <Text style={[styles.digestError, { color: ts.raw.onSurfaceVariant }]}>
-                  {digest.errorCode === 'offline' ? 'AI summary unavailable offline.' : 'AI summary could not be generated.'}
-                </Text>
-                <PeachButton title="Retry" variant="secondary" size="xs" onPress={retryDigest} />
-              </View>
-            ) : null}
-          </LuminousCard>
-        ) : null}
-
-        {/* Income vs Expense, relocated from Home (FR-03.4) */}
-        <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-          <View style={styles.cashflowHeader}>
-            <View style={{ flexShrink: 1, minWidth: 0 }}>
-              <Text style={[styles.sectionEyebrow, { color: ts.raw.onSurfaceVariant }]}>Cashflow Balance</Text>
-              <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Income vs. Expense</Text>
-            </View>
-            <View
-              style={[
-                styles.netPill,
-                { backgroundColor: (snapshot?.netBalance ?? 0) >= 0 ? ts.raw.successContainer : ts.raw.dangerSoft },
-              ]}
-            >
-              <Text
-                style={[
-                  styles.netPillText,
-                  { color: (snapshot?.netBalance ?? 0) >= 0 ? ts.raw.successText : ts.raw.danger },
-                ]}
-                numberOfLines={1}
-              >
-                {pricesVisible
-                  ? `${(snapshot?.netBalance ?? 0) >= 0 ? '+' : '-'}${formatCurrency(Math.abs(snapshot?.netBalance ?? 0), currency)} Net`
-                  : '••••'}
-              </Text>
-            </View>
-          </View>
-
-          <View style={styles.cashflowCards}>
-            <View
-              style={[
-                styles.cashflowCard,
-                styles.cashflowCardIncome,
-                { backgroundColor: ts.isDark ? ts.raw.surfaceContainerLowest : Colors.black },
-              ]}
-            >
-              <View style={styles.cashflowCardHeader}>
-                <Text style={styles.cashflowLabelOnDark}>Income</Text>
-                <View style={[styles.cashflowIcon, styles.cashflowIconOnDark]}>
-                  <ArrowDown size={12} color={Colors.white} />
-                </View>
-              </View>
-              <Text style={styles.cashflowAmountLight} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-                {pricesVisible ? formatCurrency(snapshot?.totalIncome ?? 0, currency) : '••••'}
-              </Text>
-              <Text style={styles.cashflowSubOnDark} numberOfLines={1}>Earned this period</Text>
-            </View>
-
-            <LinearGradient
-              colors={[ts.raw.primary, ts.raw.primaryContainer]}
-              start={GRADIENT_START}
-              end={GRADIENT_END}
-              style={[styles.cashflowCard, { borderColor: ts.raw.primaryBorder + '4D' }]}
-            >
-              <View style={styles.cashflowCardHeader}>
-                <Text style={styles.cashflowLabelLight}>Expenses</Text>
-                <View style={styles.cashflowIconLight}>
-                  <ArrowUp size={12} color={Colors.white} />
-                </View>
-              </View>
-              <Text style={styles.cashflowAmountLight} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-                {pricesVisible ? formatCurrency(snapshot?.totalSpent ?? 0, currency) : '••••'}
-              </Text>
-              <Text style={styles.cashflowSubLight} numberOfLines={1}>
-                {snapshot && snapshot.totalIncome > 0
-                  ? `${Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)}% of total inflow`
-                  : 'No inflow recorded'}
-              </Text>
-            </LinearGradient>
-          </View>
-
-          <View style={styles.cashflowTrackRow}>
-            <View style={[styles.cashflowTrack, { backgroundColor: ts.bg.elevated }]}>
               <View
                 style={[
-                  styles.cashflowFill,
-                  {
-                    backgroundColor: ts.raw.primary,
-                    width: `${snapshot && snapshot.totalIncome > 0 ? Math.min(100, Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)) : 0}%`,
-                  },
+                  styles.netPill,
+                  { backgroundColor: isSurplus ? ts.raw.successContainer : ts.raw.dangerSoft },
                 ]}
-              />
+              >
+                {!isSurplus ? <TriangleAlert size={12} color={ts.raw.danger} /> : null}
+                <Text
+                  style={[
+                    styles.netPillText,
+                    { color: isSurplus ? ts.raw.successText : ts.raw.danger },
+                  ]}
+                  numberOfLines={1}
+                >
+                  {pricesVisible
+                    ? `${isSurplus ? '+' : '-'}${formatCurrency(Math.abs(netBalance), currency)} Net`
+                    : '••••'}
+                </Text>
+              </View>
             </View>
-            <View style={styles.cashflowTrackLabels}>
-              <Text style={[styles.cashflowTrackLabel, { color: ts.raw.onSurfaceVariant }]}>
-                Spent: {snapshot && snapshot.totalIncome > 0 ? `${Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100)}%` : '--'}
-              </Text>
-              <Text style={[styles.cashflowTrackLabel, { color: ts.raw.onSurfaceVariant }]}>
-                Savings / Surplus: {snapshot && snapshot.totalIncome > 0 ? `${Math.max(0, 100 - Math.round((snapshot.totalSpent / snapshot.totalIncome) * 100))}%` : '--'}
-              </Text>
-            </View>
-          </View>
-        </LuminousCard>
 
-        {/* Donut and category share (FR-03.3) */}
-        <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
-          <View style={styles.sectionHeaderRow}>
-            <View style={{ flexShrink: 1, minWidth: 0 }}>
-              <Text style={[styles.sectionEyebrow, { color: ts.raw.onSurfaceVariant }]}>Category Share</Text>
-              <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Spending Breakdown</Text>
-            </View>
-            <Text style={[styles.sectionHint, { color: ts.raw.onSurfaceVariant }]}>Tap slice to filter</Text>
-          </View>
+            <View style={styles.cashflowCards}>
+              <View style={[styles.cashflowCard, { backgroundColor: ts.raw.purple900, borderColor: CARD_WATERMARK }]}>
+                <View pointerEvents="none" style={styles.cashflowDecor}>
+                  <View style={[styles.cashflowBlob, { backgroundColor: CARD_BLOB }]} />
+                  <View style={styles.cashflowWatermark}>
+                    <ArrowDown size={CARD_WATERMARK_SIZE} color={CARD_WATERMARK} strokeWidth={2.4} />
+                  </View>
+                </View>
+                <View style={[styles.cashflowBadge, { backgroundColor: Colors.white }]}>
+                  <ArrowDown size={14} color={ts.raw.purple900} strokeWidth={2.8} />
+                </View>
+                <View style={styles.cashflowFooter}>
+                  <Text style={styles.cashflowLabel}>Total Income</Text>
+                  <Text style={styles.cashflowAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
+                    {pricesVisible ? formatCurrency(snapshot?.totalIncome ?? 0, currency) : '••••'}
+                  </Text>
+                </View>
+              </View>
 
-          <View style={styles.shareRow}>
-            <SpendingDonut
-              bare
-              size={DONUT_SIZE}
-              total={snapshot?.totalSpent ?? 0}
-              distribution={distribution}
-              pricesVisible={pricesVisible}
-              currencySymbol={currencySymbol}
-              centerTopLabel={topCategory ? 'Top' : 'No data'}
-              centerLabel={topCategory?.label ?? '--'}
-              centerValue={topCategory ? `${topCategory.percentage.toFixed(0)}%` : ''}
-              onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
-            />
-            <View style={styles.shareLegend}>
-              <CategoryBreakdown
-                variant="compact"
+              <LinearGradient
+                colors={[ts.raw.primary, ts.raw.primaryContainer]}
+                start={GRADIENT_START}
+                end={GRADIENT_END}
+                style={[styles.cashflowCard, { borderColor: ts.raw.primaryBorder + '4D' }]}
+              >
+                <View pointerEvents="none" style={styles.cashflowDecor}>
+                  <View style={[styles.cashflowBlob, { backgroundColor: CARD_BLOB }]} />
+                  <View style={styles.cashflowWatermark}>
+                    <ArrowUp size={CARD_WATERMARK_SIZE} color={CARD_WATERMARK} strokeWidth={2.4} />
+                  </View>
+                </View>
+                <View style={[styles.cashflowBadge, { backgroundColor: Colors.white }]}>
+                  <ArrowUp size={14} color={ts.raw.primary} strokeWidth={2.8} />
+                </View>
+                <View style={styles.cashflowFooter}>
+                  <Text style={styles.cashflowLabel}>Total Spent</Text>
+                  <Text style={styles.cashflowAmount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
+                    {pricesVisible ? formatCurrency(snapshot?.totalSpent ?? 0, currency) : '••••'}
+                  </Text>
+                </View>
+              </LinearGradient>
+            </View>
+
+            <View style={styles.cashflowTrackRow}>
+              <View style={[styles.cashflowTrack, { backgroundColor: ts.bg.elevated }]}>
+                <View
+                  style={[
+                    styles.cashflowFill,
+                    {
+                      backgroundColor: ts.raw.primary,
+                      width: `${spentShare === null ? 0 : Math.min(100, spentShare)}%`,
+                    },
+                  ]}
+                />
+              </View>
+              <View style={styles.cashflowTrackLabels}>
+                <Text style={[styles.cashflowTrackLabel, { color: ts.raw.onSurfaceVariant }]}>
+                  Spent: {spentShare === null ? '--' : `${spentShare}%`}
+                </Text>
+                {/* A deficit is named as one. Reporting "Surplus: 0%" while the
+                    period is in the red would be a false label on a real number. */}
+                <Text style={[styles.cashflowTrackLabel, { color: ts.raw.onSurfaceVariant }]}>
+                  {spentShare === null
+                    ? 'Surplus: --'
+                    : isSurplus
+                      ? `Surplus: ${100 - spentShare}%`
+                      : `Overspend: ${spentShare - 100}%`}
+                </Text>
+              </View>
+            </View>
+
+            {/* Daily pace: the remaining balance spread over the days actually left
+                in the loaded period, and a deficit reading when the period is in the
+                red. Both figures are arithmetic on snapshot values, never a
+                projection. */}
+            <View style={[styles.paceRow, { borderTopColor: ts.raw.outline }]}>
+              <View style={styles.paceIdentity}>
+                <View
+                  style={[
+                    styles.paceIcon,
+                    { backgroundColor: isSurplus ? ts.raw.successContainer : ts.raw.dangerSoft },
+                  ]}
+                >
+                  {isSurplus
+                    ? <PiggyBank size={14} color={ts.raw.successText} />
+                    : <TriangleAlert size={14} color={ts.raw.danger} />}
+                </View>
+                <View style={styles.paceCopy}>
+                  <Text style={[styles.paceLabel, { color: ts.raw.onSurfaceVariant }]}>
+                    {isSurplus ? 'Daily safe spend' : 'Daily shortfall'}
+                  </Text>
+                  <Text
+                    style={[styles.paceValue, { color: isSurplus ? ts.raw.onSurface : ts.raw.danger }]}
+                  >
+                    {!pricesVisible
+                      ? '••••'
+                      : dailyPace === null
+                        ? 'No days left in this range'
+                        : `${formatCurrency(dailyPace, currency)} per day${isSurplus ? ' left' : ' to recover'}`}
+                  </Text>
+                </View>
+              </View>
+              {!isSurplus && topCategory ? (
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Filter transactions by ${topCategory.label}`}
+                  onPress={() => applyCategoryFilter(topCategory.name)}
+                  hitSlop={6}
+                  style={[styles.paceAction, { borderColor: ts.raw.primaryBorder }]}
+                >
+                  <Text style={[styles.paceActionText, { color: ts.raw.primary }]} numberOfLines={1}>
+                    Review {topCategory.label}
+                  </Text>
+                </ScalePressable>
+              ) : null}
+            </View>
+          </LuminousCard>
+
+          {/* Period Narrative & Spend Comparison */}
+          <LinearGradient
+            colors={ts.isDark ? Gradients.dark : Gradients.light}
+            locations={GRADIENT_LOCATIONS}
+            start={GRADIENT_START}
+            end={GRADIENT_END}
+            style={styles.narrative}
+          >
+            <View pointerEvents="none" style={styles.narrativeBlob} />
+            <View style={styles.narrativeHeader}>
+              <Text style={styles.narrativeEyebrow}>Period Performance</Text>
+              {snapshot && !narrativeUnavailable ? (
+                <View style={styles.narrativeDeltaBlock}>
+                  {showDeltaBadge && changePercent !== null ? (
+                    <View style={[styles.deltaBadge, deltaPositive ? styles.deltaBadgeGood : styles.deltaBadgeUp]}>
+                      {deltaPositive ? <TrendingDown size={13} color="#6EE7B7" /> : <TrendingUp size={13} color="#FCD34D" />}
+                      <Text style={[styles.deltaBadgeText, { color: deltaPositive ? '#6EE7B7' : '#FCD34D' }]}>
+                        {deltaPositive ? `${Math.abs(changePercent).toFixed(0)}% Less` : `+${changePercent.toFixed(0)}% More`}
+                      </Text>
+                    </View>
+                  ) : null}
+                  {/* The percentage never stands alone: the real prior period total
+                      sits beside it, and its absence is stated rather than implied. */}
+                  <Text style={styles.narrativeBaseline}>
+                    {hasPriorPeriod
+                      ? `Prior period ${pricesVisible ? formatCurrency(insight?.previousTotal ?? 0, currency) : '••••'}`
+                      : 'No prior period to compare'}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+            {narrativeUnavailable || !narrativeText ? (
+              <Text style={styles.narrativeHeadline}>
+                {snapshot?.state === 'offline'
+                  ? 'Insights are unavailable offline. Your saved data stays on this device.'
+                  : 'Could not load this period. Pull to refresh and try again.'}
+              </Text>
+            ) : (
+              <>
+                <Text style={styles.narrativeHeadline}>{narrativeText}</Text>
+                <Text style={styles.narrativeDetail}>
+                  {topCategory
+                    ? `Highest category: ${topCategory.label} (${pricesVisible ? formatCurrency(topCategory.amount, currency) : '••••'}).`
+                    : `${snapshot?.transactionCount ?? 0} transactions tracked.`}
+                </Text>
+              </>
+            )}
+            <View style={styles.narrativeFooter}>
+              <Text style={styles.narrativePeriod}>
+                {snapshot
+                  ? `Total Spent: ${pricesVisible ? formatCurrency(snapshot.totalSpent, currency) : '••••'}`
+                  : null}
+              </Text>
+              <Text style={styles.narrativePeriod}>{snapshot ? formatPeriod(snapshot.period) : null}</Text>
+            </View>
+          </LinearGradient>
+
+          {/* AI Advisor / Digest Section (Cached & On-Demand to save tokens) */}
+          {digest && digest.status !== 'dismissed' ? (
+            <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
+              <View style={styles.digestHeader}>
+                <View style={styles.digestIdentity}>
+                  <View style={[styles.digestIcon, { backgroundColor: ts.raw.purple100 }]}>
+                    <Sparkles size={16} color={ts.raw.primary} />
+                  </View>
+                  <View style={{ flexShrink: 1, minWidth: 0 }}>
+                    <Text style={[styles.digestTitle, { color: ts.raw.onSurface }]} numberOfLines={1}>
+                      {snapshot ? digestTitle(query.timeframe, snapshot.period) : 'Digest'}
+                    </Text>
+                    <Text style={[styles.digestMeta, { color: ts.raw.onSurfaceVariant }]}>
+                      {digest.status === 'generating'
+                        ? 'Analyzing with AI...'
+                        : digest.status === 'available'
+                          ? 'AI Generated'
+                          : 'Rule-based Summary'}
+                    </Text>
+                  </View>
+                </View>
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Dismiss digest"
+                  onPress={dismissDigest}
+                  hitSlop={10}
+                  style={styles.digestDismiss}
+                >
+                  <X size={14} color={ts.raw.onSurfaceVariant} />
+                </ScalePressable>
+              </View>
+
+              <View style={styles.digestBody}>
+                {digest.status === 'generating' ? (
+                  <View style={styles.digestGeneratingRow}>
+                    <ActivityIndicator size="small" color={ts.raw.primary} />
+                    <Text style={[Typography.micro, { color: ts.raw.primary }]}>Thinking...</Text>
+                  </View>
+                ) : null}
+                <Text style={[styles.digestText, { color: ts.raw.onSurface }]}>
+                  {digest.status === 'available' && digest.text ? digest.text : digest.localText}
+                </Text>
+              </View>
+
+              {digest.status !== 'available' && digest.status !== 'generating' ? (
+                <View style={styles.digestActionRow}>
+                  <PeachButton
+                    title="Generate Deep AI Breakdown"
+                    variant="primary"
+                    size="sm"
+                    onPress={() => { void requestAiDigest(); }}
+                  />
+                </View>
+              ) : null}
+            </LuminousCard>
+          ) : null}
+        </ScrollView>
+      ) : activeTab === 'categories' ? (
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={[
+            styles.scrollContent,
+            { paddingBottom: bottomClearance },
+          ]}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={retry} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
+          }
+        >
+          <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
+            <View style={styles.sectionHeaderRow}>
+              <View style={{ flexShrink: 1, minWidth: 0 }}>
+                <Text style={[styles.sectionEyebrow, { color: ts.raw.onSurfaceVariant }]}>Category Share</Text>
+                <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Spending Breakdown</Text>
+              </View>
+              <Text style={[styles.sectionHint, { color: ts.raw.primary }]}>Tap any item to filter list</Text>
+            </View>
+
+            <View style={styles.shareRow}>
+              <SpendingDonut
+                bare
+                size={DONUT_SIZE}
+                total={snapshot?.totalSpent ?? 0}
                 distribution={distribution}
                 pricesVisible={pricesVisible}
-                currencySymbol={currencySymbol}
+                currency={currency}
+                selectedName={categoryFilter}
                 onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
               />
+              <View style={styles.shareLegend}>
+                <CategoryBreakdown
+                  variant="compact"
+                  distribution={distribution}
+                  pricesVisible={pricesVisible}
+                  currency={currency}
+                  onCategoryPress={name => applyCategoryFilter(categoryFilter === name ? null : name)}
+                  onAddExpense={openManualExpense}
+                />
+              </View>
             </View>
-          </View>
-        </LuminousCard>
-
-        {/* Search and six-option sort, exclusive to Insights (FR-03.6) */}
-        <View style={styles.searchRow}>
-          <View style={styles.searchFlex}>
-            <SearchFilterBar
-              expanded
-              onExpandedChange={() => undefined}
-              query={searchQuery}
-              onQueryChange={setSearchQuery}
-              placeholder="Search merchant, note, or category..."
-            />
-          </View>
-          <ScalePressable
-            accessibilityRole="button"
-            accessibilityLabel={`Sort transactions, currently ${activeSort.triggerLabel}`}
-            onPress={() => setSortVisible(true)}
-            style={[styles.sortTrigger, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
-          >
-            <ArrowUpDown size={14} color={ts.raw.primary} />
-            <Text style={[styles.sortTriggerText, { color: ts.raw.onSurface }]} numberOfLines={1}>{activeSort.triggerLabel}</Text>
-          </ScalePressable>
-        </View>
-
-        <View style={styles.countRow}>
-          <Text accessibilityLiveRegion="polite" style={[styles.countText, { color: ts.raw.onSurfaceVariant }]}>
-            Showing {visibleExpenses.length} {visibleExpenses.length === 1 ? 'transaction' : 'transactions'}
-          </Text>
-          <Text style={[styles.countSort, { color: ts.raw.primary }]}>Sorted by {activeSort.triggerLabel}</Text>
-        </View>
-
-        {error || snapshot?.state === 'offline' || snapshot?.state === 'failure' ? (
-          <LuminousCard style={[styles.errorCard, { borderColor: ts.raw.danger, backgroundColor: ts.raw.dangerSoft }]}>
-            <View style={styles.errorRow}>
-              <RotateCcw size={14} color={ts.raw.danger} />
-              <Text style={[styles.errorText, { color: ts.raw.danger }]}>
-                {isOffline || snapshot?.state === 'offline'
-                  ? 'Sync offline. Retaining local data.'
-                  : 'Could not load your ledger. Showing what is available.'}
-              </Text>
-            </View>
-            <PeachButton title="Retry" variant="destructive" size="xs" onPress={retry} />
           </LuminousCard>
-        ) : null}
 
-        {visibleExpenses.length === 0 ? (
-          <LuminousCard style={[styles.emptyCard, { borderColor: ts.raw.outline }]}>
-            <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
-              <Search size={18} color={ts.raw.primary} />
+          {/* DEC-11-06 directed delta: the calendar is a visible section with its own
+              header inside the categories tab, not a disclosure and not appended to
+              the cashflow tab. The S-03 pair governs tokens, type and spacing only;
+              the section layout itself is owner-authorised. */}
+          <LuminousCard style={[styles.card, { borderColor: ts.raw.outline }]}>
+            <View style={styles.sectionHeaderRow}>
+              <View style={{ flexShrink: 1, minWidth: 0 }}>
+                <Text style={[styles.sectionEyebrow, { color: ts.raw.onSurfaceVariant }]}>Monthly Rhythm</Text>
+                <Text style={[styles.sectionTitle, { color: ts.raw.onSurface }]}>Spending Calendar</Text>
+              </View>
             </View>
-            <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>
-              {periodExpenses.length === 0 ? 'No Transactions in This Period' : 'No Matching Transactions'}
-            </Text>
-            <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
-              {periodExpenses.length === 0
-                ? 'Try a wider timeframe to see your spending history.'
-                : 'Try adjusting your search terms or clearing the active category filter.'}
-            </Text>
-            {(categoryFilter || searchQuery.trim().length > 0) ? (
+            <ExpenseCalendar
+              expenses={expenses}
+              currency={currency}
+              pricesVisible={pricesVisible}
+              convertAmount={convertAmount}
+            />
+          </LuminousCard>
+        </ScrollView>
+      ) : (
+        /* Tab 3: Transactions Virtualized FlatList */
+        <FlatList
+          style={{ flex: 1 }}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{
+            paddingHorizontal: Spacing.s5,
+            paddingTop: Spacing.s3,
+            paddingBottom: bottomClearance,
+            alignSelf: 'center',
+            width: '100%',
+            maxWidth: 640,
+          }}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={retry} tintColor={ts.raw.primary} colors={[ts.raw.primary]} />
+          }
+          data={visibleExpenses}
+          keyExtractor={expense => expense.id}
+          renderItem={renderExpenseRow}
+          ListHeaderComponent={
+            <>
+              {/* Active filter badge if coming from Category click */}
+              {activeCategoryLabel ? (
+                <View style={[styles.filterBadge, { backgroundColor: ts.raw.purple100, borderColor: ts.raw.primaryBorder + '44' }]}>
+                  <View style={styles.filterBadgeLeft}>
+                    <View style={[styles.filterDot, { backgroundColor: ts.raw.primary }]} />
+                    <Text style={[styles.filterText, { color: ts.raw.primary }]} numberOfLines={1}>
+                      Filtered by: {activeCategoryLabel}
+                    </Text>
+                  </View>
+                  <ScalePressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Clear category filter"
+                    onPress={() => applyCategoryFilter(null)}
+                    hitSlop={10}
+                    style={styles.filterClear}
+                  >
+                    <Text style={[styles.filterClearText, { color: ts.raw.primary }]}>Clear</Text>
+                    <X size={12} color={ts.raw.primary} />
+                  </ScalePressable>
+                </View>
+              ) : null}
+
+              {/* Search and six-option sort */}
+              <View style={styles.searchRow}>
+                <View style={styles.searchFlex}>
+                  <SearchFilterBar
+                    expanded
+                    onExpandedChange={() => undefined}
+                    query={searchQuery}
+                    onQueryChange={setSearchQuery}
+                    placeholder="Search merchant, note, or category..."
+                  />
+                </View>
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Sort transactions, currently ${activeSort.triggerLabel}`}
+                  onPress={() => setSortVisible(true)}
+                  style={[styles.sortTrigger, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]}
+                >
+                  <ArrowUpDown size={14} color={ts.raw.primary} />
+                  <Text style={[styles.sortTriggerText, { color: ts.raw.onSurface }]} numberOfLines={1}>
+                    {activeSort.triggerLabel}
+                  </Text>
+                </ScalePressable>
+              </View>
+
+              <View style={styles.countRow}>
+                <Text accessibilityLiveRegion="polite" style={[styles.countText, { color: ts.raw.onSurfaceVariant }]}>
+                  Showing {visibleExpenses.length} {visibleExpenses.length === 1 ? 'transaction' : 'transactions'}
+                </Text>
+                <Text style={[styles.countSort, { color: ts.raw.primary }]}>
+                  Sorted by {activeSort.triggerLabel}
+                </Text>
+              </View>
+
+              {error || snapshot?.state === 'offline' || snapshot?.state === 'failure' ? (
+                <LuminousCard style={[styles.errorCard, { borderColor: ts.raw.danger, backgroundColor: ts.raw.dangerSoft }]}>
+                  <View style={styles.errorRow}>
+                    <RotateCcw size={14} color={ts.raw.danger} />
+                    <Text style={[styles.errorText, { color: ts.raw.danger }]}>
+                      {isOffline || snapshot?.state === 'offline'
+                        ? 'Sync offline. Retaining local data.'
+                        : 'Could not load your ledger. Showing what is available.'}
+                    </Text>
+                  </View>
+                  <PeachButton title="Retry" variant="destructive" size="xs" onPress={retry} />
+                </LuminousCard>
+              ) : null}
+            </>
+          }
+          ListEmptyComponent={emptyState}
+        />
+      )}
+
+      {/* Duration Selector Sheet Modal */}
+      <Modal visible={timeframeSheetVisible} transparent animationType="fade" onRequestClose={() => setTimeframeSheetVisible(false)}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Close duration selector"
+          style={styles.modalBackdrop}
+          onPress={() => setTimeframeSheetVisible(false)}
+        >
+          <Pressable style={[styles.sheet, { backgroundColor: ts.raw.surface, borderColor: ts.raw.outline }]} onPress={() => undefined}>
+            <View style={[styles.sheetHandle, { backgroundColor: ts.bg.elevated }]} />
+            <View style={styles.sheetHeaderRow}>
+              <View style={{ flexShrink: 1, minWidth: 0 }}>
+                <Text style={[styles.sheetTitle, { color: ts.raw.onSurface }]}>Select Timeframe</Text>
+                <Text style={[styles.sheetSub, { color: ts.raw.onSurfaceVariant }]}>Choose duration for Insights</Text>
+              </View>
               <ScalePressable
                 accessibilityRole="button"
-                accessibilityLabel="Reset filters and search"
-                onPress={resetFilters}
-                style={styles.emptyReset}
+                accessibilityLabel="Close timeframe sheet"
+                onPress={() => setTimeframeSheetVisible(false)}
+                hitSlop={10}
+                style={styles.sheetClose}
               >
-                <Text style={[styles.emptyResetText, { color: ts.raw.primary }]}>Reset Filters</Text>
+                <X size={16} color={ts.raw.onSurfaceVariant} />
               </ScalePressable>
-            ) : null}
-          </LuminousCard>
-        ) : (
-          <View style={styles.transactionList}>
-            {visibleExpenses.map(expense => (
-              <ExpenseItem
-                key={expense.id}
-                expense={expense}
-                searchQuery={searchQuery}
-                detailOrigin="insights"
-                detailOrderIds={visibleExpenses.map(item => item.id)}
-              />
-            ))}
-          </View>
-        )}
-      </ScrollView>
+            </View>
+            <View style={{ gap: Spacing.s1 }}>
+              {TIMEFRAMES.map(option => {
+                const active = option.key === query.timeframe;
+                return (
+                  <ScalePressable
+                    key={option.key}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: active }}
+                    accessibilityLabel={option.label}
+                    onPress={() => onSelectTimeframe(option.key)}
+                    style={[styles.sortRow, active ? { backgroundColor: ts.raw.purple100 } : null]}
+                  >
+                    <Text
+                      style={[
+                        styles.sortLabel,
+                        { color: active ? ts.raw.primary : ts.raw.onSurface },
+                        active ? styles.sortLabelActive : null,
+                      ]}
+                    >
+                      {option.label}
+                    </Text>
+                    {active ? <Check size={16} color={ts.raw.primary} /> : null}
+                  </ScalePressable>
+                );
+              })}
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
 
+      {/* Sort Sheet Modal */}
       <SortSheet
         visible={sortVisible}
         activeKey={sortKey}
@@ -756,6 +922,7 @@ export default function AnalyticsScreen() {
         onClose={() => setSortVisible(false)}
       />
 
+      {/* Date Range Picker */}
       <DateRangePicker
         visible={datePickerVisible}
         startDate={null}
@@ -825,7 +992,6 @@ function SortSheet({
                       { color: active ? ts.raw.primary : ts.raw.onSurface },
                       active ? styles.sortLabelActive : null,
                     ]}
-                    numberOfLines={1}
                   >
                     {option.label}
                   </Text>
@@ -841,20 +1007,12 @@ function SortSheet({
 }
 
 const styles = StyleSheet.create({
-  skeletonStack: { gap: Spacing.s2 },
-  skeletonStackTight: { marginTop: Spacing.s2 },
-  skeletonLegendRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: Spacing.s2,
-    minHeight: 22,
-  },
-  skeletonLegendLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
+  loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   header: {
     paddingHorizontal: Spacing.s5,
     paddingBottom: Spacing.s3,
     borderBottomWidth: 1,
+    gap: Spacing.s3,
   },
   headerInner: {
     flexDirection: 'row',
@@ -867,28 +1025,51 @@ const styles = StyleSheet.create({
   headerLeft: { flexShrink: 1, minWidth: 0 },
   headerEyebrow: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', textTransform: 'uppercase', letterSpacing: 0.8 },
   headerTitle: { fontFamily: 'Manrope_700Bold', fontSize: 20, lineHeight: 26, marginTop: 2 },
-  recapButton: {
+  headerRightActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
+  durationPill: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: Spacing.s2,
-    minHeight: 44,
-    paddingHorizontal: Spacing.s4,
+    gap: Spacing.s1,
+    minHeight: HEADER_CONTROL_SIZE,
+    maxWidth: 180,
+    paddingHorizontal: Spacing.s3,
     borderRadius: Radii.full,
-    overflow: 'hidden',
+    borderWidth: 1,
+    flexShrink: 1,
   },
-  recapLabel: { ...Typography.micro, fontFamily: 'Manrope_700Bold', color: Colors.white },
+  durationPillText: { ...Typography.micro, fontFamily: 'Manrope_700Bold', flexShrink: 1 },
+  recapIconBtn: {
+    width: HEADER_CONTROL_SIZE,
+    height: HEADER_CONTROL_SIZE,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 
-  timeframeBar: {
+  tabBar: {
     flexDirection: 'row',
     padding: Spacing.s1,
     borderRadius: Radii.full,
     borderWidth: 1,
-    marginBottom: Spacing.s3,
+    alignSelf: 'center',
+    width: '100%',
+    maxWidth: 640,
   },
-  timeframeSegment: { flex: 1, minHeight: 44, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
-  timeframeInner: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 },
-  timeframeLabel: { ...Typography.labelMd, fontFamily: 'Manrope_500Medium' },
-  timeframeLabelActive: { fontFamily: 'Manrope_600SemiBold' },
+  tabSegment: { flex: 1, minHeight: 44, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
+  tabLabel: { ...Typography.labelMd, fontFamily: 'Manrope_500Medium' },
+  tabLabelActive: { fontFamily: 'Manrope_700Bold' },
+
+  scrollContent: {
+    paddingHorizontal: Spacing.s5,
+    paddingTop: Spacing.s3,
+    alignSelf: 'center',
+    width: '100%',
+    maxWidth: 640,
+  },
+
+  card: { borderRadius: Radii.md, padding: Spacing.s4, marginBottom: Spacing.s3 },
+  heroCard: { borderRadius: Radii.lg, padding: Spacing.s4 },
 
   filterBadge: {
     flexDirection: 'row',
@@ -918,6 +1099,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(139,92,246,0.25)',
   },
   narrativeHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: Spacing.s2, gap: Spacing.s2 },
+  narrativeDeltaBlock: { alignItems: 'flex-end', gap: 2, flexShrink: 1, maxWidth: '56%' },
+  narrativeBaseline: { ...Typography.micro, color: 'rgba(233,213,255,0.8)', textAlign: 'right' },
   narrativeEyebrow: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', color: 'rgba(233,213,255,0.8)', textTransform: 'uppercase', letterSpacing: 0.8 },
   deltaBadge: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, paddingHorizontal: Spacing.s2, paddingVertical: 2, borderRadius: Radii.full, borderWidth: 1 },
   deltaBadgeGood: { backgroundColor: 'rgba(16,185,129,0.2)', borderColor: 'rgba(52,211,153,0.3)' },
@@ -926,11 +1109,7 @@ const styles = StyleSheet.create({
   narrativeHeadline: { fontFamily: 'Manrope_700Bold', fontSize: 16, lineHeight: 22, color: Colors.white },
   narrativeDetail: { ...Typography.labelMd, color: 'rgba(237,233,254,0.85)', marginTop: Spacing.s1 },
   narrativeFooter: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', marginTop: Spacing.s3, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.1)', gap: Spacing.s2 },
-  narrativeTotalLabel: { ...Typography.micro, color: 'rgba(233,213,255,0.9)', flexShrink: 1 },
-  narrativeTotalAmount: { ...Typography.micro, fontFamily: 'Manrope_700Bold', color: Colors.white },
   narrativePeriod: { ...Typography.micro, color: 'rgba(233,213,255,0.8)', flexShrink: 1 },
-
-  card: { borderRadius: Radii.md, padding: Spacing.s4, marginBottom: Spacing.s3 },
 
   digestHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: Spacing.s2 },
   digestIdentity: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
@@ -939,32 +1118,54 @@ const styles = StyleSheet.create({
   digestMeta: { ...Typography.micro, marginTop: 1 },
   digestDismiss: { width: 28, height: 28, alignItems: 'center', justifyContent: 'center' },
   digestBody: { marginTop: Spacing.s2, gap: Spacing.s2 },
+  digestGeneratingRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
   digestText: { ...Typography.labelMd, lineHeight: 18 },
-  digestRetry: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s2, marginTop: Spacing.s2 },
-  digestError: { ...Typography.micro, flexShrink: 1 },
+  digestActionRow: { marginTop: Spacing.s3 },
 
   cashflowHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s2, marginBottom: Spacing.s3 },
   sectionEyebrow: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', textTransform: 'uppercase', letterSpacing: 0.8 },
   sectionTitle: { ...Typography.labelBold, marginTop: 1 },
-  netPill: { paddingHorizontal: Spacing.s2, paddingVertical: 3, borderRadius: Radii.full },
+  netPill: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, paddingHorizontal: Spacing.s2, paddingVertical: 3, borderRadius: Radii.full },
   netPillText: { ...Typography.micro, fontFamily: 'Manrope_700Bold' },
   cashflowCards: { flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s3 },
-  cashflowCard: { flex: 1, minWidth: 0, borderRadius: Radii.sm, borderWidth: 1, padding: Spacing.s3 },
-  cashflowCardIncome: { borderColor: 'rgba(255,255,255,0.1)' },
-  cashflowCardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: Spacing.s1 },
-  cashflowLabelOnDark: { ...Typography.micro, color: 'rgba(255,255,255,0.7)' },
-  cashflowLabelLight: { ...Typography.micro, color: 'rgba(255,255,255,0.7)' },
-  cashflowIcon: { width: 20, height: 20, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
-  cashflowIconOnDark: { backgroundColor: 'rgba(255,255,255,0.15)' },
-  cashflowIconLight: { width: 20, height: 20, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.2)' },
-  cashflowAmountLight: { ...Typography.labelBold, color: Colors.white, letterSpacing: -0.3 },
-  cashflowSubOnDark: { ...Typography.micro, marginTop: 2, color: Colors.statusSuccessText },
-  cashflowSubLight: { ...Typography.micro, color: 'rgba(237,233,254,0.95)', marginTop: 2 },
+  cashflowCard: { flex: 1, minWidth: 0, aspectRatio: 1, borderRadius: Radii.lg, borderWidth: 1, padding: Spacing.s3, overflow: 'hidden', justifyContent: 'space-between' },
+  cashflowDecor: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  cashflowBlob: { position: 'absolute', width: CARD_BLOB_SIZE, height: CARD_BLOB_SIZE, borderRadius: CARD_BLOB_SIZE / 2, right: -CARD_BLOB_SIZE / 3, top: -CARD_BLOB_SIZE / 6 },
+  cashflowWatermark: { position: 'absolute', right: Spacing.s1, top: '50%', marginTop: -CARD_WATERMARK_SIZE / 2 },
+  cashflowBadge: { width: 28, height: 28, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', alignSelf: 'flex-start' },
+  cashflowFooter: { gap: 1 },
+  cashflowLabel: { ...Typography.labelMd, color: CARD_LABEL },
+  cashflowAmount: { ...Typography.headlineSm, color: Colors.white, letterSpacing: -0.5 },
   cashflowTrackRow: { gap: Spacing.s1 },
   cashflowTrack: { height: 10, borderRadius: Radii.full, overflow: 'hidden' },
   cashflowFill: { height: '100%', borderRadius: Radii.full },
   cashflowTrackLabels: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: Spacing.s2 },
   cashflowTrackLabel: { ...Typography.micro },
+
+  paceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    gap: Spacing.s2,
+    marginTop: Spacing.s3,
+    paddingTop: Spacing.s3,
+    borderTopWidth: 1,
+  },
+  paceIdentity: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
+  paceIcon: { width: 28, height: 28, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center' },
+  paceCopy: { flexShrink: 1, minWidth: 0 },
+  paceLabel: { ...Typography.micro, fontFamily: 'Manrope_600SemiBold', textTransform: 'uppercase', letterSpacing: 0.6 },
+  paceValue: { ...Typography.labelBold, marginTop: 1 },
+  paceAction: {
+    minHeight: HEADER_CONTROL_SIZE,
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.s3,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    maxWidth: '100%',
+  },
+  paceActionText: { ...Typography.micro, fontFamily: 'Manrope_700Bold' },
 
   sectionHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s2, marginBottom: Spacing.s2 },
   sectionHint: { ...Typography.micro },
@@ -983,11 +1184,12 @@ const styles = StyleSheet.create({
   errorRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flex: 1, minWidth: 0 },
   errorText: { ...Typography.micro, flexShrink: 1 },
 
-  transactionList: { gap: 0 },
-  emptyCard: { borderRadius: Radii.md, padding: Spacing.s5, borderWidth: 1, borderStyle: 'dashed', alignItems: 'center' },
+  emptyCard: { borderRadius: Radii.md, padding: Spacing.s5, borderWidth: 1, alignItems: 'center' },
+  emptyCardDashed: { borderStyle: 'dashed' },
   emptyIcon: { width: 40, height: 40, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', marginBottom: Spacing.s2 },
   emptyTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', textAlign: 'center' },
   emptyBody: { ...Typography.micro, textAlign: 'center', marginTop: Spacing.s1, maxWidth: 280 },
+  emptyActions: { marginTop: Spacing.s4, gap: Spacing.s2, width: '100%', maxWidth: 280 },
   emptyReset: { minHeight: 44, justifyContent: 'center', marginTop: Spacing.s2 },
   emptyResetText: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold' },
 

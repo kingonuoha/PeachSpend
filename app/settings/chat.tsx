@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
+  Linking,
   Modal,
   Pressable,
   RefreshControl,
@@ -18,6 +19,7 @@ import {
   ArrowLeft,
   Check,
   Clock,
+  ExternalLink,
   Eye,
   EyeOff,
   HelpCircle,
@@ -38,6 +40,7 @@ import { useToast } from '../../components/ui/ToastProvider';
 import { aiChatService } from '../../services/AIChatService';
 import { databaseService } from '../../services/DatabaseService';
 import { getAiErrorMessage, type AiProvider, type ProviderModel } from '../../ai/contracts';
+import type { ChatRetentionDays } from '../../data/ChatRetention';
 import type {
   ConversationHistoryState,
   MaskedKeyState,
@@ -57,6 +60,20 @@ const OPENROUTER_SECRET_KEY = 'chat_openrouter_api_key';
 const GEMINI_MODEL_SETTING = 'chat_gemini_model';
 const OPENROUTER_MODEL_SETTING = 'chat_openrouter_model';
 const CONTENT_MAX_WIDTH = 640;
+// The real page where a Google AI Studio key is created. Opened through the
+// platform handler so the app keeps one route out of itself and no embedded web UI.
+const GEMINI_KEY_PAGE = 'https://aistudio.google.com/app/apikey';
+// The reveal control is 44 wide and sits 2 from the right edge, so the text needs
+// more than that plus a gap on the right or a long key renders underneath it.
+const KEY_INPUT_RIGHT_PAD = Spacing.s9 + Spacing.s2;
+
+// DEC-11-03: keep forever is the default and the only value a fresh install holds.
+// The two windows are an explicit opt in and the data layer really deletes for them.
+const RETENTION_OPTIONS: { value: ChatRetentionDays; label: string }[] = [
+  { value: 0, label: 'Keep Forever' },
+  { value: 7, label: '7 Days' },
+  { value: 30, label: '30 Days' },
+];
 
 function providerLabel(model: ProviderModel, provider: AiProvider): string {
   if (provider === 'gemini') return 'Google';
@@ -243,6 +260,13 @@ function ChatSettingsSkeleton() {
           <Skeleton width={80} height={10} />
         </View>
 
+        <View style={[styles.guideCard, { borderWidth: 1, borderRadius: Radii.md, borderColor: ts.raw.outline, padding: Spacing.s3 }]}>
+          <Skeleton width="40%" height={12} />
+          <Skeleton width="95%" height={10} />
+          <Skeleton width="70%" height={10} />
+          <Skeleton width={132} height={32} borderRadius={Radii.sm} />
+        </View>
+
         <LuminousCard variant="low" style={styles.keyCard}>
           <View style={styles.keyCardHead}>
             <View style={styles.keyIdentity}>
@@ -332,6 +356,9 @@ export default function ChatSettingsScreen() {
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
+  // Wave 0 D4. Read through the service, never by writing the settings key here.
+  const [retentionDays, setRetentionDays] = useState<ChatRetentionDays>(0);
+  const [retentionBusy, setRetentionBusy] = useState(false);
 
   // The two key fields are uncontrolled so the stored secret is never read into
   // React state. Drafts live in refs and are cleared as soon as they are saved.
@@ -341,7 +368,7 @@ export default function ChatSettingsScreen() {
   const openRouterDraft = useRef('');
 
   const loadScreen = useCallback(async () => {
-    const [keys, historyState, cachedGemini, cachedOpenRouter, geminiSetting, openRouterSetting] =
+    const [keys, historyState, cachedGemini, cachedOpenRouter, geminiSetting, openRouterSetting, retention] =
       await Promise.all([
         aiChatService.getProviderKeyState(),
         aiChatService.getConversationHistoryState(),
@@ -349,6 +376,7 @@ export default function ChatSettingsScreen() {
         aiChatService.getCachedOpenRouterModels(),
         databaseService.getSetting(GEMINI_MODEL_SETTING),
         databaseService.getSetting(OPENROUTER_MODEL_SETTING),
+        databaseService.getChatRetentionDays(),
       ]);
     setKeyState(keys);
     setHistory(historyState);
@@ -363,6 +391,7 @@ export default function ChatSettingsScreen() {
     );
     setActiveGeminiModel(geminiSetting ?? '');
     setActiveOpenRouterModel(openRouterSetting ?? '');
+    setRetentionDays(retention);
   }, []);
 
   // Pull-to-refresh variant. Re-reads every settings surface through the same
@@ -490,8 +519,37 @@ export default function ChatSettingsScreen() {
     }
   };
 
+  // Wave 0 D4 writes the window and the cleanup reads the same key, so a selection
+  // here is the behaviour, not a note about it. Keep Forever stores 0 and deletes
+  // nothing, which is why it is the default.
+  const applyRetention = async (days: ChatRetentionDays) => {
+    if (retentionBusy || days === retentionDays) return;
+    setRetentionBusy(true);
+    try {
+      await databaseService.setChatRetentionDays(days);
+      setRetentionDays(days);
+      toast.showToast('Chat retention updated', 'success');
+    } catch {
+      toast.showToast('Could not change chat retention', 'error');
+    } finally {
+      setRetentionBusy(false);
+    }
+  };
+
+  const openKeyPage = async () => {
+    try {
+      await Linking.openURL(GEMINI_KEY_PAGE);
+    } catch {
+      toast.showToast('Could not open a browser on this device', 'error');
+    }
+  };
+
   const originLabel =
-    params.origin === 'scan' ? 'Return to S-06 Neural Scan' : 'Return to S-07 AI Chat';
+    params.origin === 'scan' ? 'Return to Receipt Scanner' : 'Return to Financial Chat';
+
+  const retentionNote = retentionDays === 0
+    ? 'Messages stay on this device until you clear them.'
+    : `Messages older than ${retentionDays} days are removed when you open Chat. Your ledger is never affected.`;
 
   const header = (
     <View>
@@ -511,14 +569,9 @@ export default function ChatSettingsScreen() {
             <Lock size={16} color={ts.raw.onPrimary} />
           </View>
           <View style={styles.vaultText}>
-            <View style={styles.vaultTitleRow}>
-              <Text style={[Typography.captionBold, styles.vaultTitle]}>Centralized Dual-Key Vault</Text>
-              <View style={styles.frhBadge}>
-                <Text style={[Typography.micro, styles.frhText]}>FR-17.1</Text>
-              </View>
-            </View>
+            <Text style={[Typography.captionBold, styles.vaultTitle]}>Centralized Dual-Key Vault</Text>
             <Text style={[Typography.labelMd, styles.vaultBody]}>
-              Keys saved here drive S-07 AI Chat. Stored in the device secure store with no
+              Keys saved here drive the assistant. Stored in the device secure store with no
               duplicate key field anywhere else.
             </Text>
           </View>
@@ -539,6 +592,28 @@ export default function ChatSettingsScreen() {
         <FieldLabel>Provider Credentials</FieldLabel>
         <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>Secure storage</Text>
       </View>
+
+      {/* B4-5: why a key exists at all, in plain words, with the one tap route to
+          create one. It states what Google decides, so it promises no guarantee the
+          provider does not make. */}
+      <LuminousCard variant="low" style={styles.guideCard}>
+        <Text style={[Typography.captionBold, { color: ts.raw.onSurface }]}>
+          Why a key is needed
+        </Text>
+        <Text style={[Typography.micro, styles.guideBody, { color: ts.raw.onSurfaceVariant }]}>
+          PeachSpend has no servers. Your key lets this phone talk to Google or OpenRouter
+          directly, and the key itself never leaves the device. Creating a Gemini key in
+          Google AI Studio costs nothing. Google sets the terms and any usage limits.
+        </Text>
+        <PeachButton
+          title="Get a Gemini key"
+          onPress={() => void openKeyPage()}
+          variant="secondary"
+          size="xs"
+          icon={<ExternalLink size={14} color={ts.raw.primary} />}
+          accessibilityLabel="Open Google AI Studio to create a Gemini key"
+        />
+      </LuminousCard>
 
       <LuminousCard variant="low" style={styles.keyCard}>
         <View style={styles.keyCardHead}>
@@ -758,24 +833,65 @@ export default function ChatSettingsScreen() {
         <View style={styles.historyHead}>
           <View style={styles.historyHeadText}>
             <Text style={[Typography.captionBold, { color: ts.raw.onSurface }]}>
-              Conversation History (S-07)
+              Conversation History
             </Text>
             <Text style={[Typography.labelMd, { color: ts.raw.onSurfaceVariant }]}>
               {`${history?.messageCount ?? 0} messages stored locally`}
             </Text>
           </View>
           <View style={[styles.storageChip, { backgroundColor: ts.bg.elevated, borderColor: ts.raw.outline }]}>
-            <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>SQLite</Text>
+            <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>On device</Text>
           </View>
         </View>
         <View style={[styles.autoClear, { backgroundColor: ts.raw.purple100, borderColor: ts.raw.primaryBorder }]}>
           <Clock size={16} color={ts.raw.primary} />
           <Text style={[Typography.micro, styles.autoClearText, { color: ts.raw.onSurface }]}>
-            {history?.willAutoClear
-              ? 'Stale messages are due to be cleared on next chat activity.'
-              : `Auto-clears after ${history?.autoClearDays ?? 7} days of inactivity.`}
+            Delete chat messages after
           </Text>
         </View>
+        <View
+          accessibilityRole="radiogroup"
+          accessibilityLabel="Chat history retention"
+          style={styles.retentionRow}
+        >
+          {RETENTION_OPTIONS.map((option) => {
+            const selected = retentionDays === option.value;
+            return (
+              <ScalePressable
+                key={option.value}
+                accessibilityRole="radio"
+                accessibilityLabel={option.label}
+                accessibilityState={{ selected, disabled: retentionBusy }}
+                disabled={retentionBusy}
+                onPress={() => void applyRetention(option.value)}
+                style={[
+                  styles.retentionOption,
+                  {
+                    backgroundColor: selected ? ts.raw.primary : ts.bg.low,
+                    borderColor: selected ? ts.raw.primary : ts.raw.outline,
+                  },
+                ]}
+              >
+                <Text
+                  numberOfLines={2}
+                  style={[
+                    Typography.captionBold,
+                    styles.retentionLabel,
+                    { color: selected ? ts.raw.onPrimary : ts.raw.onSurfaceVariant },
+                  ]}
+                >
+                  {option.label}
+                </Text>
+              </ScalePressable>
+            );
+          })}
+        </View>
+        <Text
+          accessibilityLiveRegion="polite"
+          style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}
+        >
+          {retentionNote}
+        </Text>
         <PeachButton
           title="Clear All Chat Messages"
           onPress={() => setClearOpen(true)}
@@ -993,16 +1109,11 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.16)',
   },
   vaultText: { flex: 1, minWidth: 0 },
-  vaultTitleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexWrap: 'wrap' },
   vaultTitle: { color: '#FFFFFF' },
-  frhBadge: {
-    backgroundColor: 'rgba(255,255,255,0.18)',
-    borderRadius: Radii.sm,
-    paddingHorizontal: Spacing.s1,
-    paddingVertical: 2,
-  },
-  frhText: { color: '#FFFFFF', letterSpacing: 1 },
   vaultBody: { color: 'rgba(255,255,255,0.82)', marginTop: Spacing.s1 },
+
+  guideCard: { gap: Spacing.s2, marginBottom: Spacing.s3 },
+  guideBody: { lineHeight: 17 },
 
   errorBanner: {
     flexDirection: 'row',
@@ -1062,8 +1173,9 @@ const styles = StyleSheet.create({
     borderRadius: Radii.sm,
     borderWidth: 1,
     paddingLeft: Spacing.s3,
-    // Canonical pr-10 (HTML 209): keeps the typed draft clear of the 44pt eye.
-    paddingRight: Spacing.s8,
+    // The 44pt reveal control sits 2 from the right edge, so the text clears it by
+    // more than a token step and a long key can never render underneath the icon.
+    paddingRight: KEY_INPUT_RIGHT_PAD,
     paddingVertical: Spacing.s2,
     letterSpacing: 1,
   },
@@ -1164,6 +1276,20 @@ const styles = StyleSheet.create({
     padding: Spacing.s3,
   },
   autoClearText: { flex: 1, minWidth: 0 },
+  retentionRow: { flexDirection: 'row', gap: Spacing.s2 },
+  // Three equal options: each is a real 48pt target and the 8pt gap keeps a one
+  // handed tap from landing on the neighbouring window.
+  retentionOption: {
+    flex: 1,
+    minHeight: 48,
+    borderRadius: Radii.sm,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.s1,
+    paddingVertical: Spacing.s1,
+  },
+  retentionLabel: { textAlign: 'center' },
 
   modalBackdrop: {
     flex: 1,

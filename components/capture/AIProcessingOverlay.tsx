@@ -9,7 +9,7 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Sparkles } from 'lucide-react-native';
+import { Check, Sparkles } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
@@ -35,6 +35,8 @@ const ORB_SIZE = 80;
 const ORB_INNER_SIZE = 76;
 const PROGRESS_MAX_WIDTH = 192;
 const PROGRESS_HEIGHT = 6;
+// The step list wraps inside the same panel width as the description.
+const STEP_LIST_MAX_WIDTH = 260;
 const PULSE_DURATION = 1000; // pulseGlow 2s cycle, one leg each way (HTML 29 to 35)
 const RADAR_DURATION = 1000; // Tailwind animate-spin is 1s linear (HTML 59)
 const RING_DURATION = 1000; // Tailwind animate-ping is 1s (HTML 63)
@@ -163,24 +165,79 @@ function ProcessingProgress({ progress, reduceMotion }: { progress?: number; red
   );
 }
 
+export interface ProcessingStep {
+  label: string;
+  state: 'done' | 'active' | 'pending';
+}
+
+const STEP_STATE_LABEL: Record<ProcessingStep['state'], string> = {
+  done: 'complete',
+  active: 'in progress',
+  pending: 'not started',
+};
+
+// Real pipeline steps, supplied by the caller only when the app can observe the
+// transition itself. A step is `done` when the boundary it names has actually
+// passed, `active` while the work between two boundaries is running, and
+// `pending` before it starts, so the list can never claim a step finished early.
+function StepList({ steps }: { steps: readonly ProcessingStep[] }) {
+  return (
+    <View style={styles.steps}>
+      {steps.map((step) => (
+        <View
+          key={step.label}
+          accessible
+          accessibilityLabel={`${step.label}, ${STEP_STATE_LABEL[step.state]}`}
+          style={styles.stepRow}
+        >
+          <View style={[styles.stepDot, step.state === 'done' && styles.stepDotDone, step.state === 'active' && styles.stepDotActive]}>
+            {step.state === 'done' ? <Check size={10} color={Colors.black} strokeWidth={3} /> : null}
+          </View>
+          <Text
+            numberOfLines={2}
+            style={[
+              styles.stepLabel,
+              step.state === 'done' && styles.stepLabelDone,
+              step.state === 'active' && styles.stepLabelActive,
+            ]}
+          >
+            {step.label}
+          </Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
 export interface AIProcessingSurfaceProps {
   contextLabel: string;
   title: string;
   description: string;
   /** Real 0..1 progress from the caller. Omit when no measurable source exists. */
   progress?: number;
+  /**
+   * Real pipeline steps. Omit when the caller cannot observe each boundary, which
+   * keeps the honest indeterminate sweep rather than inventing stage names.
+   */
+  steps?: readonly ProcessingStep[];
   onCancel?: () => void;
   style?: StyleProp<ViewStyle>;
 }
 
 // Canonical overlay anatomy from the locked pair. Rendered by the production modal
 // and by the dev showcase so the surface exists once.
-export function AIProcessingSurface({ contextLabel, title, description, progress, onCancel, style }: AIProcessingSurfaceProps) {
+export function AIProcessingSurface({ contextLabel, title, description, progress, steps, onCancel, style }: AIProcessingSurfaceProps) {
   const reduceMotion = useReduceMotion();
   const pressCancel = () => {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     onCancel?.();
   };
+  // A step count is a real measured value, so it can drive the determinate bar.
+  // An explicit `progress` wins when the caller has a finer measure.
+  const stepProgress = steps && steps.length > 0
+    ? steps.filter((step) => step.state === 'done').length / steps.length
+    : undefined;
+  const resolvedProgress = progress ?? stepProgress;
   return (
     <View accessibilityState={{ busy: true }} style={[styles.panel, style]}>
       <ProcessingGlow reduceMotion={reduceMotion} />
@@ -188,7 +245,8 @@ export function AIProcessingSurface({ contextLabel, title, description, progress
       <ContextPill label={contextLabel} reduceMotion={reduceMotion} />
       <Text accessibilityRole="header" style={styles.title}>{title}</Text>
       <Text style={styles.description}>{description}</Text>
-      <ProcessingProgress progress={progress} reduceMotion={reduceMotion} />
+      <ProcessingProgress progress={resolvedProgress} reduceMotion={reduceMotion} />
+      {steps && steps.length > 0 ? <StepList steps={steps} /> : null}
       {onCancel ? (
         <Pressable
           onPress={pressCancel}
@@ -210,10 +268,12 @@ export interface AIProcessingOverlayProps {
   title: string;
   description: string;
   progress?: number;
+  /** Real pipeline steps; omit when the caller cannot observe each boundary. */
+  steps?: readonly ProcessingStep[];
   onCancel?: () => void;
 }
 
-export function AIProcessingOverlay({ visible, contextLabel, title, description, progress, onCancel }: AIProcessingOverlayProps) {
+export function AIProcessingOverlay({ visible, contextLabel, title, description, progress, steps, onCancel }: AIProcessingOverlayProps) {
   const ts = useThemeStyles();
   const reduceMotion = useReduceMotion();
   const opacity = useSharedValue(0);
@@ -239,6 +299,7 @@ export function AIProcessingOverlay({ visible, contextLabel, title, description,
           title={title}
           description={description}
           progress={progress}
+          steps={steps}
           onCancel={onCancel}
         />
       </Animated.View>
@@ -282,6 +343,14 @@ const styles = StyleSheet.create({
   track: { width: '100%', maxWidth: PROGRESS_MAX_WIDTH, height: PROGRESS_HEIGHT, borderRadius: Radii.full, backgroundColor: TRACK_BG, overflow: 'hidden', alignSelf: 'center', marginBottom: Spacing.s3 },
   fill: { height: '100%', borderRadius: Radii.full },
   sweep: { position: 'absolute', top: 0, left: 0, width: PROGRESS_MAX_WIDTH * 0.4, height: '100%', borderRadius: Radii.full, overflow: 'hidden' },
+  steps: { width: '100%', maxWidth: STEP_LIST_MAX_WIDTH, alignSelf: 'center', gap: Spacing.s1 + 2, marginBottom: Spacing.s2 },
+  stepRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2, minHeight: 18 },
+  stepDot: { width: 14, height: 14, borderRadius: Radii.full, borderWidth: 1, borderColor: `${Colors.white}66`, alignItems: 'center', justifyContent: 'center', marginTop: 1 },
+  stepDotDone: { backgroundColor: Colors.white, borderColor: Colors.white },
+  stepDotActive: { borderColor: ACCENT, backgroundColor: `${ACCENT}55` },
+  stepLabel: { ...Typography.micro, color: WHITE_70, flexShrink: 1 },
+  stepLabelDone: { color: WHITE_70 },
+  stepLabelActive: { color: Colors.white },
   cancel: { minHeight: CANCEL_MIN_HEIGHT, justifyContent: 'center', paddingHorizontal: Spacing.s3 },
   cancelLabel: { ...Typography.labelMd, color: WHITE_70, textDecorationLine: 'underline' },
   cancelLabelPressed: { color: Colors.white },

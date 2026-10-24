@@ -13,14 +13,23 @@ import {
   type ChatActionKind, type ChatActionOutcome, type ChatActionResult, type ChatActionRequest, type ChatApprovalDecision,
 } from '../ai/chatActions';
 import {
-  buildConversationHistoryState, CHAT_HISTORY_AUTO_CLEAR_DAYS, refreshModels as refreshProviderModelList, toMaskedKeyState,
+  buildConversationHistoryState, refreshModels as refreshProviderModelList, toMaskedKeyState,
   type ConversationHistoryState, type ModelRefreshOutcome, type ProviderKeyState,
 } from '../data/ProviderSettings';
 import { formatCurrency, resolveDisplayCurrency } from '../utils/currency';
+import { parseStoredBudget, toStoredBudget } from '../data/SettingsContracts';
+import { answerLocalQuestion, type LocalAnswer } from '../ai/localAnswers';
 
 const MAX_HISTORY_MESSAGES = 50;
 const TRIM_HISTORY_TO = 40;
 const MAX_DYNAMIC_TOKENS = 300;
+
+// BUG-09-16: one wording for a budget the user never set, so no budget figure in
+// the prompt states a spend, a percent used, or a remaining amount against a
+// limit that does not exist. It is the phrase the static summary line already
+// uses (BUG-09-12), reused rather than restated so the prompt cannot tell the
+// model two different things about the same state.
+const NO_BUDGET_FIGURE = 'not set (no monthly spending limit has been set, so do not compare spending against a limit or assume one exists)';
 
 class AIChatService {
   private cachedSummary: StaticSummary | null = null;
@@ -293,9 +302,17 @@ class AIChatService {
         if (resolution.status === 'discarded') return { status: 'discarded', tier: 2 };
         return { status: 'batch_saved', tier: 2, expenseIds: resolution.records.map(record => record.id), resolution };
       }
-      case 'update_budget':
-        await databaseService.updateSetting('monthly_budget', String(request.amount));
+      case 'update_budget': {
+        // Same canonical write as onboarding (BUG-09-04a): the amount reaches this
+        // boundary as a number, but a non-finite or negative one would still store
+        // a string no strict reader can honour, so it is refused rather than
+        // written. The Tier 2 vocabulary for a kind with no usable write is
+        // `unsupported`, and nothing is faked.
+        const stored = toStoredBudget(String(request.amount));
+        if (stored === null) return { status: 'unsupported', tier: 2, kind: request.kind };
+        await databaseService.updateSetting('monthly_budget', stored);
         return { status: 'settings_applied', tier: 2, kind: request.kind };
+      }
       case 'update_currency':
         await databaseService.updateSetting('currency', request.currency);
         return { status: 'settings_applied', tier: 2, kind: request.kind };
@@ -389,11 +406,18 @@ class AIChatService {
     if (/how much (on|for|did i spend on)|spent on|category|on .* (category|this month)/.test(lower)) matches.push('category_query');
     if (/\b(at|from) \w/i.test(lower) || /merchant/.test(lower)) matches.push('merchant_query');
     if (/last week|this month|in (january|february|march|april|may|june|july|august|september|october|november|december)|between|this year|last month|this week/.test(lower)) matches.push('date_range_query');
-    if (/recent|latest|last few|what did I spend|recent expenses/.test(lower)) matches.push('recent_expenses');
-    if (/when will I|at this rate|how much will|project|forecast|predict/.test(lower)) matches.push('forecast');
+    // `what did I spend` carried the same uppercase `I` against the lowercased
+    // input as the two patterns below (BUG-09-13, DEC-B49 follow-up).
+    if (/recent|latest|last few|what did i spend|recent expenses/.test(lower)) matches.push('recent_expenses');
+    // `lower` is already lowercased at :395, so every literal here must be lowercase
+    // or it can never match (BUG-09-13). `when will i` was written with an uppercase
+    // `I` and was dead against this input.
+    if (/when will i|at this rate|how much will|project|forecast|predict/.test(lower)) matches.push('forecast');
     if (/log|add|record|save|spent \d|enter .* expense/.test(lower)) matches.push('log_expense');
     if (/owe me|reimbursable|get paid back|reimburse/.test(lower)) matches.push('reimbursable');
-    if (/on track|budget|how am I doing|limit|under budget|over budget/.test(lower)) matches.push('budget_check');
+    // Same defect as the forecast pattern above: `how am I doing` kept an uppercase
+    // `I` and could not match the lowercased message (BUG-09-13).
+    if (/on track|budget|how am i doing|limit|under budget|over budget/.test(lower)) matches.push('budget_check');
 
     if (matches.length === 0) return ['general'];
     if (matches.length <= 2) return matches;
@@ -402,8 +426,9 @@ class AIChatService {
 
   private async buildStaticSummary(): Promise<StaticSummary> {
     const allSettings = await databaseService.getAllSettings();
-    const parsedBudget = Number.parseFloat(allSettings.monthly_budget);
-    const monthlyBudget = Number.isFinite(parsedBudget) && parsedBudget >= 0 ? parsedBudget : 0;
+    // One canonical budget read (BUG-09-04a): a strict parse, never a partial one,
+    // so the prompt cannot be told about a limit the user never set.
+    const monthlyBudget = parseStoredBudget(allSettings.monthly_budget);
     const currency = resolveDisplayCurrency(allSettings.currency);
     this.activeCurrency = currency;
 
@@ -466,10 +491,18 @@ class AIChatService {
           break;
         }
         case 'forecast': {
-          const budget = parseFloat((await databaseService.getSetting('monthly_budget')) || '0');
+          const budget = parseStoredBudget(await databaseService.getSetting('monthly_budget'));
           const budgetStatus = await databaseService.getBudgetStatus(budget, startOfMonth, endOfMonth);
           const projectedTotal = budgetStatus.dailySpendRate * budgetStatus.daysRemaining + budgetStatus.spent;
-          data = `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${this.fmt(budgetStatus.remaining)}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`;
+          // BUG-09-16: `getBudgetStatus` returns remaining 0 for a zero budget, so
+          // an unguarded line stated a remaining budget against a limit the user
+          // never set, right beside a line telling the model not to assume one.
+          // With no limit set the line says so in the static summary line's own
+          // wording. The spend so far and the projection do not depend on a limit,
+          // so they stay real data either way. The set case is unchanged.
+          data = budget > 0
+            ? `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${this.fmt(budgetStatus.remaining)}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`
+            : `Daily spend rate: ${this.fmt(budgetStatus.dailySpendRate)}/day\nDays remaining: ${budgetStatus.daysRemaining}\nSpent so far: ${this.fmt(budgetStatus.spent)}\nRemaining budget: ${NO_BUDGET_FIGURE}\nProjected month end at current rate: ${this.fmt(projectedTotal)}`;
           break;
         }
         case 'reimbursable': {
@@ -478,9 +511,18 @@ class AIChatService {
           break;
         }
         case 'budget_check': {
-          const budget = parseFloat((await databaseService.getSetting('monthly_budget')) || '0');
+          const budget = parseStoredBudget(await databaseService.getSetting('monthly_budget'));
           const budgetStatus = await databaseService.getBudgetStatus(budget, startOfMonth, endOfMonth);
-          data = `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${this.fmt(budgetStatus.remaining)}\nUsed: ${budgetStatus.usedPercent.toFixed(1)}%\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`;
+          // BUG-09-16: `getBudgetStatus` returns remaining 0 and usedPercent 0 for a
+          // zero budget, so an unguarded slice stated a remaining amount and a
+          // percent used against a limit the user never set. With no limit set the
+          // remaining line says so in the static summary line's own wording, and the
+          // percent line is dropped rather than reworded, because a share of a limit
+          // that does not exist has no meaning. The spend and the daily rate are
+          // real data either way. The set case is unchanged.
+          data = budget > 0
+            ? `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${this.fmt(budgetStatus.remaining)}\nUsed: ${budgetStatus.usedPercent.toFixed(1)}%\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`
+            : `Spent: ${this.fmt(budgetStatus.spent)}\nRemaining: ${NO_BUDGET_FIGURE}\nDaily rate: ${this.fmt(budgetStatus.dailySpendRate)}/day`;
           break;
         }
         default:
@@ -506,8 +548,17 @@ class AIChatService {
     const profileName = (await databaseService.getSetting('profile_name')) || 'there';
     const currency = summary.currency;
 
+    // BUG-09-12: a budget of zero means the user never set a limit, so the prompt
+    // says that plainly instead of printing a spend against a zero cap with zero
+    // percent used, which made the model reason about a limit that does not exist.
+    // The set case is unchanged and still formats through the shared formatter, so
+    // the amount it reports cannot drift from the rest of the app.
+    const budgetLine = summary.monthlyBudget > 0
+      ? `Monthly budget: ${formatCurrency(summary.monthlyBudget, currency)} (${summary.budgetUsedPercent.toFixed(0)}% used)`
+      : 'Monthly budget: not set (no monthly spending limit has been set, so do not compare spending against a limit or assume one exists)';
+
     const staticBlock = `Total spent this month: ${formatCurrency(summary.totalSpentThisMonth, currency)}
-Monthly budget: ${formatCurrency(summary.monthlyBudget, currency)} (${summary.budgetUsedPercent.toFixed(0)}% used)
+${budgetLine}
 Days remaining in month: ${summary.daysRemaining}
 Daily spend rate: ${formatCurrency(summary.dailySpendRate, currency)}/day
 Net balance this month: ${formatCurrency(summary.netBalance, currency)} (income ${formatCurrency(summary.netBalance + summary.totalSpentThisMonth, currency)} − expenses ${formatCurrency(summary.totalSpentThisMonth, currency)})
@@ -627,27 +678,26 @@ LEDGER_DATA>>>`;
   }
 
   async checkAutoExpiry(): Promise<boolean> {
-    const lastActive = await databaseService.getSetting('chat_last_active');
-    if (!lastActive) return false;
+    // Phase 11 D4, DEC-11-03. This is the chat maintenance entry point the app start
+    // path and the chat screen already call, so the retention sweep runs from the
+    // existing service bootstrap without a new call site in a screen. It used to clear
+    // the whole conversation after seven quiet days, which no longer happens: keep
+    // forever is the default and the only behaviour for a fresh install. With 7 or 30
+    // days selected, messages older than the window are deleted instead, which is age
+    // based and does not care whether the user was recently active.
+    // Returns true only when messages were actually removed.
+    const deleted = await databaseService.purgeExpiredChatMessages();
+    if (deleted > 0) logger.info('Chat history trimmed by the retention window');
+    return deleted > 0;
+  }
 
-    const lastActiveTime = parseInt(lastActive);
-    if (isNaN(lastActiveTime)) return false;
-
-    const daysSince = (Date.now() - lastActiveTime) / 86400000;
-    if (daysSince > CHAT_HISTORY_AUTO_CLEAR_DAYS) {
-      await databaseService.clearChatHistory();
-      await databaseService.saveChatMessage({
-        id: Math.random().toString(36).substring(2, 15),
-        role: 'assistant',
-        content: 'Your previous conversation was cleared after 7 days of inactivity.',
-        message_type: 'system',
-        created_at: Date.now(),
-      });
-      await databaseService.updateSetting('chat_last_active', Date.now().toString());
-      return true;
-    }
-
-    return false;
+  // Phase 11 D7 (B4-1). The offline analytical answer path. This delegates to
+  // ai/localAnswers, which reads through the ledger services and imports no provider
+  // client, so this method makes no network request and reads no API key. The chat
+  // surface calls it when there is no key or no connection, and renders the returned
+  // chart and rows with the same components a remote answer uses.
+  async answerLocally(question: string, now?: number): Promise<LocalAnswer> {
+    return answerLocalQuestion(databaseService, question, now);
   }
 
   private trimHistory(history: ChatMessage[]): ChatMessage[] {

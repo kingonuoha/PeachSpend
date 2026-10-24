@@ -68,8 +68,20 @@ export class IncomeValidationError extends Error {
   }
 }
 
+// Sources where the merchant is extracted from something the user did not type,
+// so an absent merchant is a true absence rather than an omission. A product
+// photograph normally carries no store name at all, and refusing that capture
+// would block a save the user can see is correct (BUG-09-17a).
+//
+// Every other source keeps the merchant required. A manual entry is the case
+// where the requirement is real: the user left blank a name that was asked for.
+// A chat action and an imported row keep it too, and both already enforce it at
+// their own boundary before a candidate is built, so this restates that rule
+// rather than relaxing it.
+const MERCHANT_OPTIONAL_SOURCES: readonly CaptureSource[] = ['ocr', 'share', 'auto_capture'];
+
 export function assertValidCaptureCandidate(candidate: CaptureCandidate): void {
-  if (!candidate.merchant.trim()) throw new CaptureValidationError('merchant');
+  if (!MERCHANT_OPTIONAL_SOURCES.includes(candidate.source) && !candidate.merchant.trim()) throw new CaptureValidationError('merchant');
   if (!Number.isFinite(candidate.amount) || candidate.amount <= 0) throw new CaptureValidationError('amount');
   if (!candidate.currency.trim()) throw new CaptureValidationError('currency');
   if (!candidate.category.trim()) throw new CaptureValidationError('category');

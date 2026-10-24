@@ -48,7 +48,64 @@ describe('SqliteCaptureRepository duplicate detection', () => {
     const repository = new SqliteCaptureRepository({ execAsync } as never);
 
     await expect(repository.withTransaction(async () => { throw new Error('write_failed'); })).rejects.toThrow('write_failed');
-    expect(execAsync.mock.calls.map(([sql]) => sql)).toEqual(['BEGIN', 'ROLLBACK']);
+    expect(execAsync.mock.calls.map(([sql]) => sql)).toEqual(['BEGIN IMMEDIATE', 'ROLLBACK']);
+  });
+});
+
+// BUG-09-17a. The merchant is the duplicate identity. A merchantless candidate
+// has no identity to compare, so it is not duplicate matched at all rather than
+// matched on amount alone, which would make two unrelated merchantless purchases
+// of the same amount on the same day duplicates of each other.
+describe('BUG-09-17a, duplicate identity for a merchantless capture', () => {
+  const merchantlessProduct: CaptureCandidate = {
+    merchant: '', amount: 4.5, currency: 'USD', category: 'shopping', date: existingExpense.date, source: 'ocr', note: 'Sparkling water',
+  };
+
+  it('does not match a merchantless candidate against stored rows', async () => {
+    const getFirstAsync = vi.fn().mockResolvedValue(existingExpense);
+    const repository = new SqliteCaptureRepository({ getFirstAsync } as never);
+
+    await expect(repository.findDuplicate({ merchant: '', amount: 4.5, date: existingExpense.date })).resolves.toBeNull();
+    expect(getFirstAsync).not.toHaveBeenCalled();
+  });
+
+  it('does not match two unrelated merchantless candidates in one batch, even with the same amount and day', async () => {
+    const getAllAsync = vi.fn().mockResolvedValue([{ ...existingExpense, merchant: '' }]);
+    const repository = new SqliteCaptureRepository({ getAllAsync } as never);
+
+    await expect(repository.findBatchDuplicates([merchantlessProduct, { ...merchantlessProduct, note: 'Hand soap' }])).resolves.toEqual([]);
+    expect(getAllAsync).not.toHaveBeenCalled();
+  });
+
+  it('keeps merchant matching for a candidate that has a merchant', async () => {
+    const getAllAsync = vi.fn().mockResolvedValue([existingExpense]);
+    const repository = new SqliteCaptureRepository({ getAllAsync } as never);
+    const merchantful: CaptureCandidate = { merchant: 'Cafe', amount: 12.5, currency: 'USD', category: 'dining', date: existingExpense.date, source: 'ocr' };
+
+    await expect(repository.findBatchDuplicates([merchantful])).resolves.toEqual([
+      { candidateIndex: 0, match: { existing: existingExpense, reason: 'merchant_amount_24h' } },
+    ]);
+    expect(getAllAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not match two merchantless candidates in one batch when neither has a note either', async () => {
+    const getAllAsync = vi.fn().mockResolvedValue([]);
+    const repository = new SqliteCaptureRepository({ getAllAsync } as never);
+    const bare = { ...merchantlessProduct, note: undefined };
+
+    await expect(repository.findBatchDuplicates([bare, { ...bare }])).resolves.toEqual([]);
+    expect(getAllAsync).not.toHaveBeenCalled();
+  });
+
+  it('does not remember a category for a capture that has no merchant', async () => {
+    const runAsync = vi.fn().mockResolvedValue(undefined);
+    const repository = new SqliteCaptureRepository({ runAsync } as never);
+
+    await repository.rememberCategory('', 'shopping', 'ocr');
+    expect(runAsync).not.toHaveBeenCalled();
+
+    await repository.rememberCategory('Cafe', 'dining', 'ocr');
+    expect(runAsync).toHaveBeenCalledTimes(1);
   });
 });
 
