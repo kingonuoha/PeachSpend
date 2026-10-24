@@ -108,6 +108,10 @@ export function useSheetDragToDismiss({
       // Downward is free; upward past the top resists.
       translateY.set(next >= 0 ? next : rubberband(next, height));
     })
+    // The refs are read by the RN-thread dispatchers when the gesture fires, never
+    // during render, so this is a rule false positive rather than a ref read in a
+    // render path. The disable is scoped to this callback only.
+    // eslint-disable-next-line react-hooks/refs -- refs are read at gesture time on the RN thread, not during render
     .onEnd((event) => {
       const travelled = reduceMotion ? event.translationY : translateY.get();
       const projected = travelled + project(event.velocityY);

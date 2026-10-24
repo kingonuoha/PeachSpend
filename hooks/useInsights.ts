@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 import { geminiClient, openRouterClient } from '../ai/providerClients';
 import type { AiProvider } from '../ai/contracts';
@@ -10,7 +10,7 @@ import {
   generateInsightDigest,
   generatingInsightDigest,
 } from '../data/InsightDataService';
-import { createInsightDigestCache } from '../data/InsightDigestCache';
+import { buildInsightDigestKey, createInsightDigestCache } from '../data/InsightDigestCache';
 import type {
   InsightDigest,
   InsightDigestContext,
@@ -90,7 +90,10 @@ export function useInsights() {
   const [snapshot, setSnapshot] = useState<InsightsSnapshot | null>(null);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [categoryMeta, setCategoryMeta] = useState<Record<string, InsightCategoryMeta>>({});
-  const [digest, setDigest] = useState<InsightDigest | null>(null);
+  // The outcome of the user's own on-demand request, tagged with the snapshot and
+  // provider context it was asked for. It is the only mutable part of the digest;
+  // the rest is derived below, so no effect has to sync a cache read into state.
+  const [userDigest, setUserDigest] = useState<{ source: string; digest: InsightDigest } | null>(null);
   // Month is the default basis: a single week is easily distorted by one rent or
   // bulk grocery day, and most budgets run on a monthly cycle, so the first view
   // is not skewed by an unrepresentative window.
@@ -136,6 +139,10 @@ export function useInsights() {
       setExpenses(list);
       setCategoryMeta(meta);
       setError(false);
+      // A digest the user asked for belongs to the figures and context it was
+      // asked for, so a landed read retires it in the same commit as the new
+      // snapshot instead of leaving it to an effect.
+      setUserDigest(null);
     } catch {
       if (id !== requestId.current) return;
       // getSnapshot resolves its own failure snapshot; a throw here is a hard
@@ -170,27 +177,42 @@ export function useInsights() {
   // Digest resolution: a stored digest for this exact snapshot and provider
   // context, otherwise the instant, free local summary. Nothing on this path
   // reaches a provider.
-  useEffect(() => {
-    if (!snapshot) return;
-    setDigest(digestCache.read(snapshot, query.timeframe, digestContextToken));
-  }, [snapshot, query.timeframe, digestContextToken]);
+  //
+  // This is derived during render rather than synced into state from an effect:
+  // the answer is a function of the snapshot, the timeframe and the settings
+  // token, and an effect would only add a second render that briefly showed the
+  // previous digest. `read` never runs the cache loader, so a mount, a section
+  // switch or a timeframe change still cannot spend a token (phase 10, FR-03.2).
+  const digestSource = snapshot
+    ? `${buildInsightDigestKey(snapshot, query.timeframe)}@${digestContextToken}`
+    : null;
+  const cachedDigest = useMemo(
+    () => (snapshot ? digestCache.read(snapshot, query.timeframe, digestContextToken) : null),
+    [snapshot, query.timeframe, digestContextToken],
+  );
+  // A generated, dismissed or offline answer only applies to the source it was
+  // produced for. If the figures or the provider context moved first, the cache
+  // read above is shown instead of a result about the old figures.
+  const digest = userDigest !== null && userDigest.source === digestSource ? userDigest.digest : cachedDigest;
 
   // Explicit user trigger for generating or retrying AI breakdown
   const requestAiDigest = useCallback(async () => {
-    if (!snapshot) return;
+    if (!snapshot || digestSource === null) return;
+    const source = digestSource;
     const localText = snapshot.insight.narrativeText ?? '';
     if (isOffline) {
-      setDigest({ status: 'unavailable', text: null, localText, generatedAt: null, errorCode: 'offline', retryable: true });
+      setUserDigest({ source, digest: { status: 'unavailable', text: null, localText, generatedAt: null, errorCode: 'offline', retryable: true } });
       return;
     }
 
-    setDigest(generatingInsightDigest(localText));
+    setUserDigest({ source, digest: generatingInsightDigest(localText) });
     try {
-      setDigest(await digestCache.generate(snapshot, query.timeframe, digestContextToken));
+      const generated = await digestCache.generate(snapshot, query.timeframe, digestContextToken);
+      setUserDigest({ source, digest: generated });
     } catch {
-      setDigest({ status: 'unavailable', text: null, localText, generatedAt: null, errorCode: 'provider', retryable: true });
+      setUserDigest({ source, digest: { status: 'unavailable', text: null, localText, generatedAt: null, errorCode: 'provider', retryable: true } });
     }
-  }, [snapshot, isOffline, query.timeframe, digestContextToken]);
+  }, [snapshot, digestSource, isOffline, query.timeframe, digestContextToken]);
 
   const setTimeframe = useCallback((timeframe: InsightTimeframe, customStart?: number, customEnd?: number) => {
     setQuery(
@@ -205,8 +227,9 @@ export function useInsights() {
   }, [load, query]);
 
   const dismissDigest = useCallback(() => {
-    setDigest(prev => (prev ? dismissInsightDigest(prev) : prev));
-  }, []);
+    if (!digest || digestSource === null) return;
+    setUserDigest({ source: digestSource, digest: dismissInsightDigest(digest) });
+  }, [digest, digestSource]);
 
   return {
     snapshot,
