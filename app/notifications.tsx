@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
   Modal,
@@ -9,7 +9,7 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ReanimatedSwipeable from 'react-native-gesture-handler/ReanimatedSwipeable';
 import { Stack, useFocusEffect, useRouter } from 'expo-router';
 import {
@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Trash2,
   TrendingUp,
+  Undo2,
 } from 'lucide-react-native';
 
 import { LuminousCard } from '../components/ui/LuminousCard';
@@ -53,10 +54,9 @@ const NOTIFICATION_FRESHNESS_DOMAINS = ['notifications'] as const;
 const BACK_SIZE = 40;
 const BACK_HIT_SLOP = { top: 2, bottom: 2, left: 2, right: 2 };
 const ICON_CHIP_SIZE = 44;
-const DELETE_SIZE = 32;
-const DELETE_HIT_SLOP = { top: 6, bottom: 6, left: 6, right: 6 };
-// Filter pills, Clear all and Mark read keep a compact 32pt visual and earn the
-// remaining 44pt target vertically through hitSlop (app-wide chip convention).
+// Filter pills, Clear all, Mark read and the undo action keep a compact 32pt
+// visual and earn the remaining 44pt target vertically through hitSlop (app-wide
+// chip convention).
 const PILL_HIT_SLOP = { top: 6, bottom: 6 };
 const UNREAD_DOT_SIZE = 12;
 // Loading placeholder count. Three rows mirror the common first viewport of the
@@ -65,6 +65,11 @@ const SKELETON_ROW_COUNT = 3;
 // Revealed swipe action width. Wide enough for the trash glyph plus the Delete
 // label and above the 44pt minimum target in both axes.
 const SWIPE_ACTION_WIDTH = 88;
+// Undo window for a swiped row. The row leaves the list immediately but the store
+// write is held for this window, so Undo restores the exact record rather than
+// writing a copy with a new id. When the window closes, or the screen unmounts,
+// the held delete is committed.
+const UNDO_WINDOW_MS = 5000;
 
 // A stored body can carry a formatted amount. When prices are hidden, any
 // whitespace token containing a digit is masked before it reaches the screen so
@@ -102,7 +107,7 @@ function destinationBadge(screen: NotificationDestination['screen']): string | n
   return null;
 }
 
-type PendingAction = { mode: 'clear' } | { mode: 'single'; id: string; title: string };
+type UndoPending = { record: NotificationRecord; index: number };
 
 // Loading placeholder. Mirrors the loaded row geometry (same list padding/gap and
 // the real rowCard/rowInner/iconChip styles) so content arrives with no shift.
@@ -148,10 +153,9 @@ interface NotificationRowProps {
   record: NotificationRecord;
   pricesVisible: boolean;
   onOpen: (record: NotificationRecord) => void;
-  onDelete: (record: NotificationRecord) => void;
 }
 
-function NotificationRow({ record, pricesVisible, onOpen, onDelete }: NotificationRowProps) {
+function NotificationRow({ record, pricesVisible, onOpen }: NotificationRowProps) {
   const ts = useThemeStyles();
   const visual = kindVisual(record.kind, ts);
   const Icon = visual.Icon;
@@ -235,27 +239,21 @@ function NotificationRow({ record, pricesVisible, onOpen, onDelete }: Notificati
           </View>
         </View>
       </LuminousCard>
-
-      <ScalePressable
-        onPress={() => onDelete(record)}
-        accessibilityRole="button"
-        accessibilityLabel={`Delete ${record.title}`}
-        hitSlop={DELETE_HIT_SLOP}
-        style={styles.deleteButton}
-      >
-        <Trash2 size={15} color={ts.raw.onSurfaceVariant} />
-      </ScalePressable>
     </ScalePressable>
   );
 }
 
-// Swipe-to-reveal Delete wrapper. NotificationRow stays untouched so the resting
-// row is unchanged; the swipeable only adds the revealed action behind it. The
-// action is the visible-button alternative to the inline trash and routes to the
-// same confirmation flow, never a direct delete. It stays hidden from assistive
-// tech until the row is swiped open so a closed row never exposes a phantom
-// second Delete control.
-function SwipeableNotificationRow(props: NotificationRowProps) {
+// Swipe-to-reveal Delete wrapper. The card face holds exactly one control: the row
+// itself. The revealed Delete is a visible-button alternative to the gesture and is
+// the only delete affordance on the row; it starts the undo window rather than
+// opening a blocking confirmation (audit Screen 5 lines 316 to 324). It stays
+// hidden from assistive tech until the row is swiped open, so a closed row never
+// exposes a phantom second Delete control.
+interface SwipeableNotificationRowProps extends NotificationRowProps {
+  onDelete: (record: NotificationRecord) => void;
+}
+
+function SwipeableNotificationRow(props: SwipeableNotificationRowProps) {
   const ts = useThemeStyles();
   const [swipeOpen, setSwipeOpen] = useState(false);
   const handleSwipeOpen = useCallback(() => setSwipeOpen(true), []);
@@ -294,7 +292,11 @@ function SwipeableNotificationRow(props: NotificationRowProps) {
         </View>
       )}
     >
-      <NotificationRow {...props} />
+      <NotificationRow
+        record={props.record}
+        pricesVisible={props.pricesVisible}
+        onOpen={props.onOpen}
+      />
     </ReanimatedSwipeable>
   );
 }
@@ -302,6 +304,7 @@ function SwipeableNotificationRow(props: NotificationRowProps) {
 export default function NotificationsScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
+  const insets = useSafeAreaInsets();
   const { showToast } = useToast();
   const { settings } = useSettings();
   const reduceMotion = useReduceMotion();
@@ -316,8 +319,14 @@ export default function NotificationsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [failed, setFailed] = useState(false);
   const [filter, setFilter] = useState<'all' | 'unread'>('all');
-  const [pending, setPending] = useState<PendingAction | null>(null);
-  const [deleting, setDeleting] = useState(false);
+  // Clear all is the only destructive action that still asks first, because it
+  // removes every row at once. A single row delete is swipe plus undo.
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [undo, setUndo] = useState<UndoPending | null>(null);
+  const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Mirrors `undo` for the unmount cleanup, which cannot read state.
+  const undoRef = useRef<UndoPending | null>(null);
 
   const unreadCount = useMemo(() => records.filter((record) => !record.read).length, [records]);
   const visible = useMemo(
@@ -331,6 +340,19 @@ export default function NotificationsScreen() {
   const { isStale, markFresh } = useDataFreshness(NOTIFICATION_FRESHNESS_DOMAINS);
 
   const load = useCallback(async () => {
+    // A held swipe delete has to land before a re-read, or the reloaded list would
+    // show a row the undo bar says is gone. The held row is committed here rather
+    // than restored, because a reload is a fresh read of the store.
+    const held = undoRef.current;
+    if (held) {
+      if (undoTimer.current) {
+        clearTimeout(undoTimer.current);
+        undoTimer.current = null;
+      }
+      undoRef.current = null;
+      setUndo(null);
+      void notificationDataService.delete(held.record.id).catch(() => undefined);
+    }
     try {
       const state = await notificationDataService.list();
       setRecords(state.status === 'ready' ? state.notifications : []);
@@ -433,41 +455,109 @@ export default function NotificationsScreen() {
 
   const requestClearAll = useCallback(() => {
     if (records.length === 0) return;
-    setPending({ mode: 'clear' });
+    setConfirmClear(true);
   }, [records.length]);
 
-  const requestDelete = useCallback((record: NotificationRecord) => {
-    setPending({ mode: 'single', id: record.id, title: record.title });
+  // Puts a held row back at the position it was removed from. Guarded against a
+  // duplicate id, so a retry or a double tap cannot insert the same record twice.
+  const restoreRecord = useCallback((entry: UndoPending) => {
+    setRecords((prev) => {
+      if (prev.some((record) => record.id === entry.record.id)) return prev;
+      const next = [...prev];
+      next.splice(Math.min(entry.index, next.length), 0, entry.record);
+      return next;
+    });
   }, []);
 
-  const cancelConfirm = useCallback(() => {
-    if (deleting) return;
-    setPending(null);
-  }, [deleting]);
-
-  const confirmPending = useCallback(async () => {
-    if (!pending) return;
-    setDeleting(true);
+  // The held write. A failure restores the row and says so, which is the only
+  // honest outcome: the row is still in the inbox.
+  const commitDelete = useCallback(async (entry: UndoPending) => {
     try {
-      if (pending.mode === 'clear') {
-        await notificationDataService.clearAll();
-        setRecords([]);
-        showToast('All notifications cleared', 'success');
-      } else {
-        await notificationDataService.delete(pending.id);
-        setRecords((prev) => prev.filter((record) => record.id !== pending.id));
-        showToast('Notification removed', 'success');
-      }
-      setPending(null);
+      await notificationDataService.delete(entry.record.id);
     } catch {
-      showToast('Could not remove notification. Please try again.', 'error');
-      setPending(null);
-    } finally {
-      setDeleting(false);
+      restoreRecord(entry);
+      showToast('Could not remove that notification. It is back in your inbox.', 'error');
     }
-  }, [pending, showToast]);
+  }, [restoreRecord, showToast]);
 
-  const isClear = pending?.mode === 'clear';
+  // Swipe delete. The row leaves the list at once and the store write is held for
+  // the undo window, so Undo restores the same row with the same id instead of
+  // re-inserting a copy. A second swipe commits the first pending delete before it
+  // starts its own window, so only one row is ever held.
+  const startDelete = useCallback((record: NotificationRecord) => {
+    const held = undoRef.current;
+    if (held) {
+      if (undoTimer.current) {
+        clearTimeout(undoTimer.current);
+        undoTimer.current = null;
+      }
+      void commitDelete(held);
+    }
+    const index = records.findIndex((item) => item.id === record.id);
+    const entry: UndoPending = { record, index: index < 0 ? 0 : index };
+    setRecords((prev) => prev.filter((item) => item.id !== record.id));
+    // Set the ref at the same time as the state so a second swipe in the same tick
+    // still sees the row that is currently held.
+    undoRef.current = entry;
+    setUndo(entry);
+    undoTimer.current = setTimeout(() => {
+      undoTimer.current = null;
+      setUndo(null);
+      void commitDelete(entry);
+    }, UNDO_WINDOW_MS);
+  }, [commitDelete, records]);
+
+  const undoDelete = useCallback(() => {
+    const entry = undoRef.current;
+    if (!entry) return;
+    if (undoTimer.current) {
+      clearTimeout(undoTimer.current);
+      undoTimer.current = null;
+    }
+    setUndo(null);
+    restoreRecord(entry);
+    showToast('Notification restored', 'success');
+  }, [restoreRecord, showToast]);
+
+  // Keep the ref in step with the state the renderer uses, and commit a held row
+  // when the screen goes away so a swipe is never silently discarded.
+  useEffect(() => {
+    undoRef.current = undo;
+  }, [undo]);
+
+  useEffect(() => () => {
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+    const held = undoRef.current;
+    if (held) void notificationDataService.delete(held.record.id).catch(() => undefined);
+  }, []);
+
+  const cancelClear = useCallback(() => {
+    if (clearing) return;
+    setConfirmClear(false);
+  }, [clearing]);
+
+  const confirmClearAll = useCallback(async () => {
+    setClearing(true);
+    // Clear all supersedes any held row, so the window closes with it.
+    if (undoTimer.current) {
+      clearTimeout(undoTimer.current);
+      undoTimer.current = null;
+    }
+    undoRef.current = null;
+    setUndo(null);
+    try {
+      await notificationDataService.clearAll();
+      setRecords([]);
+      showToast('All notifications cleared', 'success');
+      setConfirmClear(false);
+    } catch {
+      showToast('Could not clear notifications. Please try again.', 'error');
+      setConfirmClear(false);
+    } finally {
+      setClearing(false);
+    }
+  }, [showToast]);
+
   const unreadLabel = `${unreadCount} unread ${unreadCount === 1 ? 'update' : 'updates'}`;
   const selectedPillText = ts.isDark ? '#17162A' : '#FFFFFF';
 
@@ -595,7 +685,7 @@ export default function NotificationsScreen() {
                 record={item}
                 pricesVisible={pricesVisible}
                 onOpen={openRecord}
-                onDelete={requestDelete}
+                onDelete={startDelete}
               />
             )}
             contentContainerStyle={[styles.listContent, visible.length === 0 ? styles.listContentEmpty : null]}
@@ -617,23 +707,68 @@ export default function NotificationsScreen() {
                 >
                   <Bell size={32} color={ts.raw.primary} />
                 </View>
-                <Text style={[Typography.bodyBold, { color: ts.raw.onSurface }]}>All caught up</Text>
+                <Text style={[Typography.bodyBold, { color: ts.raw.onSurface }]}>Your inbox is clear</Text>
                 <Text style={[Typography.labelMd, styles.emptyCopy, { color: ts.raw.onSurfaceVariant }]}>
-                  No new notifications right now. New activity summaries, receipts, and recaps will
-                  appear here.
+                  New activity summaries, receipts, and recaps will appear here.
                 </Text>
+                {/* Real next action (task B1-5 bullet 4). Insights is a different
+                    destination from this inbox, so the empty state leads somewhere
+                    new instead of repeating the header back control. */}
+                <PeachButton
+                  title="View insights"
+                  variant="secondary"
+                  size="md"
+                  onPress={() => router.push('/(tabs)/analytics')}
+                  style={styles.emptyAction}
+                />
               </View>
             }
           />
         </View>
       )}
 
+      {/* Undo surface for a swiped row. It sits above the list rather than inside
+          it so the restored row never moves while the bar is visible, and it is
+          announced politely so a screen reader hears both the removal and the
+          recovery path. */}
+      {undo ? (
+        <View
+          pointerEvents="box-none"
+          style={[styles.undoLayer, { bottom: insets.bottom + Spacing.s4 }]}
+        >
+          <View
+            accessibilityLiveRegion="polite"
+            style={[
+              styles.undoBar,
+              {
+                backgroundColor: ts.bg.surfaceContainerHighest,
+                borderColor: ts.border.card,
+              },
+            ]}
+          >
+            <Text style={[Typography.labelMd, styles.undoText, { color: ts.raw.onSurface }]} numberOfLines={1}>
+              Notification deleted
+            </Text>
+            <ScalePressable
+              onPress={undoDelete}
+              accessibilityRole="button"
+              accessibilityLabel="Undo delete"
+              hitSlop={PILL_HIT_SLOP}
+              style={styles.undoAction}
+            >
+              <Undo2 size={16} color={ts.raw.primary} />
+              <Text style={[Typography.labelBold, { color: ts.raw.primary }]}>Undo</Text>
+            </ScalePressable>
+          </View>
+        </View>
+      ) : null}
+
       <Modal
-        visible={pending !== null}
+        visible={confirmClear}
         transparent
         animationType={reduceMotion ? 'none' : 'fade'}
         statusBarTranslucent
-        onRequestClose={cancelConfirm}
+        onRequestClose={cancelClear}
       >
         <View
           style={[
@@ -643,7 +778,7 @@ export default function NotificationsScreen() {
         >
           <Pressable
             style={StyleSheet.absoluteFill}
-            onPress={cancelConfirm}
+            onPress={cancelClear}
             accessibilityLabel="Dismiss confirmation"
           />
           <View
@@ -654,30 +789,28 @@ export default function NotificationsScreen() {
               <Trash2 size={22} color={ts.raw.danger} />
             </View>
             <Text style={[Typography.headlineMd, { color: ts.raw.onSurface }]}>
-              {isClear ? 'Clear all notifications?' : 'Delete notification?'}
+              Clear all notifications?
             </Text>
             <Text style={[Typography.labelMd, styles.modalCopy, { color: ts.raw.onSurfaceVariant }]}>
-              {isClear
-                ? `This will permanently remove all ${records.length} notifications from your inbox. Past transactions and budgets remain untouched.`
-                : `Remove "${pending?.mode === 'single' ? pending.title : ''}" from your updates list?`}
+              {`This will permanently remove all ${records.length} notifications from your inbox. Past transactions and budgets remain untouched.`}
             </Text>
             <View style={styles.modalActions}>
               <PeachButton
-                title={isClear ? 'Yes, clear notifications' : 'Delete notification'}
-                onPress={() => void confirmPending()}
+                title="Yes, clear notifications"
+                onPress={() => void confirmClearAll()}
                 variant="destructive"
                 size="lg"
                 fullWidth
-                isLoading={deleting}
-                disabled={deleting}
+                isLoading={clearing}
+                disabled={clearing}
               />
               <PeachButton
                 title="Cancel"
-                onPress={cancelConfirm}
+                onPress={cancelClear}
                 variant="neutral"
                 size="lg"
                 fullWidth
-                disabled={deleting}
+                disabled={clearing}
               />
             </View>
           </View>
@@ -831,7 +964,6 @@ const styles = StyleSheet.create({
   rowText: {
     flex: 1,
     minWidth: 0,
-    paddingRight: Spacing.s6,
   },
   titleRow: {
     flexDirection: 'row',
@@ -861,16 +993,6 @@ const styles = StyleSheet.create({
   badgeText: {
     fontFamily: 'Manrope_600SemiBold',
   },
-  deleteButton: {
-    position: 'absolute',
-    top: Spacing.s3,
-    right: Spacing.s3,
-    width: DELETE_SIZE,
-    height: DELETE_SIZE,
-    borderRadius: Radii.full,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   emptyWrap: {
     flex: 1,
     alignItems: 'center',
@@ -890,6 +1012,46 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: Spacing.s1,
     maxWidth: 260,
+  },
+  emptyAction: {
+    marginTop: Spacing.s5,
+  },
+  // Floating undo bar. Above the list, above the safe area inset, and never part of
+  // the list so the restored row cannot shift while it is visible. The layer is
+  // full width so the bar can centre and cap at the same content width as the list.
+  undoLayer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    paddingHorizontal: Spacing.s4,
+  },
+  undoBar: {
+    width: '100%',
+    maxWidth: MAX_CONTENT_WIDTH,
+    minHeight: 52,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    paddingHorizontal: Spacing.s4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  undoText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  undoAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s1,
+    minHeight: 44,
+    paddingHorizontal: Spacing.s2,
   },
   modalBackdrop: {
     flex: 1,

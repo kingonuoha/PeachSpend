@@ -78,6 +78,18 @@ function monthLabel(timestamp: number): string {
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'long' });
 }
 
+const DAY_MS = 86400000;
+
+// Counts calendar days from `from` to `to` inclusive. Built on UTC fields so a
+// daylight saving shift inside the range cannot turn 31 days into 30.
+function calendarDayCount(from: number, to: number): number {
+  const a = new Date(from);
+  const b = new Date(to);
+  const startOfFrom = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+  const startOfTo = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+  return Math.round((startOfTo - startOfFrom) / DAY_MS) + 1;
+}
+
 function initialsOf(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return '';
@@ -159,13 +171,39 @@ export default function HomeScreen() {
 
   const budget = useMemo(() => {
     const limit = parseStoredBudget(settings.monthly_budget);
-    if (limit <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
+    if (limit <= 0) return { state: 'none' as const, progress: 0, percent: 0, cap: 0 };
     const cap = convertAmount(limit, settings.budget_currency || currency).amount;
-    if (cap <= 0) return { state: 'none' as const, progress: 0, percent: 0 };
+    if (cap <= 0) return { state: 'none' as const, progress: 0, percent: 0, cap: 0 };
     const progress = spend / cap;
     const state = progress > 1 ? 'over' as const : progress >= 0.8 ? 'near' as const : 'on' as const;
-    return { state, progress, percent: Math.round(progress * 100) };
+    return { state, progress, percent: Math.round(progress * 100), cap };
   }, [settings.monthly_budget, settings.budget_currency, currency, convertAmount, spend]);
+
+  // Cycle pacing, derived only from the period the snapshot reports and the real
+  // remaining budget. `daysLeft` counts calendar days from the snapshot's own read
+  // time through the period end, so the figure can never disagree with the totals
+  // beside it and the render stays pure. With no cap the same block reports the
+  // daily average instead, which is why the two numbers are labelled differently:
+  // "safe to spend" is a limit, "average this month" describes what already happened.
+  const pace = useMemo(() => {
+    if (!snapshot) return null;
+    const { start, end } = snapshot.period;
+    const totalDays = calendarDayCount(start, end);
+    const elapsedDays = Math.min(Math.max(calendarDayCount(start, snapshot.refreshedAt), 1), totalDays);
+    const daysLeft = totalDays - elapsedDays + 1;
+    const averagePerDay = spend / elapsedDays;
+    const remaining = budget.cap - spend;
+    return {
+      daysLeft,
+      averagePerDay,
+      safePerDay: budget.state !== 'none' && remaining > 0 ? remaining / daysLeft : null,
+      overBudget: budget.state !== 'none' && remaining < 0 ? -remaining : 0,
+      // Linear projection of the current daily rate across the whole period. It is
+      // labelled as a trend, never as a prediction, and it is only offered while
+      // spending is at or past the near limit.
+      projectedOver: budget.state === 'on' ? 0 : averagePerDay * totalDays - budget.cap,
+    };
+  }, [snapshot, spend, budget.cap, budget.state]);
 
   const insight = snapshot?.comparativeInsight;
   const month = snapshot ? monthLabel(snapshot.period.start) : '';
@@ -180,6 +218,21 @@ export default function HomeScreen() {
   const categories = useMemo(() => (snapshot?.categories ?? []).slice(0, MAX_CATEGORIES), [snapshot]);
 
   const money = useCallback((value: number) => formatCurrency(value, currencyCode), [currencyCode]);
+
+  // The one pacing line under the track. Hidden amounts keep their mask so the
+  // line never leaks a figure the eye toggle is hiding, while the day count stays
+  // readable because a day count is not an amount.
+  const paceLine = useMemo(() => {
+    if (!pace) return '';
+    const dayLabel = `${pace.daysLeft} ${pace.daysLeft === 1 ? 'day' : 'days'} left`;
+    if (budget.state === 'none') {
+      return `${visible ? money(pace.averagePerDay) : MASK}/day average this month • ${dayLabel}`;
+    }
+    if (pace.safePerDay !== null) {
+      return `${visible ? money(pace.safePerDay) : MASK}/day safe to spend • ${dayLabel}`;
+    }
+    return `${visible ? money(pace.overBudget) : MASK} over budget • ${dayLabel}`;
+  }, [pace, budget.state, visible, money]);
 
   const toggleVisibility = useCallback(() => {
     const next = visible ? 'false' : 'true';
@@ -294,7 +347,23 @@ export default function HomeScreen() {
                   <Flame size={14} color="#FCD34D" />
                   <Text style={styles.streakText}>{streakDays}d</Text>
                 </ScalePressable>
-              ) : null}
+              ) : (
+                // Day 1 hook (audit Screen 2, "Invisible Streak Engine", line 124):
+                // a zero streak used to render nothing at all, which hid the habit
+                // mechanic from a brand new user. The badge is driven by the real
+                // snapshot streak and opens the same SH-02a surface the active
+                // streak pill opens, so it is one destination, not a second one.
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Day 1 ready, open your streak details"
+                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                  onPress={() => void openStreakSplash()}
+                  style={[styles.glassButton, styles.streakPill, styles.dayOnePill]}
+                >
+                  <Flame size={14} color="rgba(255,255,255,0.65)" />
+                  <Text style={styles.dayOneText}>Day 1</Text>
+                </ScalePressable>
+              )}
 
               <ScalePressable
                 accessibilityRole="button"
@@ -313,10 +382,10 @@ export default function HomeScreen() {
             </View>
           </View>
 
-          <View style={styles.outflowRow}>
-            <Text style={styles.outflowLabel}>TOTAL OUTFLOW ({month.toUpperCase()})</Text>
-            {budget.state !== 'none' ? <BudgetPill state={budget.state} percent={budget.percent} /> : null}
-          </View>
+          {/* Tier 2, core outflow: the label and the single headline figure, with
+              the pacing pill moved down into its own tier. Chunking authority:
+              audit Screen 2 line 131 to 136. */}
+          <Text style={styles.outflowLabel}>TOTAL OUTFLOW ({month.toUpperCase()})</Text>
 
           <View style={styles.amountRow}>
             <Text style={styles.amount} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.6}>
@@ -337,28 +406,46 @@ export default function HomeScreen() {
             </View>
           </View>
 
-          {budget.state !== 'none' ? (
-            <View style={styles.budgetTrack}>
-              {budget.state === 'on' ? (
-                <LinearGradient
-                  colors={[Colors.success, ts.raw.primary]}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 0 }}
-                  style={[styles.budgetFill, { width: `${Math.min(budget.progress, 1) * 100}%` }]}
+          {/* Tier 3, pacing: pill, track and the daily burn rate in one group, so
+              the reader compares the limit with its own pace rather than reading a
+              warning pill next to the total. */}
+          <View style={styles.pacingTier}>
+            {budget.state !== 'none' ? (
+              <>
+                <BudgetPill
+                  state={budget.state}
+                  percent={budget.percent}
+                  projection={visible && pace !== null && pace.projectedOver > 0 ? money(pace.projectedOver) : null}
                 />
-              ) : (
-                <View
-                  style={[
-                    styles.budgetFill,
-                    {
-                      width: `${Math.min(budget.progress, 1) * 100}%`,
-                      backgroundColor: budget.state === 'over' ? ts.raw.danger : ts.raw.warning,
-                    },
-                  ]}
-                />
-              )}
-            </View>
-          ) : null}
+                <View style={styles.budgetTrack}>
+                  {budget.state === 'on' ? (
+                    <LinearGradient
+                      colors={[Colors.success, ts.raw.primary]}
+                      start={{ x: 0, y: 0 }}
+                      end={{ x: 1, y: 0 }}
+                      style={[styles.budgetFill, { width: `${Math.min(budget.progress, 1) * 100}%` }]}
+                    />
+                  ) : (
+                    <View
+                      style={[
+                        styles.budgetFill,
+                        {
+                          width: `${Math.min(budget.progress, 1) * 100}%`,
+                          backgroundColor: budget.state === 'over' ? ts.raw.danger : ts.raw.warning,
+                        },
+                      ]}
+                    />
+                  )}
+                </View>
+              </>
+            ) : null}
+
+            {paceLine ? (
+              <Text style={styles.paceLine} accessibilityLabel={paceLine}>
+                {paceLine}
+              </Text>
+            ) : null}
+          </View>
 
           {/* F-03R-02: the insight is derived from real period totals, so it is
               hidden with the amounts to avoid leaking direction or percent. */}
@@ -408,7 +495,12 @@ export default function HomeScreen() {
               />
             </View>
 
-            <View style={styles.categoryRow}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ gap: Spacing.s2 }}
+              accessibilityLabel="Top categories this month"
+            >
               {categories.map(category => {
                 const info = load?.categories[category.category];
                 const tint = CategoryTints[category.category as keyof typeof CategoryTints] ?? CategoryTints.other;
@@ -427,7 +519,7 @@ export default function HomeScreen() {
                     <View style={[styles.categoryIcon, { backgroundColor: chip[0] }]}>
                       <CategoryGlyph iconName={info?.icon_name} size={18} color={chip[1]} />
                     </View>
-                    <Text style={[styles.categoryName, { color: ts.raw.onSurface }]} numberOfLines={1}>
+                    <Text style={[styles.categoryName, { color: ts.raw.onSurface }]} numberOfLines={2}>
                       {info?.title ?? category.category}
                     </Text>
                     <Text style={[styles.categoryAmount, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
@@ -436,7 +528,7 @@ export default function HomeScreen() {
                   </ScalePressable>
                 );
               })}
-            </View>
+            </ScrollView>
           </View>
         ) : null}
 
@@ -463,14 +555,33 @@ export default function HomeScreen() {
           </View>
 
           {recent.length === 0 ? (
-            <View style={[styles.empty, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }]}>
-              <View style={[styles.emptyIcon, { backgroundColor: ts.bg.primary10 }]}>
+            // First Step card (audit Screen 2, "Deflating Zero-State" line 113 and
+            // "Disconnected Call to Action" line 117). Replaces the dashed box whose
+            // only instruction was to go and find the tab bar. Both actions below
+            // are real navigations to existing routes.
+            <View style={[styles.firstStep, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }]}>
+              <View style={[styles.firstStepIcon, { backgroundColor: ts.bg.primary10 }]}>
                 <Leaf size={20} color={ts.raw.primary} />
               </View>
-              <Text style={[styles.emptyTitle, { color: ts.raw.onSurface }]}>No transactions recorded yet</Text>
-              <Text style={[styles.emptyBody, { color: ts.raw.onSurfaceVariant }]}>
-                Use the plus button to log your first expense, scan a receipt, or log income.
+              <Text style={[styles.firstStepTitle, { color: ts.raw.onSurface }]}>Your ledger is ready</Text>
+              <Text style={[styles.firstStepBody, { color: ts.raw.onSurfaceVariant }]}>
+                Record your first expense to start your insights.
               </Text>
+              <PeachButton
+                title="Log First Expense"
+                size="md"
+                fullWidth
+                onPress={() => router.push({ pathname: '/expense/manual', params: { origin: 'Home' } } as never)}
+                style={{ marginTop: Spacing.s4 }}
+              />
+              <PeachButton
+                title="Scan a receipt"
+                variant="quiet"
+                size="md"
+                fullWidth
+                onPress={() => router.push('/(tabs)/scan')}
+                style={{ marginTop: Spacing.s2 }}
+              />
             </View>
           ) : (
             <View style={styles.transactionList}>
@@ -590,6 +701,11 @@ function HomeSkeleton() {
             <Skeleton width={20} height={20} borderRadius={Radii.full} style={heroTint} />
             <Skeleton width={150} height={12} style={heroTint} />
           </View>
+          <View style={styles.pacingTier}>
+            <Skeleton width={112} height={16} borderRadius={Radii.full} style={heroTint} />
+            <Skeleton width="100%" height={6} borderRadius={Radii.full} style={[heroTint, { marginTop: Spacing.s2 }]} />
+            <Skeleton width={188} height={12} style={[heroTint, { marginTop: Spacing.s2 }]} />
+          </View>
         </LinearGradient>
 
         <View style={styles.section}>
@@ -600,7 +716,7 @@ function HomeSkeleton() {
             </View>
             <Skeleton width={64} height={24} borderRadius={Radii.full} />
           </View>
-          <View style={styles.categoryRow}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: Spacing.s2 }}>
             {Array.from({ length: SKELETON_CATEGORY_COUNT }).map((_, index) => (
               <View
                 key={index}
@@ -611,7 +727,7 @@ function HomeSkeleton() {
                 <Skeleton width="50%" height={10} style={styles.skeletonChipAmount} />
               </View>
             ))}
-          </View>
+          </ScrollView>
         </View>
 
         <View style={styles.section}>
@@ -645,13 +761,28 @@ function HomeSkeleton() {
   );
 }
 
-function BudgetPill({ state, percent }: { state: 'on' | 'near' | 'over'; percent: number }) {
-  const label = state === 'over' ? `Exceeded (+${Math.max(percent - 100, 1)}%)` : state === 'near' ? `Near Limit (${percent}%)` : 'On Pace';
+// Pacing pill. When the cycle is at or past the near limit and the projection is
+// computable, the pill states the projected overrun in real currency instead of a
+// bare percentage, which is the loss-aversion framing the audit asks for (Screen 2
+// line 155). With amounts hidden it falls back to the percentage so the mask is
+// never contradicted.
+function BudgetPill({
+  state,
+  percent,
+  projection,
+}: {
+  state: 'on' | 'near' | 'over';
+  percent: number;
+  projection: string | null;
+}) {
+  const label = projection
+    ? `Trending to exceed by ${projection}`
+    : state === 'over' ? `Exceeded (+${Math.max(percent - 100, 1)}%)` : state === 'near' ? `Near Limit (${percent}%)` : 'On Pace';
   const color = state === 'over' ? '#FCA5A5' : state === 'near' ? '#FCD34D' : '#DDD6FE';
   const background = state === 'over' ? 'rgba(244,63,94,0.25)' : state === 'near' ? 'rgba(245,158,11,0.25)' : 'rgba(255,255,255,0.15)';
   return (
     <View style={[styles.budgetPill, { backgroundColor: background }]}>
-      <Text style={[styles.budgetPillText, { color }]} numberOfLines={1}>
+      <Text style={[styles.budgetPillText, { color }]} numberOfLines={2}>
         {label}
       </Text>
     </View>
@@ -761,6 +892,10 @@ const styles = StyleSheet.create({
   },
   streakPill: { flexDirection: 'row', gap: Spacing.s1 },
   streakText: { ...Typography.micro, color: '#FCD34D', fontFamily: 'Manrope_700Bold' },
+  // Zero-streak badge. Outline only, so it reads as an invitation rather than an
+  // achievement, matching the audit's "subdued flame" framing.
+  dayOnePill: { borderWidth: 1, borderColor: 'rgba(255,255,255,0.35)', backgroundColor: 'transparent' },
+  dayOneText: { ...Typography.micro, color: 'rgba(255,255,255,0.85)', fontFamily: 'Manrope_600SemiBold' },
   bellBadge: {
     position: 'absolute',
     top: 2,
@@ -774,15 +909,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   bellBadgeText: { color: Colors.white, fontFamily: 'Manrope_700Bold', fontSize: 9, lineHeight: 12 },
-  outflowRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: Spacing.s2,
-  },
   outflowLabel: { ...Typography.labelMd, color: 'rgba(255,255,255,0.7)', flexShrink: 1 },
+  // Pacing tier: pill, track and burn rate grouped as one block, separated from
+  // the total above by the same 16pt rhythm the pair uses between hero blocks.
+  pacingTier: { marginTop: Spacing.s4, gap: Spacing.s2 },
+  paceLine: { ...Typography.micro, color: 'rgba(255,255,255,0.75)', fontFamily: 'Manrope_500Medium' },
   budgetPill: {
-    maxWidth: '55%',
+    alignSelf: 'flex-start',
+    maxWidth: '100%',
     paddingHorizontal: Spacing.s2,
     paddingVertical: 2,
     borderRadius: Radii.full,
@@ -860,14 +994,17 @@ const styles = StyleSheet.create({
   sectionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexShrink: 1, minWidth: 0 },
   sectionTitle: { ...Typography.labelBold },
   sectionMeta: { ...Typography.micro },
-  categoryRow: { flexDirection: 'row', gap: Spacing.s2 },
+  // Category chip, sized so a name is never hidden. 96pt wide by at least 64pt
+  // tall clears the audit's 88x64 floor (Screen 2 line 159) and gives a two line
+  // name room to finish; the row scrolls horizontally instead of compressing.
   categoryChip: {
-    flex: 1,
-    minWidth: 0,
+    width: 96,
+    minHeight: 64,
     padding: Spacing.s2,
     borderRadius: Radii.md,
     borderWidth: 1,
     alignItems: 'center',
+    justifyContent: 'center',
   },
   categoryIcon: {
     width: 44,
@@ -908,14 +1045,15 @@ const styles = StyleSheet.create({
   ocrBadgeText: { ...Typography.micro, fontFamily: 'Manrope_700Bold', fontSize: 10, lineHeight: 12 },
   transactionMeta: { ...Typography.micro },
   transactionAmount: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold', flexShrink: 0 },
-  empty: {
+  // First Step card. Replaces the dashed zero state; a solid card with a real
+  // primary action, per audit Screen 2 lines 143 to 148.
+  firstStep: {
     padding: Spacing.s5,
     borderRadius: Radii.md,
     borderWidth: 1,
-    borderStyle: 'dashed',
     alignItems: 'center',
   },
-  emptyIcon: {
+  firstStepIcon: {
     width: 48,
     height: 48,
     borderRadius: Radii.full,
@@ -923,8 +1061,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: Spacing.s2,
   },
-  emptyTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold' },
-  emptyBody: { ...Typography.micro, textAlign: 'center', marginTop: Spacing.s1, maxWidth: 240 },
+  firstStepTitle: { ...Typography.labelMd, fontFamily: 'Manrope_700Bold' },
+  firstStepBody: { ...Typography.micro, textAlign: 'center', marginTop: Spacing.s1, maxWidth: 240 },
   // TEMPORARY H6 dev-only control. Subdued, separated from canonical sections.
   devResetSection: {
     marginTop: Spacing.s8,

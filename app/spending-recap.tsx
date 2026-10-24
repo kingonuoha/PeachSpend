@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AccessibilityInfo,
   Platform,
@@ -11,7 +11,8 @@ import {
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
-import { BarChart3, Check, Sparkles, Star, X } from 'lucide-react-native';
+import * as Haptics from 'expo-haptics';
+import { ArrowDown, ArrowUp, BarChart3, Check, Minus, Sparkles, Star, X } from 'lucide-react-native';
 
 import { CategoryTints, Colors, Gradients, Radii, Spacing, Typography } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
@@ -25,6 +26,7 @@ import { useSpendingRecap } from '../hooks/useSpendingRecap';
 import type {
   SpendingRecapAffirmation,
   SpendingRecapCadence,
+  SpendingRecapDirection,
   SpendingRecapHighlight,
   SpendingRecapSeriesPoint,
 } from '../data/RecapContracts';
@@ -96,10 +98,10 @@ function deltaLabel(
   pricesVisible: boolean,
 ): string {
   const amount = pricesVisible ? formatCurrency(Math.abs(highlight.changeAmount), currency) : MASK;
-  if (highlight.direction === 'down') return `${amount} lower`;
-  if (highlight.direction === 'up') return `${amount} higher`;
-  if (highlight.direction === 'unchanged') return 'Level with last period';
-  return 'First period tracked';
+  if (highlight.direction === 'down') return `${amount} lower than the prior period`;
+  if (highlight.direction === 'up') return `${amount} higher than the prior period`;
+  if (highlight.direction === 'unchanged') return 'Level with the prior period';
+  return 'No earlier period to compare with yet';
 }
 
 function affirmationCopy(affirmation: SpendingRecapAffirmation): { headline: string; message: string } {
@@ -121,56 +123,144 @@ function affirmationCopy(affirmation: SpendingRecapAffirmation): { headline: str
   };
 }
 
+// Direction cue for the period comparison. The icon is a second channel beside the
+// colour and the sentence, so a reader with a colour vision difference still gets
+// the direction. No icon for `no_previous_data`, because there is no direction.
+function DeltaCue({
+  direction,
+  theme,
+}: {
+  direction: SpendingRecapDirection;
+  theme: ReturnType<typeof useThemeStyles>;
+}) {
+  if (direction === 'down') return <ArrowDown size={12} color={theme.raw.statusSuccessText} strokeWidth={2.4} />;
+  if (direction === 'up') return <ArrowUp size={12} color={theme.raw.warningContainerText} strokeWidth={2.4} />;
+  if (direction === 'unchanged') return <Minus size={12} color={theme.raw.onSurfaceVariant} strokeWidth={2.4} />;
+  return null;
+}
+
 // Capped per-period micro chart (HTML 294-325). Bars come only from the contract
 // series; a zero bucket draws no bar rather than a fake stub, and the single
 // `isPeak` bucket gets the brand fill and a bold label.
+//
+// Each column is a real 44pt wide selection target. Seven of them are 308pt, which
+// does not fit the 240pt of usable card width at a 320pt viewport, so the row
+// scrolls instead of shrinking the targets below the 44pt floor. Selecting a
+// column shows that bucket's exact total in the caption below the chart; the
+// series carries a label, a value and a peak flag only, so there is no merchant to
+// show and none is invented.
 const BAR_MAX_HEIGHT = 88;
 const BAR_MIN_HEIGHT = 4;
+const BAR_TOUCH_TARGET = 44;
 
 function RecapSeriesChart({
   series,
   accessibilityLabel,
+  currency,
+  pricesVisible,
+  selectedIndex,
+  onSelect,
 }: {
   series: SpendingRecapSeriesPoint[];
   accessibilityLabel: string;
+  currency: string;
+  pricesVisible: boolean;
+  selectedIndex: number | null;
+  onSelect: (index: number) => void;
 }) {
   const ts = useThemeStyles();
   const maxValue = Math.max(...series.map(point => point.value), 0);
   return (
-    <View
-      accessible
-      accessibilityRole="image"
-      accessibilityLabel={accessibilityLabel}
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
       style={[styles.chartArea, { borderBottomColor: ts.raw.outline }]}
+      contentContainerStyle={styles.chartContent}
+      accessibilityLabel={accessibilityLabel}
     >
-      {series.map(point => {
+      {series.map((point, index) => {
         const height = point.value > 0 && maxValue > 0
           ? Math.max(BAR_MIN_HEIGHT, Math.round((point.value / maxValue) * BAR_MAX_HEIGHT))
           : 0;
+        const selected = selectedIndex === index;
         return (
-          <View key={point.label} style={styles.chartColumn}>
+          <ScalePressable
+            key={point.label}
+            haptic={false}
+            accessibilityRole="button"
+            accessibilityState={{ selected }}
+            accessibilityLabel={`${point.label}, ${pricesVisible ? formatCurrency(point.value, currency) : 'amount hidden'}`}
+            accessibilityHint="Shows this bucket's exact total below the chart"
+            onPress={() => onSelect(index)}
+            style={styles.chartColumn}
+          >
             <View
               style={[
                 styles.chartBar,
                 {
                   height,
                   backgroundColor: point.isPeak ? ts.raw.primary : ts.raw.purple100,
+                  // Selection is carried by a border as well as the fill, so it is
+                  // never a colour-only state.
+                  borderWidth: selected ? 2 : 0,
+                  borderColor: ts.raw.onSurface,
                 },
               ]}
             />
             <Text
               style={[
                 Typography.micro,
-                point.isPeak ? styles.chartLabelPeak : null,
-                { color: point.isPeak ? ts.raw.primary : ts.raw.onSurfaceVariant },
+                point.isPeak || selected ? styles.chartLabelPeak : null,
+                { color: selected || point.isPeak ? ts.raw.primary : ts.raw.onSurfaceVariant },
               ]}
               numberOfLines={1}
             >
               {point.label}
             </Text>
-          </View>
+          </ScalePressable>
         );
       })}
+    </ScrollView>
+  );
+}
+
+// Dismiss control pinned to the bottom of the screen. The canonical pair puts the
+// only bottom dismiss at the very end of a long scroll, which the audit (Screen 3,
+// "Ergonomic Dismiss Bottleneck", line 192) calls out. This footer is a sibling of
+// the ScrollView rather than a child, so it stays reachable at every scroll
+// position while the header close control above keeps canonical parity.
+function RecapDismissFooter({
+  originLabel,
+  onDismiss,
+  theme,
+  insets,
+}: {
+  originLabel: string;
+  onDismiss: () => void;
+  theme: ReturnType<typeof useThemeStyles>;
+  insets: { bottom: number };
+}) {
+  return (
+    <View
+      style={[
+        styles.footer,
+        {
+          backgroundColor: theme.bg.screen,
+          borderTopColor: theme.raw.outline,
+          paddingBottom: insets.bottom + Spacing.s2,
+        },
+      ]}
+    >
+      <PeachButton
+        title={`Got it, return to ${originLabel}`}
+        variant="outline"
+        size="xl"
+        fullWidth
+        onPress={onDismiss}
+        labelColor={theme.raw.primary}
+        trailingIcon={<Check size={16} color={theme.raw.primary} strokeWidth={2.2} />}
+        adjustsLabelFontSize
+      />
     </View>
   );
 }
@@ -178,12 +268,12 @@ function RecapSeriesChart({
 // Loading body (POLISH Section 6: no bare spinner where a skeleton fits, and
 // Section 10 lists this screen's ActivityIndicator as a gap). It mirrors only
 // the sections that render on every ready load: the hero narrative card, the
-// affirming gradient block and the dismiss row, sharing the loaded screen's
-// `scrollContent` wrap so the placeholder cannot drift from the layout it
+// affirming gradient block and the pinned dismiss footer, sharing the loaded
+// screen's `scrollContent` wrap so the placeholder cannot drift from the layout it
 // replaces. The category and chart cards are conditional on the snapshot (they
 // hide when the period has no category or fewer than two populated buckets), so
-// reserving space for them would shift content the other way on those loads;
-// that matches the accepted Home skeleton convention in POLISH Section 13.
+// reserving space for them would shift content the other way on those loads; that
+// matches the accepted Home skeleton convention in POLISH Section 13.
 // Every block height is the token line height of the real content it stands in
 // for, and decorative blocks stay hidden from assistive tech while the container
 // exposes one busy label, matching the Home/Profile skeleton convention.
@@ -249,13 +339,21 @@ function RecapSkeleton() {
             </View>
           </View>
         </LinearGradient>
-
-        {/* Single immediate dismiss */}
-        <View style={styles.dismissWrap}>
-          <Skeleton width="100%" height={52} borderRadius={Radii.full} />
-          <Skeleton width="62%" height={13} style={{ marginTop: Spacing.s2, alignSelf: 'center' }} />
-        </View>
       </ScrollView>
+
+      {/* Pinned dismiss footer placeholder, same geometry as the real footer. */}
+      <View
+        style={[
+          styles.footer,
+          {
+            backgroundColor: ts.bg.screen,
+            borderTopColor: ts.raw.outline,
+            paddingBottom: insets.bottom + Spacing.s2,
+          },
+        ]}
+      >
+        <Skeleton width="100%" height={52} borderRadius={Radii.full} />
+      </View>
     </View>
   );
 }
@@ -270,6 +368,15 @@ export default function SpendingRecapScreen() {
   const origin = parseOrigin(params.origin);
   const cadence = parseCadence(params.cadence);
   const originInfo = ORIGINS[origin];
+
+  // Selection haptics follow the app's existing selection convention (the
+  // onboarding dots and currency pills both call selectionAsync), so a bucket pick
+  // feels like a pick rather than a button press.
+  const [selectedBar, setSelectedBar] = useState<number | null>(null);
+  const selectBar = useCallback((index: number) => {
+    void Haptics.selectionAsync();
+    setSelectedBar(current => (current === index ? null : index));
+  }, []);
 
   const { read, categoryMeta, loading, refreshing, retry } = useSpendingRecap(cadence);
 
@@ -311,6 +418,12 @@ export default function SpendingRecapScreen() {
 
     const spentText = pricesVisible ? formatCurrency(snapshot.totalSpent, currency) : MASK;
     const earnedText = pricesVisible ? formatCurrency(snapshot.totalEarned, currency) : MASK;
+    const hasPriorPeriod = snapshot.comparativeHighlight.direction !== 'no_previous_data';
+    const priorText = hasPriorPeriod
+      ? pricesVisible
+        ? formatCurrency(snapshot.comparativeHighlight.previousTotal, currency)
+        : MASK
+      : 'Not tracked';
     const categoryAmount = category
       ? pricesVisible
         ? formatCurrency(category.total, currency)
@@ -330,6 +443,9 @@ export default function SpendingRecapScreen() {
       chartAccessibilityLabel,
       spentText,
       earnedText,
+      priorText,
+      hasPriorPeriod,
+      direction: snapshot.comparativeHighlight.direction,
       categoryAmount,
       categoryTransactions: category
         ? `${category.transactionCount} ${category.transactionCount === 1 ? 'transaction' : 'transactions'}`
@@ -343,12 +459,16 @@ export default function SpendingRecapScreen() {
     };
   }, [snapshot, categoryMeta, cadence, currency, pricesVisible, ts.isDark]);
 
+  // A spending increase is a caution, not a brand accent (audit Screen 3 line 191:
+  // the up direction used the primary purple, which reads as a reward). The warning
+  // container text token is the designed text-on-warning tone in both modes, so the
+  // sentence keeps its contrast; the icon and the word carry the meaning too.
   const deltaColor = useMemo(() => {
     const direction = snapshot?.comparativeHighlight.direction;
     if (direction === 'down') return ts.raw.statusSuccessText;
-    if (direction === 'up') return ts.raw.primary;
+    if (direction === 'up') return ts.raw.warningContainerText;
     return ts.raw.onSurfaceVariant;
-  }, [snapshot, ts.raw.statusSuccessText, ts.raw.primary, ts.raw.onSurfaceVariant]);
+  }, [snapshot, ts.raw.statusSuccessText, ts.raw.warningContainerText, ts.raw.onSurfaceVariant]);
 
   // POLISH Section 7: the recap read is async, so a resolved offline or failure
   // state is spoken, not only rendered. iOS has no live region, so it speaks
@@ -368,6 +488,15 @@ export default function SpendingRecapScreen() {
   }, [readState, refreshing]);
 
   const periodLabel = view?.periodLabel ?? null;
+  const selectedPoint = view && selectedBar !== null ? view.series[selectedBar] ?? null : null;
+  // Selection shows the bucket's exact total. With nothing selected the caption
+  // keeps the canonical peak line and names the interaction, so the bars are
+  // discoverable as controls rather than only as artwork.
+  const chartCaption = selectedPoint
+    ? `${selectedPoint.label}: ${pricesVisible ? formatCurrency(selectedPoint.value, currency) : MASK}`
+    : view?.peakCaption
+      ? `${view.peakCaption} • Tap a bar for its total`
+      : '';
 
   const header = (
     <View
@@ -504,10 +633,14 @@ export default function SpendingRecapScreen() {
             {view.contextText}
           </Text>
 
+          {/* Period-over-period comparison, side by side (task B1-3 bullet 1).
+              Both figures are real contract totals in real currency. When the
+              contract says there is no earlier period, the cell states that instead
+              of rendering a zero the user would read as a real comparison. */}
           <View style={[styles.kpiRow, { borderTopColor: ts.raw.outline }]}>
             <View style={[styles.kpiPill, { backgroundColor: ts.bg.low }]}>
               <Text style={[Typography.micro, styles.uppercase, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
-                Total Outflow
+                This period
               </Text>
               <Text
                 style={[Typography.labelBold, styles.kpiValue, { color: ts.raw.onSurface }]}
@@ -517,26 +650,50 @@ export default function SpendingRecapScreen() {
               >
                 {view.spentText}
               </Text>
-              <Text style={[Typography.micro, { color: deltaColor }]} numberOfLines={1}>
-                {view.deltaText}
-              </Text>
             </View>
             <View style={[styles.kpiPill, { backgroundColor: ts.bg.low }]}>
               <Text style={[Typography.micro, styles.uppercase, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
-                Total Inflow
+                Prior period
               </Text>
               <Text
-                style={[Typography.labelBold, styles.kpiValue, { color: ts.raw.onSurface }]}
+                style={[
+                  view.hasPriorPeriod ? Typography.labelBold : Typography.micro,
+                  styles.kpiValue,
+                  { color: view.hasPriorPeriod ? ts.raw.onSurface : ts.raw.onSurfaceVariant },
+                ]}
                 numberOfLines={1}
                 adjustsFontSizeToFit
                 minimumFontScale={0.7}
               >
-                {view.earnedText}
-              </Text>
-              <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
-                {view.inflowSub}
+                {view.priorText}
               </Text>
             </View>
+          </View>
+
+          {/* The difference, with an icon and a word so the direction is never
+              carried by colour alone (audit Screen 3 line 191, and Rule 37). */}
+          <View style={styles.deltaRow}>
+            <DeltaCue direction={view.direction} theme={ts} />
+            <Text style={[Typography.micro, styles.deltaText, { color: deltaColor }]} numberOfLines={2}>
+              {view.deltaText}
+            </Text>
+          </View>
+
+          <View style={[styles.kpiPill, styles.inflowPill, { backgroundColor: ts.bg.low }]}>
+            <Text style={[Typography.micro, styles.uppercase, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+              Total Inflow
+            </Text>
+            <Text
+              style={[Typography.labelBold, styles.kpiValue, { color: ts.raw.onSurface }]}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.7}
+            >
+              {view.earnedText}
+            </Text>
+            <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+              {view.inflowSub}
+            </Text>
           </View>
 
           {normalizationNote ? (
@@ -607,10 +764,17 @@ export default function SpendingRecapScreen() {
                 Capped Recap View
               </Text>
             </View>
-            <RecapSeriesChart series={view.series} accessibilityLabel={view.chartAccessibilityLabel} />
-            {view.peakCaption ? (
-              <Text style={[Typography.micro, styles.chartCaption, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
-                {view.peakCaption}
+            <RecapSeriesChart
+              series={view.series}
+              accessibilityLabel={view.chartAccessibilityLabel}
+              currency={currency}
+              pricesVisible={pricesVisible}
+              selectedIndex={selectedBar}
+              onSelect={selectBar}
+            />
+            {chartCaption ? (
+              <Text style={[Typography.micro, styles.chartCaption, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
+                {chartCaption}
               </Text>
             ) : null}
           </LuminousCard>
@@ -641,23 +805,15 @@ export default function SpendingRecapScreen() {
           </View>
         </LinearGradient>
 
-        {/* 5. Single immediate dismiss (FR-23.5) */}
-        <View style={styles.dismissWrap}>
-          <PeachButton
-            title={`Got it, return to ${originInfo.label}`}
-            variant="outline"
-            size="xl"
-            fullWidth
-            onPress={dismiss}
-            labelColor={ts.raw.primary}
-            trailingIcon={<Check size={16} color={ts.raw.primary} strokeWidth={2.2} />}
-            adjustsLabelFontSize
-          />
-          <Text style={[Typography.micro, styles.dismissHint, { color: ts.raw.onSurfaceVariant }]}>
-            Dismiss returns directly to the previous screen without saving state changes.
-          </Text>
-        </View>
+        {/* 5. Dismiss moved out of the scroll: see the pinned footer below. */}
       </ScrollView>
+
+      <RecapDismissFooter
+        originLabel={originInfo.label}
+        onDismiss={dismiss}
+        theme={ts}
+        insets={insets}
+      />
     </View>
   );
 }
@@ -838,20 +994,25 @@ const styles = StyleSheet.create({
     gap: Spacing.s2,
   },
   chartArea: {
+    height: 124,
+    borderBottomWidth: 1,
+  },
+  chartContent: {
     flexDirection: 'row',
     alignItems: 'flex-end',
     justifyContent: 'space-between',
-    gap: Spacing.s2,
-    height: 112,
-    paddingTop: Spacing.s2,
+    gap: Spacing.s1,
+    minWidth: '100%',
     paddingHorizontal: Spacing.s1,
-    borderBottomWidth: 1,
   },
+  // 44pt wide selection target per bucket. Seven of them are 308pt, which is why
+  // the chart scrolls horizontally on a narrow viewport instead of shrinking the
+  // target below the floor.
   chartColumn: {
-    flex: 1,
-    minWidth: 0,
+    width: BAR_TOUCH_TARGET,
     alignItems: 'center',
     justifyContent: 'flex-end',
+    paddingTop: Spacing.s2,
   },
   chartBar: {
     width: '100%',
@@ -909,11 +1070,23 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.85)',
     marginTop: Spacing.s1,
   },
-  dismissWrap: {
-    marginTop: Spacing.s1,
-  },
-  dismissHint: {
+  deltaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s1,
     marginTop: Spacing.s2,
-    textAlign: 'center',
+  },
+  deltaText: {
+    flexShrink: 1,
+  },
+  // Total Inflow keeps the canonical pill anatomy but sits on its own row, because
+  // the two-cell comparison above now owns the pair slot.
+  inflowPill: {
+    marginTop: Spacing.s3,
+  },
+  footer: {
+    borderTopWidth: 1,
+    paddingTop: Spacing.s2,
+    paddingHorizontal: Spacing.s5,
   },
 });

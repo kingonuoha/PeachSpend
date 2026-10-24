@@ -3,7 +3,7 @@ import { AccessibilityInfo, AppState, Platform, Pressable, ScrollView, Text, Tex
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { ChevronLeft, ChevronRight, Eye, RotateCcw, ShieldCheck } from 'lucide-react-native';
+import { ChevronLeft, ChevronRight, Eye, RotateCcw, ShieldCheck, User } from 'lucide-react-native';
 import { OnboardingSlide, onboardingIllustrationSize } from '../../components/onboarding/OnboardingSlide';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
@@ -15,7 +15,7 @@ import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Radii, Spacing, Typography } from '../../constants/tokens';
 import { createNativeAutoCaptureAdapter } from '../../data/NativeAutoCaptureAdapter';
 import type { AutoCapturePermission } from '../../data/contracts';
-import { getCurrencyPrefix, getCurrencyName } from '../../utils/currency';
+import { getCurrencyPrefix, getCurrencyName, formatCurrency } from '../../utils/currency';
 
 // Canonical S-01 setup currencies, first four shown as pills. Names and symbols
 // come from the shared currency utility so no screen hardcodes a symbol.
@@ -47,12 +47,20 @@ const GUTTER_RATIO = 0.0615;
 // nothing it cannot keep: the write is transactional, so a failure saves nothing.
 const SAVE_FAILURE_MESSAGE = 'Could not save your setup on this device. Nothing was saved. Try again.';
 
-// The locked indicator dots are 8pt wide on a 16pt pitch inside a 10pt row, so the
-// dot geometry, not the slop, limits the target: 4pt a side is the widest area that
-// never reaches the next dot, which is what stops a tap on one dot resolving to its
-// neighbour, and the row's own 10pt height caps the vertical. Both the 48dp floor
-// shortfall that remains and the row height that causes it are escalated.
-const DOT_HIT_SLOP = Spacing.s1;
+// Audit batch 1 (Screen 1, "Touch Target Expansion", line 89 of
+// docs/ux-audit/batch-1-onboarding-dashboard.md) requires an interactive hit
+// container of at least 44 by 44 points around each pagination dot while the
+// drawn dot stays small. Each dot now sits in its own 44pt cell, so the target is
+// earned by layout instead of by hitSlop: adjacent slops on a 16pt pitch would
+// overlap and a tap in the overlap would resolve to whichever sibling React
+// Native paints last. The drawn artwork below is untouched (8pt, 26pt active).
+const DOT_TOUCH_TARGET = 44;
+
+// Starter budget anchors from the same audit fix (line 76: "$1,000, $2,500,
+// $5,000, Custom"). They are amounts offered to the user, not a reading of the
+// ledger, and every one of them is rendered through the shared formatter for the
+// currency currently selected, so no symbol or grouped figure is written here.
+const BUDGET_PRESET_AMOUNTS = [1000, 2500, 5000] as const;
 
 export default function OnboardingScreen() {
   const router = useRouter();
@@ -69,6 +77,10 @@ export default function OnboardingScreen() {
   // the app-wide fallback currency which may differ for an install.
   const currency = currencyOverride ?? 'USD';
   const [budget, setBudget] = useState('');
+  // Which budget affordance is live. A preset writes its own formatted amount;
+  // Custom reveals the free numeric input. Held beside `budget` so the chip's
+  // selected state and the input's visibility cannot disagree.
+  const [customBudget, setCustomBudget] = useState(false);
   const [permission, setPermission] = useState<AutoCapturePermission>('unsupported');
   const [canRequestPermission, setCanRequestPermission] = useState(false);
   // The setup write is the screen's only async commit, so it is the only state
@@ -183,18 +195,11 @@ export default function OnboardingScreen() {
           <View style={{ minWidth: 64, minHeight: 48 }} />
         )}
 
-        {index <= 2 ? (
-          <ScalePressable
-            accessibilityRole="button"
-            accessibilityLabel="Skip onboarding"
-            onPress={skip}
-            style={{ minHeight: 48, justifyContent: 'center', paddingHorizontal: Spacing.s2 }}
-          >
-            <Text style={{ color: theme.text.onSurfaceVariant, ...Typography.labelLg }}>Skip</Text>
-          </ScalePressable>
-        ) : (
-          <View style={{ minWidth: 64, minHeight: 48 }} />
-        )}
+        {/* Skip lives in the footer now: the audit (Screen 1, "Mobile Touch and
+            Ergonomics Flaws", line 68) places it outside the one-handed thumb zone
+            in the header. Its header slot is kept as a spacer so Back does not move
+            between steps. */}
+        <View style={{ minWidth: 64, minHeight: 48 }} />
       </View>
 
       <ScrollView
@@ -231,6 +236,10 @@ export default function OnboardingScreen() {
                 setCurrency={setCurrencyOverride}
                 budget={budget}
                 setBudget={setBudget}
+                customBudget={customBudget}
+                setCustomBudget={setCustomBudget}
+                completedSteps={index}
+                totalSteps={totalDots}
                 theme={theme}
               />
             );
@@ -252,9 +261,7 @@ export default function OnboardingScreen() {
       </ScrollView>
 
       <View style={{ paddingHorizontal: gutter, paddingBottom: Spacing.s4 }}>
-        <View
-          style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: Spacing.s2, height: 10, marginBottom: Spacing.s4 }}
-        >
+        <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }}>
           {slideIds.map((slideId, dotIndex) => (
             <Pressable
               key={slideId}
@@ -262,14 +269,17 @@ export default function OnboardingScreen() {
               accessibilityLabel={`Go to onboarding step ${dotIndex + 1} of ${totalDots}`}
               accessibilityState={{ selected: dotIndex === index }}
               onPress={() => { void Haptics.selectionAsync(); goTo(dotIndex); }}
-              hitSlop={DOT_HIT_SLOP}
-              style={{
-                width: dotIndex === index ? 26 : 8,
-                height: 8,
-                borderRadius: Radii.full,
-                backgroundColor: dotIndex === index ? theme.raw.primary : theme.text.onSurfaceVariant30,
-              }}
-            />
+              style={{ width: DOT_TOUCH_TARGET, height: DOT_TOUCH_TARGET, alignItems: 'center', justifyContent: 'center' }}
+            >
+              <View
+                style={{
+                  width: dotIndex === index ? 26 : 8,
+                  height: 8,
+                  borderRadius: Radii.full,
+                  backgroundColor: dotIndex === index ? theme.raw.primary : theme.text.onSurfaceVariant30,
+                }}
+              />
+            </Pressable>
           ))}
         </View>
 
@@ -282,6 +292,23 @@ export default function OnboardingScreen() {
             onPress={() => (index < totalDots - 1 ? goTo(index + 1) : complete())}
             trailingIcon={<ChevronRight color={theme.text.white} size={18} />}
           />
+        )}
+
+        {/* Lower skip affordance. The canonical pair puts Skip in the header only,
+            which a one-handed thumb cannot reach (audit line 68). Moving the single
+            control here keeps one implementation and one meaning instead of adding a
+            second Skip beside the header one. It stays text-only and quiet so it can
+            never be mistaken for the primary action, and it is absent from the setup
+            and auto-capture steps exactly as the pair hides it from slide 4 onward. */}
+        {index < VALUE_SLIDES.length && (
+          <ScalePressable
+            accessibilityRole="button"
+            accessibilityLabel="Skip setup and use the default preferences"
+            onPress={skip}
+            style={{ minHeight: 44, alignItems: 'center', justifyContent: 'center', marginTop: Spacing.s1 }}
+          >
+            <Text style={{ color: theme.text.onSurfaceVariant, ...Typography.labelLg }}>Skip</Text>
+          </ScalePressable>
         )}
       </View>
 
@@ -336,15 +363,20 @@ function SetupSkeleton() {
         </View>
 
         <View style={{ paddingHorizontal: gutter, paddingBottom: Spacing.s4 }}>
-          <View
-            style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: Spacing.s2, height: 10, marginBottom: Spacing.s4 }}
-          >
-            <Skeleton width={26} height={8} borderRadius={Radii.full} />
+          <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center' }}>
+            <View style={{ width: DOT_TOUCH_TARGET, height: DOT_TOUCH_TARGET, alignItems: 'center', justifyContent: 'center' }}>
+              <Skeleton width={26} height={8} borderRadius={Radii.full} />
+            </View>
             {Array.from({ length: 4 }).map((_, dotIndex) => (
-              <Skeleton key={dotIndex} width={8} height={8} borderRadius={Radii.full} />
+              <View key={dotIndex} style={{ width: DOT_TOUCH_TARGET, height: DOT_TOUCH_TARGET, alignItems: 'center', justifyContent: 'center' }}>
+                <Skeleton width={8} height={8} borderRadius={Radii.full} />
+              </View>
             ))}
           </View>
           <Skeleton width="100%" height={52} borderRadius={Radii.full} />
+          <View style={{ height: 44, marginTop: Spacing.s1, alignItems: 'center', justifyContent: 'center' }}>
+            <Skeleton width={48} height={Typography.labelLg.lineHeight} />
+          </View>
         </View>
       </View>
     </SafeAreaView>
@@ -360,21 +392,42 @@ interface SetupSlideProps {
   setCurrency: (value: string) => void;
   budget: string;
   setBudget: (value: string) => void;
+  customBudget: boolean;
+  setCustomBudget: (value: boolean) => void;
+  completedSteps: number;
+  totalSteps: number;
   theme: Theme;
 }
 
-function SetupSlide({ width, gutter, name, setName, currency, setCurrency, budget, setBudget, theme }: SetupSlideProps) {
+function SetupSlide({
+  width,
+  gutter,
+  name,
+  setName,
+  currency,
+  setCurrency,
+  budget,
+  setBudget,
+  customBudget,
+  setCustomBudget,
+  completedSteps,
+  totalSteps,
+  theme,
+}: SetupSlideProps) {
   const pillCodes = CURRENCY_CODES.slice(0, 4);
+  const trimmedName = name.trim();
   return (
     <View style={{ width, flex: 1, paddingHorizontal: gutter, paddingTop: Spacing.s3 }}>
       <ScrollView contentContainerStyle={{ paddingBottom: Spacing.s5 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-        <Text style={badgeStyle(theme)}>Step 1 of Setup</Text>
-        <Text style={[Typography.headlineLg, { fontSize: 24, color: theme.text.onSurface, marginTop: Spacing.s3, marginBottom: Spacing.s1 }]}>
+        <StepProgress completed={completedSteps} total={totalSteps} theme={theme} />
+        <Text style={[Typography.headlineLg, { fontSize: 24, color: theme.text.onSurface, marginBottom: Spacing.s1 }]}>
           Make it yours.
         </Text>
-        <Text style={[Typography.labelMd, { color: theme.text.onSurfaceVariant, marginBottom: Spacing.s5 }]}>
+        <Text style={[Typography.labelMd, { color: theme.text.onSurfaceVariant, marginBottom: Spacing.s4 }]}>
           Set your basic preferences. You can adjust all of these in Settings at any time.
         </Text>
+
+        <PreviewCard name={trimmedName} currency={currency} theme={theme} />
 
         <Text style={labelStyle(theme)}>Your Name</Text>
         <TextInput
@@ -391,7 +444,7 @@ function SetupSlide({ width, gutter, name, setName, currency, setCurrency, budge
           <Text style={labelStyle(theme)}>Default Currency</Text>
           <Text style={badgeStyle(theme)}>Base Unit</Text>
         </View>
-        <View accessibilityRole="radiogroup" accessibilityLabel="Default currency" style={{ flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s5 }}>
+        <View accessibilityRole="radiogroup" accessibilityLabel="Default currency" style={{ flexDirection: 'row', gap: Spacing.s2, marginBottom: Spacing.s3 }}>
           {pillCodes.map((code) => {
             const selected = code === currency;
             return (
@@ -418,16 +471,128 @@ function SetupSlide({ width, gutter, name, setName, currency, setCurrency, budge
           <Text style={labelStyle(theme)}>Monthly Target Budget</Text>
           <Text style={badgeStyle(theme)}>Optional</Text>
         </View>
-        <TextInput
-          value={budget}
-          onChangeText={setBudget}
-          placeholder="Leave blank to skip"
-          placeholderTextColor={theme.text.onSurfaceVariant40}
-          keyboardType="numeric"
-          accessibilityLabel="Monthly target budget, optional"
-          style={inputStyle(theme)}
-        />
+        <View accessibilityRole="radiogroup" accessibilityLabel="Monthly target budget" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.s2 }}>
+          {BUDGET_PRESET_AMOUNTS.map((amount) => {
+            const selected = !customBudget && parseBudgetAmount(budget) === amount;
+            const label = formatCurrency(amount, currency);
+            return (
+              <Pressable
+                key={amount}
+                accessibilityRole="radio"
+                accessibilityLabel={label}
+                accessibilityState={{ selected }}
+                onPress={() => { void Haptics.selectionAsync(); setBudget(String(amount)); setCustomBudget(false); }}
+                style={[budgetChip(theme), selected && { backgroundColor: theme.raw.primary, borderColor: theme.raw.primary }]}
+              >
+                <Text style={{ color: selected ? theme.text.white : theme.text.onSurface, ...Typography.captionBold, fontWeight: '700' }} numberOfLines={1}>
+                  {label}
+                </Text>
+              </Pressable>
+            );
+          })}
+          <Pressable
+            accessibilityRole="radio"
+            accessibilityLabel="Custom monthly budget"
+            accessibilityState={{ selected: customBudget }}
+            onPress={() => { void Haptics.selectionAsync(); setCustomBudget(true); }}
+            style={[budgetChip(theme), customBudget && { backgroundColor: theme.raw.primary, borderColor: theme.raw.primary }]}
+          >
+            <Text style={{ color: customBudget ? theme.text.white : theme.text.onSurface, ...Typography.captionBold, fontWeight: '700' }}>
+              Custom
+            </Text>
+          </Pressable>
+        </View>
+        {customBudget && (
+          <TextInput
+            value={budget}
+            onChangeText={setBudget}
+            placeholder="Enter an amount"
+            placeholderTextColor={theme.text.onSurfaceVariant40}
+            keyboardType="numeric"
+            autoFocus
+            accessibilityLabel={`Custom monthly target budget in ${getCurrencyName(currency)}`}
+            style={[inputStyle(theme), { marginTop: Spacing.s2 }]}
+          />
+        )}
       </ScrollView>
+    </View>
+  );
+}
+
+// Reads the budget string back as a number so a preset only shows selected when
+// the stored value really equals it. A blank or unreadable entry is nothing
+// selected, never a silent zero.
+function parseBudgetAmount(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : null;
+}
+
+// Setup progress, derived from the step the user has actually reached. `completed`
+// is the carousel index (the steps already passed), never a fixed percentage, so
+// the track is honest on both platform branches: 3 of 4 on iOS and 3 of 5 on
+// Android, because Android has the extra auto-capture step.
+function StepProgress({ completed, total, theme }: { completed: number; total: number; theme: Theme }) {
+  const fraction = total > 0 ? Math.min(Math.max(completed / total, 0), 1) : 0;
+  return (
+    <View
+      accessible
+      accessibilityRole="progressbar"
+      accessibilityValue={{ min: 0, max: total, now: completed }}
+      accessibilityLabel={`Setup progress, ${completed} of ${total} steps done`}
+      style={{ marginBottom: Spacing.s3 }}
+    >
+      <View style={{ height: 6, borderRadius: Radii.full, backgroundColor: theme.bg.elevated, overflow: 'hidden' }}>
+        <View style={{ width: `${fraction * 100}%`, height: 6, borderRadius: Radii.full, backgroundColor: theme.raw.primary }} />
+      </View>
+      <Text style={[Typography.micro, { color: theme.text.onSurfaceVariant, marginTop: Spacing.s1 }]}>
+        {completed} of {total} steps done
+      </Text>
+    </View>
+  );
+}
+
+// Live preview of the Home header this setup will produce. It renders the name
+// typed so far, or an explicit no-name placeholder, plus the currency currently
+// selected. It shows no amount and no count, so there is nothing here to be
+// mistaken for a ledger figure before one exists.
+function PreviewCard({ name, currency, theme }: { name: string; currency: string; theme: Theme }) {
+  const hasName = name.length > 0;
+  const initials = name
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join('');
+  return (
+    <View
+      accessible
+      accessibilityLabel={
+        hasName
+          ? `Home header preview. ${name}, ${getCurrencyName(currency)}.`
+          : `Home header preview. No name entered yet, ${getCurrencyName(currency)}.`
+      }
+      style={previewCard(theme)}
+    >
+      <View style={previewAvatar(theme)}>
+        {hasName ? (
+          <Text style={{ color: theme.text.white, ...Typography.labelBold }}>{initials}</Text>
+        ) : (
+          <User color={theme.text.onSurfaceVariant} size={18} />
+        )}
+      </View>
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={[Typography.micro, { color: theme.text.onSurfaceVariant }]}>Your Home header</Text>
+        <Text
+          numberOfLines={1}
+          style={[Typography.headlineMd, { color: hasName ? theme.text.onSurface : theme.text.onSurfaceVariant40 }]}
+        >
+          {hasName ? name : 'Your name'}
+        </Text>
+      </View>
+      <Text style={previewCurrency(theme)} numberOfLines={1}>
+        {currency} {getCurrencyPrefix(currency)}
+      </Text>
     </View>
   );
 }
@@ -562,6 +727,48 @@ const currencyPill = (theme: Theme) => ({
   borderColor: theme.border.card,
   alignItems: 'center' as const,
   justifyContent: 'center' as const,
+});
+// Budget starter chips. Same pill anatomy as the currency pills, minimum 44pt
+// tall so the target clears the 44pt/48dp floor on every width, and they wrap
+// rather than compress so a longer formatted amount can never clip a label.
+const budgetChip = (theme: Theme) => ({
+  minHeight: 44,
+  paddingHorizontal: Spacing.s4,
+  borderRadius: Radii.full,
+  backgroundColor: theme.bg.surface,
+  borderWidth: 1,
+  borderColor: theme.border.card,
+  alignItems: 'center' as const,
+  justifyContent: 'center' as const,
+});
+const previewCard = (theme: Theme) => ({
+  flexDirection: 'row' as const,
+  alignItems: 'center' as const,
+  gap: Spacing.s3,
+  backgroundColor: theme.bg.surface,
+  borderWidth: 1,
+  borderColor: theme.border.card,
+  borderRadius: Radii.lg,
+  padding: Spacing.s3,
+  marginBottom: Spacing.s4,
+});
+const previewAvatar = (theme: Theme) => ({
+  width: 40,
+  height: 40,
+  borderRadius: Radii.full,
+  backgroundColor: theme.raw.primary,
+  alignItems: 'center' as const,
+  justifyContent: 'center' as const,
+});
+// Mirrors the canonical form-badge pill so the preview reads as part of the form.
+const previewCurrency = (theme: Theme) => ({
+  ...Typography.micro,
+  color: theme.text.onSurfaceVariant,
+  backgroundColor: theme.bg.elevated,
+  paddingHorizontal: Spacing.s2,
+  paddingVertical: Spacing.s1,
+  borderRadius: Radii.full,
+  overflow: 'hidden' as const,
 });
 const permissionCard = (theme: Theme) => ({
   backgroundColor: theme.bg.surface,

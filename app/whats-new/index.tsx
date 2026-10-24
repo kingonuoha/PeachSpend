@@ -1,12 +1,23 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Stack, useRouter } from 'expo-router';
 import Constants from 'expo-constants';
 import { LinearGradient } from 'expo-linear-gradient';
-import { ArrowLeft, ShieldCheck, Sparkles } from 'lucide-react-native';
+import {
+  ArrowLeft,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  MessageCircle,
+  ScanLine,
+  ShieldCheck,
+  Sparkles,
+  Upload,
+} from 'lucide-react-native';
 
 import { LuminousCard } from '../../components/ui/LuminousCard';
+import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Colors, Gradients, LightTheme, Radii, Spacing, Typography } from '../../constants/tokens';
@@ -76,6 +87,38 @@ const CHANGELOG: ChangelogEntry[] = [
   { type: 'fix', text: 'Spending analytics use your currency symbol and category colors' },
 ];
 
+// Curated capability cards (task B1-4 bullet 1). Each destination is an existing
+// route that another screen already navigates to, so no card is a dead end.
+const CAPABILITY_CARDS = [
+  {
+    key: 'scan',
+    title: 'Scan a receipt',
+    detail: 'Read line items from a photo',
+    route: '/(tabs)/scan',
+    icon: ScanLine,
+  },
+  {
+    key: 'chat',
+    title: 'Ask the assistant',
+    detail: 'Ask about your spending',
+    route: '/chat',
+    icon: MessageCircle,
+  },
+  {
+    key: 'import',
+    title: 'Import a CSV',
+    detail: 'Bring in a file you exported',
+    route: '/import',
+    icon: Upload,
+  },
+] as const;
+
+const GROUP_LABELS: Record<ChangeKind, string> = {
+  new: 'New capabilities',
+  fix: 'Reliability and fixes',
+};
+
+
 export default function WhatsNewScreen() {
   const ts = useThemeStyles();
   const router = useRouter();
@@ -85,7 +128,17 @@ export default function WhatsNewScreen() {
 
   const newCount = useMemo(() => CHANGELOG.filter((entry) => entry.type === 'new').length, []);
   const fixCount = useMemo(() => CHANGELOG.filter((entry) => entry.type === 'fix').length, []);
+  const newEntries = useMemo(() => CHANGELOG.filter((entry) => entry.type === 'new'), []);
+  const fixEntries = useMemo(() => CHANGELOG.filter((entry) => entry.type === 'fix'), []);
   const totalCount = CHANGELOG.length;
+
+  // Disclosure is allowed on this screen only (brief section 4 and ESC-11-08).
+  // Both groups start collapsed, which is the point of the chunking: 23 flat rows
+  // became two summary rows, and nothing was deleted to achieve it.
+  const [openGroups, setOpenGroups] = useState<Record<ChangeKind, boolean>>({ new: false, fix: false });
+  const toggleGroup = useCallback((kind: ChangeKind) => {
+    setOpenGroups((current) => ({ ...current, [kind]: !current[kind] }));
+  }, []);
 
   const goBack = useCallback(() => {
     if (router.canGoBack()) router.back();
@@ -151,10 +204,58 @@ export default function WhatsNewScreen() {
         ) : null}
       </View>
 
+      {/* Header area privacy line (task B1-4 bullet 3). The canonical pair keeps
+          the local-only promise only in the footer, after 1,500pt of changelog.
+          The copy states only what is true today: the ledger and receipt images
+          live in the local database, and an AI request goes to the provider the
+          user configured with their own key. It sits outside the ScrollView so it
+          is present at every scroll position. */}
+      <View style={[styles.privacyStrip, { borderBottomColor: ts.raw.outline }]}>
+        <ShieldCheck size={14} color={ts.raw.primary} strokeWidth={2} />
+        <Text style={[Typography.micro, styles.privacyText, { color: ts.raw.onSurfaceVariant }]}>
+          Your ledger and receipt images stay on this device. AI requests go only to the provider you configured.
+        </Text>
+      </View>
+
       <ScrollView
         showsVerticalScrollIndicator={false}
         contentContainerStyle={[styles.content, { paddingBottom: Spacing.s8 + insets.bottom }]}
       >
+        {/* Curated capability cards. Each one is a real navigation to a route other
+            screens already open, so none of them is a dead end. */}
+        <View style={styles.capabilityList}>
+          {CAPABILITY_CARDS.map((card) => {
+            const Icon = card.icon;
+            return (
+              <ScalePressable
+                key={card.key}
+                accessibilityRole="button"
+                accessibilityLabel={`${card.title}. ${card.detail}`}
+                onPress={() => router.push(card.route as never)}
+                style={[
+                  styles.capabilityCard,
+                  {
+                    backgroundColor: ts.isDark ? ts.raw.surface : ts.bg.lowest,
+                    borderColor: ts.raw.outline,
+                  },
+                ]}
+              >
+                <View style={[styles.capabilityIcon, { backgroundColor: ts.bg.primary10 }]}>
+                  <Icon size={18} color={ts.raw.primary} strokeWidth={2} />
+                </View>
+                <View style={styles.capabilityText}>
+                  <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]} numberOfLines={1}>
+                    {card.title}
+                  </Text>
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
+                    {card.detail}
+                  </Text>
+                </View>
+                <ChevronRight size={16} color={ts.raw.onSurfaceVariant} />
+              </ScalePressable>
+            );
+          })}
+        </View>
         <LinearGradient
           colors={gradient}
           locations={GRADIENT_LOCATIONS}
@@ -290,45 +391,23 @@ export default function WhatsNewScreen() {
             </View>
           </View>
 
-          {CHANGELOG.map((entry, index) => {
-            const isNew = entry.type === 'new';
-            return (
-              <View
-                key={`${entry.type}-${index}`}
-                style={[
-                  styles.itemRow,
-                  index < totalCount - 1
-                    ? { borderBottomWidth: 1, borderBottomColor: ts.raw.outline }
-                    : null,
-                ]}
-              >
-                <View
-                  style={[
-                    styles.tag,
-                    styles.itemTag,
-                    {
-                      backgroundColor: isNew
-                        ? ts.raw.purple100
-                        : ts.raw.statusSuccessContainer,
-                    },
-                  ]}
-                >
-                  <Text
-                    style={[
-                      Typography.micro,
-                      styles.tagText,
-                      { color: isNew ? ts.raw.primary : ts.raw.statusSuccessText },
-                    ]}
-                  >
-                    {isNew ? 'NEW' : 'FIX'}
-                  </Text>
-                </View>
-                <Text style={[Typography.labelMd, styles.itemText, { color: ts.raw.onSurface }]}>
-                  {entry.text}
-                </Text>
-              </View>
-            );
-          })}
+          <DisclosureGroup
+            label={GROUP_LABELS.new}
+            kind="new"
+            entries={newEntries}
+            open={openGroups.new}
+            onToggle={toggleGroup}
+            theme={ts}
+            isFirst
+          />
+          <DisclosureGroup
+            label={GROUP_LABELS.fix}
+            kind="fix"
+            entries={fixEntries}
+            open={openGroups.fix}
+            onToggle={toggleGroup}
+            theme={ts}
+          />
         </LuminousCard>
 
         <View style={styles.footer}>
@@ -350,8 +429,102 @@ export default function WhatsNewScreen() {
             Your ledger stays on this device.
           </Text>
         </View>
+
+        {/* Full width return in the lower thumb zone (task B1-4 bullet 4). The
+            canonical pair's only exit is the 40pt back circle in the top left. */}
+        <PeachButton
+          title="Return to Settings"
+          variant="secondary"
+          size="xl"
+          fullWidth
+          onPress={goBack}
+          style={styles.returnAction}
+        />
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+// One collapsible group of release entries. The count comes from the entries
+// themselves, so the header can never claim a number the list does not hold.
+function DisclosureGroup({
+  label,
+  kind,
+  entries,
+  open,
+  onToggle,
+  theme,
+  isFirst = false,
+}: {
+  label: string;
+  kind: ChangeKind;
+  entries: ChangelogEntry[];
+  open: boolean;
+  onToggle: (kind: ChangeKind) => void;
+  theme: ReturnType<typeof useThemeStyles>;
+  isFirst?: boolean;
+}) {
+  return (
+    <View style={isFirst ? null : { borderTopWidth: 1, borderTopColor: theme.raw.outline }}>
+      <ScalePressable
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        accessibilityLabel={`${label}, ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}`}
+        onPress={() => onToggle(kind)}
+        style={styles.groupHeader}
+      >
+        <Text style={[Typography.labelBold, styles.groupLabel, { color: theme.raw.onSurface }]}>
+          {label}
+        </Text>
+        <Text style={[Typography.micro, { color: theme.raw.onSurfaceVariant }]}>
+          {entries.length}
+        </Text>
+        {open ? (
+          <ChevronUp size={16} color={theme.raw.onSurfaceVariant} />
+        ) : (
+          <ChevronDown size={16} color={theme.raw.onSurfaceVariant} />
+        )}
+      </ScalePressable>
+
+      {open
+        ? entries.map((entry, index) => (
+            <View
+              key={`${entry.type}-${index}`}
+              style={[
+                styles.itemRow,
+                index < entries.length - 1
+                  ? { borderBottomWidth: 1, borderBottomColor: theme.raw.outline }
+                  : null,
+              ]}
+            >
+              <View
+                style={[
+                  styles.tag,
+                  styles.itemTag,
+                  {
+                    backgroundColor: entry.type === 'new'
+                      ? theme.raw.purple100
+                      : theme.raw.statusSuccessContainer,
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    Typography.micro,
+                    styles.tagText,
+                    { color: entry.type === 'new' ? theme.raw.primary : theme.raw.statusSuccessText },
+                  ]}
+                >
+                  {entry.type === 'new' ? 'NEW' : 'FIX'}
+                </Text>
+              </View>
+              <Text style={[Typography.labelMd, styles.itemText, { color: theme.raw.onSurface }]}>
+                {entry.text}
+              </Text>
+            </View>
+          ))
+        : null}
+    </View>
   );
 }
 
@@ -543,6 +716,56 @@ const styles = StyleSheet.create({
   itemText: {
     flex: 1,
     minWidth: 0,
+  },
+  privacyStrip: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: Spacing.s1,
+    paddingHorizontal: Spacing.s5,
+    paddingBottom: Spacing.s2,
+    borderBottomWidth: 1,
+  },
+  privacyText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  capabilityList: {
+    gap: Spacing.s2,
+  },
+  capabilityCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s3,
+    minHeight: 64,
+    paddingHorizontal: Spacing.s3,
+    paddingVertical: Spacing.s3,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+  },
+  capabilityIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: Radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  capabilityText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  groupHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    minHeight: 52,
+    paddingHorizontal: Spacing.s3,
+  },
+  groupLabel: {
+    flex: 1,
+    minWidth: 0,
+  },
+  returnAction: {
+    marginTop: Spacing.s1,
   },
   footer: {
     alignItems: 'center',
