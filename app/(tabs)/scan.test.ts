@@ -47,6 +47,12 @@ vi.mock('expo-haptics', () => ({
   NotificationFeedbackType: { Error: 'error', Success: 'success' },
 }));
 vi.mock('expo-image-picker', () => ({ launchImageLibraryAsync: vi.fn() }));
+// The scan screen's pending-receipt rows render the stored draft image. `expo-image`
+// pulls the Expo runtime into the node graph and throws `__DEV__ is not defined` during
+// collection, so it is mocked here in the suite's harness prologue, the same way
+// receive.test.ts and VerificationSheet.test.ts mock it. Stubbed as a null component so
+// the row still renders and every non-image assertion stays live.
+vi.mock('expo-image', () => ({ Image: () => null }));
 vi.mock('../../services/GeminiService', () => ({ geminiService: { scanReceipt: vi.fn() } }));
 vi.mock('../../services/DatabaseService', () => ({ databaseService: { getSecret: vi.fn(), getCaptureRepository: vi.fn(), getCategories: vi.fn() } }));
 vi.mock('../../services/NotificationService', () => ({ notificationService: { scheduleExpenseNotification: vi.fn() } }));

@@ -4,7 +4,7 @@ import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { useRouter, useLocalSearchParams, useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Check, Home, Image as ImageIcon, Pencil, Share2, ShieldCheck, TriangleAlert, X } from 'lucide-react-native';
+import { Check, Home, Image as ImageIcon, Pencil, RotateCcw, ScanLine, Share2, ShieldCheck, TriangleAlert, X } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import NetInfo from '@react-native-community/netinfo';
 
@@ -13,6 +13,7 @@ import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
 import { AIProcessingOverlay } from '../../components/capture/AIProcessingOverlay';
+import { pipelineSteps, type PipelineStage } from '../../components/capture/pipelineStages';
 import { VerificationSheet } from '../../components/expense/VerificationSheet';
 import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
 import { useSettings } from '../../components/ui/SettingsProvider';
@@ -137,6 +138,17 @@ const hasRequiredReceiptFields = (item: ScannedReceipt): boolean => (
   item.category.trim().length > 0
 );
 
+// Phase 11 B2-6. The screen only ever moves through these, in this order. The
+// pre-flight step is the guard the audit asks for: the image is on this device and
+// nothing has left it, and the user can cancel from there.
+type SharePhase = 'preflight' | 'processing' | 'review' | 'queued' | 'saved' | 'recovery';
+
+// Why processing cannot run right now, in the user's words. Null means it can.
+const BLOCKER_COPY: Record<'offline' | 'missing_key', string> = {
+  offline: 'You are offline, so the shared image has not been sent to your AI provider.',
+  missing_key: 'No AI provider key is set, so the shared image has not been sent to your AI provider.',
+};
+
 const humanizeCategory = (id: string): string => id
   .replace(/[-_]+/g, ' ')
   .trim()
@@ -196,7 +208,8 @@ export default function ShareReceiveScreen() {
   const { checkForNewAchievements } = useAchievements();
   const { handoffToken } = useLocalSearchParams<{ handoffToken?: string }>();
 
-  const [processing, setProcessing] = useState(true);
+  const [phase, setPhase] = useState<SharePhase>('preflight');
+  const [pipelineStage, setPipelineStage] = useState<PipelineStage | null>(null);
   const [recovery, setRecovery] = useState<RecoveryState | null>(null);
   const [scanResult, setScanResult] = useState<ScannedReceipt[] | null>(null);
   const [isSheetVisible, setIsSheetVisible] = useState(false);
@@ -204,8 +217,15 @@ export default function ShareReceiveScreen() {
   const [pendingBatch, setPendingBatch] = useState<ScannedReceipt[] | null>(null);
   const [savedItems, setSavedItems] = useState<ScannedReceipt[] | null>(null);
   const [savedWithImage, setSavedWithImage] = useState(false);
+  const [savedRecordId, setSavedRecordId] = useState<string | null>(null);
   const [ownedImageUri, setOwnedImageUri] = useState<string | null>(null);
   const [imageMeta, setImageMeta] = useState<OwnedImageMeta | null>(null);
+  // Why processing cannot run right now. It is re-checked on every attempt, so it can
+  // never go stale behind a settings change or a reconnect.
+  const [blocker, setBlocker] = useState<'offline' | 'missing_key' | null>(null);
+  // The draft row that owns this image on this device. It exists from the moment the
+  // image is copied, which is what lets the image survive a consumed handoff token.
+  const [draftId, setDraftId] = useState<string | null>(null);
   // POLISH Section 7: the ingestion outcome is async, so it is spoken, not only
   // rendered. iOS has no live region and speaks through announceForAccessibility;
   // Android reads the polite live region rendered at the bottom of this screen. A live
@@ -215,6 +235,7 @@ export default function ShareReceiveScreen() {
   const [outcomeAnnouncement, setOutcomeAnnouncement] = useState('');
 
   const ownedImageRef = useRef<string | null>(null);
+  const draftIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const startedRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -227,6 +248,8 @@ export default function ShareReceiveScreen() {
     };
   }, []);
 
+  // Releasing the app's own copy. When a draft row owns the file, the ref has already
+  // been cleared and nothing is deleted; the row is the only pointer to it.
   const cleanupOwnedImage = useCallback(async () => {
     const uri = ownedImageRef.current;
     ownedImageRef.current = null;
@@ -235,6 +258,50 @@ export default function ShareReceiveScreen() {
       setImageMeta(null);
     }
     await deleteOwnedImage(uri ?? undefined);
+  }, []);
+
+  // A draft row is durable local data. Discarding the flow deletes the row and then the
+  // file it pointed at, in that order, so there is never a row without a file or a file
+  // without a row.
+  const discardDraft = useCallback(async (): Promise<void> => {
+    const id = draftIdRef.current;
+    draftIdRef.current = null;
+    if (mountedRef.current) setDraftId(null);
+    const uri = ownedImageRef.current;
+    ownedImageRef.current = null;
+    if (mountedRef.current) {
+      setOwnedImageUri(null);
+      setImageMeta(null);
+    }
+    if (id) {
+      try {
+        const store = await databaseService.getReceiptDraftStore();
+        await store.deleteReceiptDraft(id);
+      } catch {
+        logger.error('Failed to remove the shared receipt draft', 'share_draft_delete_failed');
+      }
+    }
+    await deleteOwnedImage(uri ?? undefined);
+  }, []);
+
+  // Keep the image on this device and remember which row owns it. The app copy is not
+  // deleted while a row points at it, so a consumed handoff token can never destroy it.
+  const keepDraft = useCallback(async (uri: string, errorCode: string | null): Promise<string | null> => {
+    try {
+      const store = await databaseService.getReceiptDraftStore();
+      const draft = await store.enqueueReceiptDraft({ imageUri: uri, source: 'share' });
+      if (errorCode) await store.markReceiptDraftFailed(draft.id, errorCode);
+      draftIdRef.current = draft.id;
+      ownedImageRef.current = null;
+      if (mountedRef.current) {
+        setDraftId(draft.id);
+        setOwnedImageUri(uri);
+      }
+      return draft.id;
+    } catch {
+      logger.error('Failed to keep the shared image on this device', 'share_draft_enqueue_failed');
+      return null;
+    }
   }, []);
 
   // Focus loss and unmount release the app-owned cache copy exactly once. A saved
@@ -299,12 +366,15 @@ export default function ShareReceiveScreen() {
   }, []);
 
   const runOcr = useCallback(async (uri: string) => {
-    setProcessing(true);
+    setPhase('processing');
+    setPipelineStage('captured');
     const controller = new AbortController();
     abortRef.current = controller;
     try {
+      setPipelineStage('requesting');
       const base64 = await readOwnedReceiptImageAsBase64(uri);
       const rawItems = await geminiService.scanReceipt(base64, 'receipt', { signal: controller.signal });
+      setPipelineStage('parsing');
       if (!rawItems || !Array.isArray(rawItems)) {
         throw new AiError('invalid_response', 'gemini', 'AI response did not match the receipt contract');
       }
@@ -313,38 +383,62 @@ export default function ShareReceiveScreen() {
       }
       const items = convertToUserCurrency(rawItems);
       if (!mountedRef.current) return;
+      setPipelineStage('ready');
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       setScanResult(items);
       setIsSheetVisible(true);
+      setPhase('review');
     } catch (error) {
-      // A user cancel is not an AI failure; leave quietly (the screen unmounts).
-      if (!(error instanceof AiError && error.code === 'cancelled')) applyAiError(error);
-      await cleanupOwnedImage();
+      // A user cancel is not an AI failure; the image stays on this device in its draft.
+      if (!(error instanceof AiError && error.code === 'cancelled')) {
+        const normalized = normalizeAiError(error, 'gemini');
+        applyAiError(error);
+        const id = draftIdRef.current;
+        if (id) {
+          try {
+            const store = await databaseService.getReceiptDraftStore();
+            await store.markReceiptDraftFailed(id, normalized.code);
+          } catch {
+            logger.error('Failed to record the share failure on the draft', 'share_draft_fail_marker_failed');
+          }
+        }
+        if (mountedRef.current) setPhase('queued');
+      } else if (mountedRef.current) {
+        setPhase('queued');
+      }
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
-      if (mountedRef.current) setProcessing(false);
+      if (mountedRef.current) setPipelineStage(null);
     }
-  }, [applyAiError, cleanupOwnedImage, convertToUserCurrency]);
+  }, [applyAiError, convertToUserCurrency]);
 
-  const processRecord = useCallback(async (record: ShareIntentFileRecord) => {
-    setProcessing(true);
+  // The one entry point for a shared payload: copy it locally, record the draft row,
+  // then decide whether processing can run. Nothing has left the device at any point
+  // before the user presses the scan action.
+  const prepareShare = useCallback(async (record: ShareIntentFileRecord) => {
     setRecovery(null);
     clearOutcomeAnnouncement();
     try {
       const copied = await copyReceiptImageToAppCache(record.uri, record.mimeType, record.fileSize);
       ownedImageRef.current = copied;
-      if (mountedRef.current) {
-        setOwnedImageUri(copied);
-        setImageMeta({ mimeType: record.mimeType, fileSize: record.fileSize });
+      setOwnedImageUri(copied);
+      setImageMeta({ mimeType: record.mimeType, fileSize: record.fileSize });
+      await keepDraft(copied, null);
+      const availability = await checkAvailability();
+      if (!mountedRef.current) return;
+      if (availability === 'ready') {
+        setBlocker(null);
+        setPhase('preflight');
+      } else {
+        setBlocker(availability);
+        setPhase('queued');
       }
-      await runOcr(copied);
     } catch (error) {
       applyAiError(error);
-      await cleanupOwnedImage();
-    } finally {
-      if (mountedRef.current) setProcessing(false);
+      await discardDraft();
+      if (mountedRef.current) setPhase('recovery');
     }
-  }, [applyAiError, clearOutcomeAnnouncement, cleanupOwnedImage, runOcr]);
+  }, [applyAiError, checkAvailability, clearOutcomeAnnouncement, discardDraft, keepDraft]);
 
   // One-shot handoff: the opaque token is consumed exactly once and the raw native
   // URI never reaches state, params, or the UI. The guard also protects against a
@@ -359,25 +453,13 @@ export default function ShareReceiveScreen() {
         if (!record) {
           if (mountedRef.current) {
             commitRecovery({ code: null, message: 'This shared image is no longer available. Share it again to retry.' });
-            setProcessing(false);
+            setPhase('recovery');
           }
           return;
         }
-        const availability = await checkAvailability();
-        if (!mountedRef.current) return;
-        if (availability === 'offline') {
-          commitRecovery({ code: 'offline', message: getAiErrorMessage('offline', 'receipt') });
-          setProcessing(false);
-          return;
-        }
-        if (availability === 'missing_key') {
-          commitRecovery({ code: 'missing_key', message: 'Gemini API key missing. Open AI Provider Settings.' });
-          setProcessing(false);
-          return;
-        }
-        await processRecord(record);
+        await prepareShare(record);
       } catch {
-        if (mountedRef.current) setProcessing(false);
+        if (mountedRef.current) setPhase('recovery');
       }
     })();
     // The handoff is one-shot; re-running on callback identity changes would
@@ -406,17 +488,31 @@ export default function ShareReceiveScreen() {
     }
   }, [checkForNewAchievements]);
 
-  const finalizeBatchSave = useCallback((items: ScannedReceipt[]) => {
-    const hadImage = Boolean(ownedImageRef.current);
-    // The persisted expense record now owns the cache copy, so release the ref
-    // without deleting the file.
+  const finalizeBatchSave = useCallback(async (items: ScannedReceipt[], recordId: string) => {
+    const hadImage = Boolean(ownedImageRef.current) || Boolean(draftIdRef.current);
+    // The draft row has done its job: the expense now points at the same file, so the
+    // row is marked saved and removed while the image stays on disk.
+    const id = draftIdRef.current;
+    draftIdRef.current = null;
+    if (id) {
+      try {
+        const store = await databaseService.getReceiptDraftStore();
+        await store.markReceiptDraftSaved(id);
+        await store.deleteReceiptDraft(id);
+      } catch {
+        logger.error('Failed to close the shared receipt draft', 'share_draft_save_marker_failed');
+      }
+    }
     ownedImageRef.current = null;
     setIsSheetVisible(false);
     setScanResult(null);
     setOwnedImageUri(null);
     setImageMeta(null);
+    setDraftId(null);
     setSavedWithImage(hadImage);
     setSavedItems(items);
+    setSavedRecordId(recordId);
+    setPhase('saved');
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     // POLISH Section 7: a committed save is async, so the success is spoken, not only
     // rendered. The sentence comes from the same helper the render uses, so the two
@@ -434,12 +530,12 @@ export default function ShareReceiveScreen() {
       return;
     }
     const repository = await databaseService.getCaptureRepository();
-    const candidates = buildCandidates(items, ownedImageRef.current);
+    const candidates = buildCandidates(items, ownedImageRef.current ?? ownedImageUri);
     const resolution = await resolveExpenseBatchSave(repository, candidates, 'save_anyway');
     if (resolution.status !== 'saved') throw new Error('capture_save_failed');
     await runBatchSideEffects(resolution.records, candidates);
-    finalizeBatchSave(items);
-  }, [finalizeBatchSave, runBatchSideEffects, showToast]);
+    await finalizeBatchSave(items, resolution.records[0].id);
+  }, [finalizeBatchSave, ownedImageUri, runBatchSideEffects, showToast]);
 
   const handleConfirm = useCallback(async (items: ScannedReceipt[]) => {
     try {
@@ -450,7 +546,7 @@ export default function ShareReceiveScreen() {
         return;
       }
       const repository = await databaseService.getCaptureRepository();
-      const candidates = buildCandidates(items, ownedImageRef.current);
+      const candidates = buildCandidates(items, ownedImageRef.current ?? ownedImageUri);
       const resolutions = await resolveExpenseBatchSave(repository, candidates, 'confirm');
       if (resolutions.status === 'needs_review') {
         const firstMatch = resolutions.matches.find((match) => 'match' in match)?.match;
@@ -463,13 +559,13 @@ export default function ShareReceiveScreen() {
       // The confirm pass already persisted the batch. Run side effects on those
       // real records only; never re-enter executeSave (save_anyway) here.
       await runBatchSideEffects(resolutions.records, candidates);
-      finalizeBatchSave(items);
+      await finalizeBatchSave(items, resolutions.records[0].id);
     } catch {
       logger.error('Failed to save shared receipt', 'save_failed');
       showToast('Failed to save expenses', 'error');
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [finalizeBatchSave, runBatchSideEffects, showToast]);
+  }, [finalizeBatchSave, ownedImageUri, runBatchSideEffects, showToast]);
 
   const handleChooseAnother = useCallback(async () => {
     try {
@@ -479,57 +575,120 @@ export default function ShareReceiveScreen() {
       if (!asset.mimeType) throw new Error('unsupported_image_type');
       setRecovery(null);
       clearOutcomeAnnouncement();
-      setProcessing(true);
+      // A new image replaces the old one, so the old draft and its file go first.
+      await discardDraft();
       const copied = await copyReceiptImageToAppCache(asset.uri, asset.mimeType, asset.fileSize);
       ownedImageRef.current = copied;
-      if (mountedRef.current) {
-        setOwnedImageUri(copied);
-        setImageMeta({ mimeType: asset.mimeType, fileSize: asset.fileSize });
+      setOwnedImageUri(copied);
+      setImageMeta({ mimeType: asset.mimeType, fileSize: asset.fileSize });
+      await keepDraft(copied, null);
+      const availability = await checkAvailability();
+      if (!mountedRef.current) return;
+      if (availability === 'ready') {
+        setBlocker(null);
+        setPhase('preflight');
+      } else {
+        setBlocker(availability);
+        setPhase('queued');
       }
-      await runOcr(copied);
     } catch (error) {
       applyAiError(error);
-      await cleanupOwnedImage();
-      if (mountedRef.current) setProcessing(false);
+      await discardDraft();
+      if (mountedRef.current) setPhase('recovery');
     }
-  }, [applyAiError, clearOutcomeAnnouncement, cleanupOwnedImage, runOcr]);
+  }, [applyAiError, checkAvailability, clearOutcomeAnnouncement, discardDraft, keepDraft]);
 
+  // Leaving before anything was saved discards the local copy: the user cancelled the
+  // flow, so there is nothing to keep.
   const leaveWithCleanup = useCallback(() => {
     void (async () => {
-      await cleanupOwnedImage();
+      await discardDraft();
       returnToOrigin();
     })();
-  }, [cleanupOwnedImage, returnToOrigin]);
+  }, [discardDraft, returnToOrigin]);
+
+  // Leaving from the queued state keeps the draft: the screen already told the user the
+  // image is saved on the device, so leaving must not quietly delete it.
+  const leaveKeepingDraft = useCallback(() => {
+    returnToOrigin();
+  }, [returnToOrigin]);
+
+  const handleHeaderClose = useCallback(() => {
+    if (phase === 'queued' || phase === 'processing') leaveKeepingDraft();
+    else leaveWithCleanup();
+  }, [leaveKeepingDraft, leaveWithCleanup, phase]);
 
   const handleGoHome = useCallback(() => {
-    void (async () => {
-      await cleanupOwnedImage();
-      router.replace('/(tabs)');
-    })();
-  }, [cleanupOwnedImage, router]);
+    router.replace('/(tabs)');
+  }, [router]);
+
+  const handleViewTransaction = useCallback(() => {
+    if (!savedRecordId) return;
+    router.replace({ pathname: '/expense/[id]', params: { id: savedRecordId } });
+  }, [router, savedRecordId]);
 
   const handleCancelProcessing = useCallback(() => {
     abortRef.current?.abort();
-    setProcessing(false);
-    leaveWithCleanup();
-  }, [leaveWithCleanup]);
+    setPipelineStage(null);
+    // The image stays on this device in its draft row, so the user can try again.
+    setPhase('queued');
+    showToast('Processing cancelled. The shared image is still on this device.', 'info');
+  }, [showToast]);
+
+  const handleScanNow = useCallback(() => {
+    const uri = ownedImageRef.current ?? ownedImageUri;
+    if (!uri) return;
+    void runOcr(uri);
+  }, [ownedImageUri, runOcr]);
+
+  // Re-check the blocker, then run. A still-blocked attempt explains itself instead of
+  // pretending to start work it cannot do.
+  const handleRetryQueued = useCallback(async () => {
+    const uri = ownedImageRef.current ?? ownedImageUri;
+    if (!uri) return;
+    const availability = await checkAvailability();
+    if (!mountedRef.current) return;
+    if (availability !== 'ready') {
+      setBlocker(availability);
+      showToast(
+        availability === 'offline'
+          ? 'Still offline. The image stays saved on this device.'
+          : 'Still no AI key. The image stays saved on this device.',
+        'error',
+      );
+      return;
+    }
+    setBlocker(null);
+    const id = draftIdRef.current;
+    if (id) {
+      try {
+        const store = await databaseService.getReceiptDraftStore();
+        await store.retryReceiptDraft(id);
+      } catch {
+        logger.error('Failed to requeue the shared draft', 'share_draft_requeue_failed');
+      }
+    }
+    await runOcr(uri);
+  }, [checkAvailability, ownedImageUri, runOcr, showToast]);
 
   const handleSheetCancel = useCallback(() => {
     setIsSheetVisible(false);
     setScanResult(null);
-    leaveWithCleanup();
-  }, [leaveWithCleanup]);
+    // The extraction is abandoned, not the image: the draft keeps the file and the
+    // queued state offers another attempt.
+    setPhase('queued');
+  }, []);
 
   const handleDuplicateDiscard = useCallback(() => {
     setDuplicateWarning(null);
     setPendingBatch(null);
     setIsSheetVisible(false);
     setScanResult(null);
-    leaveWithCleanup();
-  }, [leaveWithCleanup]);
+    setPhase('queued');
+  }, []);
 
-  const showSuccess = savedItems !== null;
-  const showRecovery = recovery !== null;
+  const showSuccess = phase === 'saved' && savedItems !== null;
+  const showRecovery = phase === 'recovery' && recovery !== null;
   // Derived from the failure code rather than stored, so the presentation and the
   // primary action can never disagree with the code the state carries.
   const recoveryKindValue: RecoveryKind = recovery ? recoveryKind(recovery.code) : 'generic';
@@ -538,7 +697,11 @@ export default function ShareReceiveScreen() {
     ? 'Saved to your ledger'
     : showRecovery
       ? 'Could not read image'
-      : `From ${Platform.OS === 'ios' ? 'iOS' : 'Android'} share sheet`;
+      : phase === 'preflight'
+        ? 'Review it before anything is sent'
+        : phase === 'queued'
+          ? 'Saved on this device'
+          : `From ${Platform.OS === 'ios' ? 'iOS' : 'Android'} share sheet`;
 
   // Pair success body sets the merchant and amount in purple semibold ahead of
   // the plain result sentence. Multi-item saves keep the honest count sentence. This
@@ -554,7 +717,7 @@ export default function ShareReceiveScreen() {
         ]}
       >
         <ScalePressable
-          onPress={leaveWithCleanup}
+          onPress={handleHeaderClose}
           accessibilityRole="button"
           accessibilityLabel="Close shared receipt and return"
           hitSlop={CLOSE_HIT_SLOP}
@@ -606,7 +769,120 @@ export default function ShareReceiveScreen() {
                 </Text>
               </View>
             </View>
-            <PeachButton title="Return to Home Dashboard" onPress={handleGoHome} variant="primary" size="lg" fullWidth />
+            <PeachButton title="View this transaction" onPress={handleViewTransaction} variant="primary" size="lg" fullWidth />
+            <PeachButton title="Done" onPress={handleGoHome} variant="secondary" size="lg" fullWidth />
+          </View>
+        ) : phase === 'preflight' || phase === 'queued' ? (
+          /* Phase 11 B2-6. The pre-flight guard: the image is on this device and nothing
+             has left it. Queued is the same card with the reason processing cannot run
+             and a real retry. */
+          <View style={styles.section}>
+            <View style={[styles.callout, { backgroundColor: ts.bg.primary5, borderColor: ts.border.primary20 }]}>
+              <View style={[styles.aiBadge, { backgroundColor: ts.bg.primary }]}>
+                <Text style={styles.aiBadgeText}>AI</Text>
+              </View>
+              <View style={styles.calloutBody}>
+                <Text style={[styles.calloutTitle, { color: ts.text.onSurface }]}>
+                  {phase === 'preflight' ? 'Ready to read this receipt' : blocker ? 'Saved on this device' : 'Not processed yet'}
+                </Text>
+                <Text style={[styles.calloutText, { color: ts.text.onSurfaceVariant }]}>
+                  {phase === 'preflight'
+                    ? 'Nothing has been sent anywhere yet. Reading it uses your own AI provider key.'
+                    : blocker
+                      ? BLOCKER_COPY[blocker]
+                      : recovery?.message ?? 'The last attempt did not finish. The image is still saved on this device.'}
+                </Text>
+              </View>
+            </View>
+
+            <View style={[styles.imageCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+              <View style={[styles.imageArea, { backgroundColor: Gradients.light[0] }]}>
+                <Image
+                  source={ownedImageUri ? { uri: ownedImageUri } : undefined}
+                  style={styles.imageFill}
+                  contentFit="cover"
+                  transition={150}
+                  accessibilityLabel="Shared receipt image"
+                />
+                {imageMeta ? (
+                  <View style={[styles.metaChip, { backgroundColor: ts.bg.overlay }]}>
+                    <ImageIcon size={12} color={Colors.white} />
+                    <Text numberOfLines={1} style={styles.metaChipText}>{describeImageMeta(imageMeta)}</Text>
+                  </View>
+                ) : null}
+              </View>
+              <View style={styles.imageFooter}>
+                <View style={styles.imageFooterText}>
+                  <Text numberOfLines={1} style={[styles.imageTitle, { color: ts.text.onSurface }]}>
+                    Incoming Share Ingestion
+                  </Text>
+                  <Text numberOfLines={1} style={[styles.imageMeta, { color: ts.text.onSurfaceVariant }]}>
+                    {draftId ? 'Saved on this device until it is saved to your ledger' : 'Secure app copy ready for OCR'}
+                  </Text>
+                </View>
+                <View style={[styles.autoChip, { backgroundColor: ts.bg.primary5, borderColor: ts.border.primary20 }]}>
+                  <Text style={[styles.autoChipText, { color: ts.text.primary }]}>
+                    {phase === 'preflight' ? 'Not sent' : 'Saved'}
+                  </Text>
+                </View>
+              </View>
+            </View>
+
+            <View style={styles.infoGrid}>
+              <View style={[styles.infoCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+                <Text style={[styles.infoLabel, { color: ts.text.onSurfaceVariant }]}>Privacy Guard</Text>
+                <View style={styles.infoValueRow}>
+                  <ShieldCheck size={12} color={ts.raw.successText} />
+                  <Text numberOfLines={2} style={[styles.infoValue, { color: ts.raw.successText }]}>
+                    Sent via your own AI key
+                  </Text>
+                </View>
+              </View>
+              <View style={[styles.infoCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+                <Text style={[styles.infoLabel, { color: ts.text.onSurfaceVariant }]}>Commit Safety</Text>
+                <Text numberOfLines={2} style={[styles.infoValue, { color: ts.text.onSurface }]}>Nothing saved yet</Text>
+              </View>
+            </View>
+
+            <View style={styles.actionStack}>
+              {phase === 'preflight' ? (
+                <PeachButton
+                  title="Scan receipt"
+                  onPress={handleScanNow}
+                  variant="primary"
+                  size="lg"
+                  fullWidth
+                  icon={<ScanLine size={16} color={Colors.white} />}
+                />
+              ) : (
+                <PeachButton
+                  title="Try again"
+                  onPress={() => { void handleRetryQueued(); }}
+                  variant="primary"
+                  size="lg"
+                  fullWidth
+                  icon={<RotateCcw size={16} color={Colors.white} />}
+                />
+              )}
+              <PeachButton
+                title={phase === 'preflight' ? 'Cancel' : 'Go Home'}
+                onPress={phase === 'preflight' ? leaveWithCleanup : handleGoHome}
+                variant="neutral"
+                size="lg"
+                fullWidth
+                icon={<Home size={16} color={ts.text.onSurface} />}
+              />
+              {phase === 'queued' ? (
+                <PeachButton
+                  title="Discard image"
+                  onPress={leaveWithCleanup}
+                  variant="outline"
+                  size="lg"
+                  fullWidth
+                  labelColor={ts.raw.danger}
+                />
+              ) : null}
+            </View>
           </View>
         ) : showRecovery && recovery && recoveryView ? (
           <View style={[styles.recoveryBlock, styles.errorBlock]}>
@@ -684,55 +960,8 @@ export default function ShareReceiveScreen() {
               <View style={styles.calloutBody}>
                 <Text style={[styles.calloutTitle, { color: ts.text.onSurface }]}>System Intent Detected</Text>
                 <Text style={[styles.calloutText, { color: ts.text.onSurfaceVariant }]}>
-                  Peach received an image from your device&apos;s share sheet. Starting automatic receipt scanning.
+                  Peach received an image from your device&apos;s share sheet. Reading it uses your own AI provider key.
                 </Text>
-              </View>
-            </View>
-
-            <View style={[styles.imageCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
-              <View style={[styles.imageArea, { backgroundColor: Gradients.light[0] }]}>
-                <Image
-                  source={ownedImageUri ? { uri: ownedImageUri } : undefined}
-                  style={styles.imageFill}
-                  contentFit="cover"
-                  transition={150}
-                  accessibilityLabel="Shared receipt image"
-                />
-                {imageMeta ? (
-                  <View style={[styles.metaChip, { backgroundColor: ts.bg.overlay }]}>
-                    <ImageIcon size={12} color={Colors.white} />
-                    <Text numberOfLines={1} style={styles.metaChipText}>{describeImageMeta(imageMeta)}</Text>
-                  </View>
-                ) : null}
-              </View>
-              <View style={styles.imageFooter}>
-                <View style={styles.imageFooterText}>
-                  <Text numberOfLines={1} style={[styles.imageTitle, { color: ts.text.onSurface }]}>
-                    Incoming Share Ingestion
-                  </Text>
-                  <Text numberOfLines={1} style={[styles.imageMeta, { color: ts.text.onSurfaceVariant }]}>
-                    Secure app copy ready for OCR
-                  </Text>
-                </View>
-                <View style={[styles.autoChip, { backgroundColor: ts.bg.primary5, borderColor: ts.border.primary20 }]}>
-                  <Text style={[styles.autoChipText, { color: ts.text.primary }]}>Auto</Text>
-                </View>
-              </View>
-            </View>
-
-            <View style={styles.infoGrid}>
-              <View style={[styles.infoCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
-                <Text style={[styles.infoLabel, { color: ts.text.onSurfaceVariant }]}>Privacy Guard</Text>
-                <View style={styles.infoValueRow}>
-                  <ShieldCheck size={12} color={ts.raw.successText} />
-                  <Text numberOfLines={2} style={[styles.infoValue, { color: ts.raw.successText }]}>
-                    Sent via your own AI key
-                  </Text>
-                </View>
-              </View>
-              <View style={[styles.infoCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
-                <Text style={[styles.infoLabel, { color: ts.text.onSurfaceVariant }]}>Commit Safety</Text>
-                <Text numberOfLines={2} style={[styles.infoValue, { color: ts.text.onSurface }]}>Nothing saved yet</Text>
               </View>
             </View>
           </View>
@@ -740,10 +969,11 @@ export default function ShareReceiveScreen() {
       </ScrollView>
 
       <AIProcessingOverlay
-        visible={processing && !showRecovery && !showSuccess}
+        visible={phase === 'processing'}
         contextLabel={PROCESSING_COPY.contextLabel}
         title={PROCESSING_COPY.title}
         description={PROCESSING_COPY.description}
+        steps={pipelineSteps(pipelineStage, 'share')}
         onCancel={handleCancelProcessing}
       />
 

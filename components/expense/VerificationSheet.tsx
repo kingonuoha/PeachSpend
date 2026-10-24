@@ -279,8 +279,7 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
 
   if (!isVisible && items.length === 0) return null;
 
-  const originLabel = origin === 'share' ? 'Shared Image' : 'Scan Origin';
-  const originBadge = `${originLabel} • ${origin === 'share' ? 'S-13' : 'S-04'}`;
+  const originLabel = origin === 'share' ? 'Shared image' : 'Camera scan';
 
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents={isVisible ? 'auto' : 'none'}>
@@ -320,7 +319,7 @@ export const VerificationSheet: React.FC<VerificationSheetProps> = ({
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexWrap: 'wrap' }}>
                     <Text style={[Typography.headlineMd, { color: ts.text.onSurface }]}>Verify Transaction</Text>
                     <View style={{ paddingHorizontal: Spacing.s2, paddingVertical: 2, borderRadius: Radii.full, backgroundColor: ts.bg.primary10, borderWidth: 1, borderColor: ts.border.primary20 }}>
-                      <Text style={[Typography.micro, { color: ts.text.primary, textTransform: 'uppercase' }]}>{originBadge}</Text>
+                      <Text style={[Typography.micro, { color: ts.text.primary, textTransform: 'uppercase' }]}>{originLabel}</Text>
                     </View>
                   </View>
                   <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, marginTop: 2 }]}>Verify parsed AI extraction before commit</Text>
