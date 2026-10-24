@@ -43,7 +43,7 @@ import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/t
 import { formatCurrency } from '../../utils/currency';
 import { resolveAvatarUri } from '../../utils/profileAvatar';
 import { profileDataService, settingsPort } from '../../services/DataServices';
-import { setThemeMode, setThemePack } from '../../data/ThemePackContracts';
+import { setThemeMode, setThemePack, THEME_PACKS } from '../../data/ThemePackContracts';
 import type { AchievementState, ProfileSnapshot } from '../../data/ProfileContracts';
 
 // S-05 Profile. Rebuilt as a replacement for the legacy screen: identity and
@@ -84,6 +84,18 @@ const SKELETON_SETTINGS_ROW_COUNT = 2;
 
 const THEME_PACK_FAILURE_MESSAGE = 'Could not change the theme pack. Please try again.';
 const THEME_MODE_FAILURE_MESSAGE = 'Could not change the appearance. Please try again.';
+
+// A pack tile previews the pack's own tokens before the user commits to it, so the
+// choice is visible rather than abstract. THEME_PACKS is the only place a pack's
+// variant exists, so the preview reads it instead of inventing swatch colours. A pack
+// that has no variant for the current mode falls back to the live tokens already on
+// screen, which is what the user is looking at.
+function packPreview(packId: string, mode: 'light' | 'dark'): { surface: string; accent: string; muted: string } | null {
+  const definition = THEME_PACKS.find((pack) => pack.id === packId);
+  if (!definition) return null;
+  const variant = definition.variants[mode];
+  return { surface: variant.surface, accent: variant.primary, muted: variant.onSurfaceVariant };
+}
 
 // BUG-09-11b. The profile snapshot reads the ledger (expenses, streak, badges), so
 // only a ledger write invalidates it. Theme and appearance writes go straight to
@@ -246,17 +258,17 @@ function ProfileSkeleton() {
               </View>
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.s2 }}>
                 {Array.from({ length: SKELETON_PACK_COUNT }).map((_, index) => (
-                  <Skeleton key={index} width="22%" height={61} borderRadius={Radii.sm} style={{ minWidth: 64 }} />
+                  <Skeleton key={index} width="22%" height={72} borderRadius={Radii.sm} style={{ minWidth: 72 }} />
                 ))}
               </View>
-              <View style={{ marginTop: Spacing.s4, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: ts.raw.outline, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
+              <View style={{ marginTop: Spacing.s4, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: ts.raw.outline, flexDirection: 'row', flexWrap: 'wrap', rowGap: Spacing.s2, alignItems: 'center', justifyContent: 'space-between' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, flexShrink: 1, minWidth: 0 }}>
                   <Skeleton width={108} height={16} />
                   <Skeleton width={72} height={13} />
                 </View>
-                <View style={{ backgroundColor: ts.bg.low, borderWidth: 1, borderColor: ts.raw.outline, borderRadius: Radii.sm, padding: 2, flexDirection: 'row' }}>
-                  <Skeleton width={48} height={21} borderRadius={Radii.sm} />
-                  <Skeleton width={44} height={21} borderRadius={Radii.sm} />
+                <View style={{ backgroundColor: ts.bg.low, borderWidth: 1, borderColor: ts.raw.outline, borderRadius: Radii.sm, padding: 2, flexDirection: 'row', gap: Spacing.s1 }}>
+                  <Skeleton width={60} height={44} borderRadius={Radii.sm} />
+                  <Skeleton width={60} height={44} borderRadius={Radii.sm} />
                 </View>
               </View>
             </LuminousCard>
@@ -589,12 +601,42 @@ export default function ProfileScreen() {
 
                 <View style={{ flex: 1, minWidth: 0 }}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s1 }}>
-                    <Text
-                      numberOfLines={1}
-                      style={[Typography.headlineMd, { color: '#FFFFFF', flexShrink: 1 }]}
-                    >
-                      {snapshot.displayName || 'Add your name'}
-                    </Text>
+                    {snapshot.displayName.trim() ? (
+                      <Text
+                        numberOfLines={1}
+                        style={[Typography.headlineMd, { color: '#FFFFFF', flexShrink: 1 }]}
+                      >
+                        {snapshot.displayName}
+                      </Text>
+                    ) : (
+                      /* An empty name is an invitation, not a gap. The outline and tint
+                         come from the hero's own white glass stops (0.15, 0.20, 0.30 and
+                         0.70 are already used in this card), so the emphasis adds no new
+                         colour and stays legible over both gradient variants. */
+                      <ScalePressable
+                        accessibilityRole="button"
+                        accessibilityLabel="Add your name and photo"
+                        onPress={(event) => {
+                          rememberFocusTrigger(event);
+                          setEditing(true);
+                        }}
+                        style={{
+                          flexShrink: 1,
+                          minHeight: 28,
+                          justifyContent: 'center',
+                          paddingHorizontal: Spacing.s2,
+                          paddingVertical: 2,
+                          borderRadius: Radii.full,
+                          borderWidth: 1,
+                          borderColor: 'rgba(255,255,255,0.60)',
+                          backgroundColor: 'rgba(255,255,255,0.12)',
+                        }}
+                      >
+                        <Text numberOfLines={1} style={[Typography.labelMd, { color: '#FFFFFF', fontFamily: 'Manrope_700Bold' }]}>
+                          Add your name
+                        </Text>
+                      </ScalePressable>
+                    )}
                     {/* POLISH Section 7: the pill renders 21pt tall, so hitSlop lifts
                         the target to 49pt without changing the rendered box. */}
                     <ScalePressable
@@ -649,12 +691,15 @@ export default function ProfileScreen() {
                   </View>
                   <View style={{ flex: 1, minWidth: 0 }}>
                     <Text style={[Typography.labelBold, { color: '#FFFFFF' }]} numberOfLines={1}>
-                      {snapshot.stats.streak > 0 ? `${snapshot.stats.streak} Day Streak` : 'Start a streak'}
+                      {snapshot.stats.streak > 0 ? `${snapshot.stats.streak} Day Streak` : 'Start Day 1'}
                     </Text>
-                    <Text style={[Typography.micro, { color: 'rgba(255,255,255,0.70)' }]} numberOfLines={1}>
+                    {/* DEC-11-05 and B4-2: a zero streak is framed as the first day to
+                        invite the next action, and it still says plainly that no streak
+                        exists yet. It never claims a day count the ledger does not hold. */}
+                    <Text style={[Typography.micro, { color: 'rgba(255,255,255,0.70)' }]} numberOfLines={2}>
                       {snapshot.stats.streak > 0
                         ? `Logged expenses ${snapshot.stats.streak} consecutive days`
-                        : 'Log an expense to begin your streak'}
+                        : 'Log an expense today to start your streak'}
                     </Text>
                   </View>
                 </ScalePressable>
@@ -850,53 +895,71 @@ export default function ProfileScreen() {
               <View accessibilityRole="radiogroup" accessibilityLabel="App theme pack" style={{ flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.s2 }}>
                 {snapshot.themePack.packs.map((pack) => {
                   const selected = pack.id === snapshot.themePack.activePackId;
+                  // The preview reads the pack's own variant for the active appearance
+                  // mode. It is null only for a pack the registry does not define, and
+                  // then the tile falls back to the live tokens already on screen.
+                  const preview = packPreview(pack.id, snapshot.themePack.mode);
                   return (
                     <ScalePressable
                       key={pack.id}
                       accessibilityRole="radio"
-                      accessibilityLabel={pack.label}
+                      accessibilityLabel={preview ? `${pack.label} theme preview` : pack.label}
                       accessibilityState={{ selected, disabled: themeBusy }}
                       disabled={themeBusy}
                       onPress={() => applyThemePack(pack.id)}
                       style={{
                         flexBasis: '22%',
                         flexGrow: 1,
-                        minWidth: 64,
+                        minWidth: 72,
                         borderRadius: Radii.sm,
                         borderWidth: 2,
                         borderColor: selected ? ts.raw.primary : ts.raw.outline,
                         backgroundColor: ts.bg.low,
                         paddingVertical: Spacing.s2,
+                        paddingHorizontal: Spacing.s1,
                         alignItems: 'center',
                         gap: Spacing.s1,
                       }}
                     >
+                      {/* A miniature of the real surface and accent, so the pack is
+                          visible before the user commits to it. */}
                       <View
+                        pointerEvents="none"
+                        importantForAccessibility="no-hide-descendants"
                         style={{
-                          width: 28,
-                          height: 28,
-                          borderRadius: Radii.full,
-                          backgroundColor: selected ? snapshot.themePack.palette.primary : ts.raw.surfaceContainerHighest,
-                          alignItems: 'center',
-                          justifyContent: 'center',
+                          width: '100%',
+                          borderRadius: Radii.sm,
+                          borderWidth: 1,
+                          borderColor: ts.raw.outline,
+                          backgroundColor: preview?.surface ?? ts.raw.surface,
+                          padding: Spacing.s1,
+                          gap: 3,
                         }}
                       >
-                        {selected ? <Check size={14} color="#FFFFFF" /> : null}
+                        <View style={{ height: 6, width: '72%', borderRadius: 3, backgroundColor: preview?.accent ?? ts.raw.primary }} />
+                        <View style={{ height: 4, width: '46%', borderRadius: 2, backgroundColor: preview?.muted ?? ts.raw.onSurfaceVariant, opacity: 0.5 }} />
+                        <View style={{ height: 4, width: '62%', borderRadius: 2, backgroundColor: preview?.muted ?? ts.raw.onSurfaceVariant, opacity: 0.3 }} />
                       </View>
-                      <Text style={[Typography.micro, { color: ts.raw.onSurface, fontFamily: 'Manrope_700Bold' }]} numberOfLines={1}>
-                        {pack.label}
-                      </Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                        {selected ? <Check size={12} color={ts.raw.primary} /> : null}
+                        <Text style={[Typography.micro, { color: ts.raw.onSurface, fontFamily: 'Manrope_700Bold' }]} numberOfLines={1}>
+                          {pack.label}
+                        </Text>
+                      </View>
                     </ScalePressable>
                   );
                 })}
               </View>
 
-              <View style={{ marginTop: Spacing.s4, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: ts.raw.outline, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
+              {/* B4-2: the two segments render at 44pt with a real gap between them,
+                  so a one handed tap cannot land on the wrong side. The row wraps at
+                  narrow widths instead of letting the control run off the card. */}
+              <View style={{ marginTop: Spacing.s4, paddingTop: Spacing.s3, borderTopWidth: 1, borderTopColor: ts.raw.outline, flexDirection: 'row', flexWrap: 'wrap', rowGap: Spacing.s2, alignItems: 'center', justifyContent: 'space-between' }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, flexShrink: 1, minWidth: 0 }}>
                   <Text style={[Typography.labelMd, { color: ts.raw.onSurface, fontFamily: 'Manrope_600SemiBold' }]}>Appearance Mode</Text>
                   <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>(Independent)</Text>
                 </View>
-                <View accessibilityRole="radiogroup" accessibilityLabel="Appearance mode" style={{ flexDirection: 'row', backgroundColor: ts.bg.low, borderWidth: 1, borderColor: ts.raw.outline, borderRadius: Radii.sm, padding: 2 }}>
+                <View accessibilityRole="radiogroup" accessibilityLabel="Appearance mode" style={{ flexDirection: 'row', backgroundColor: ts.bg.low, borderWidth: 1, borderColor: ts.raw.outline, borderRadius: Radii.sm, padding: 2, gap: Spacing.s1 }}>
                   {(['light', 'dark'] as const).map((mode) => {
                     const selected = snapshot.themePack.mode === mode;
                     return (
@@ -907,13 +970,12 @@ export default function ProfileScreen() {
                         accessibilityState={{ selected, disabled: themeBusy }}
                         disabled={themeBusy}
                         onPress={() => applyThemeMode(mode)}
-                        /* POLISH Section 7: the control renders 21pt tall, so hitSlop
-                           lifts the target to 49pt. Horizontal slop stays zero so the
-                           two adjacent segments never overlap each other. */
-                        hitSlop={{ top: 14, bottom: 14 }}
                         style={{
-                          paddingHorizontal: Spacing.s3,
-                          paddingVertical: Spacing.s1,
+                          minHeight: 44,
+                          minWidth: 60,
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          paddingHorizontal: Spacing.s2,
                           borderRadius: Radii.sm,
                           backgroundColor: selected ? ts.raw.surface : 'transparent',
                         }}
@@ -953,7 +1015,7 @@ export default function ProfileScreen() {
                   <View style={{ flex: 1, minWidth: 0 }}>
                     <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>App Settings</Text>
                     <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
-                      Budget, AI providers, categories and stewardship (S-06)
+                      Budget, AI providers, categories and data management
                     </Text>
                   </View>
                 </View>

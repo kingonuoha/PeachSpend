@@ -96,6 +96,10 @@ import {
 const MAX_CONTENT_WIDTH = 640;
 const ICON_CHIP = 32;
 const ROW_MIN_HEIGHT = 56;
+// B4-3: the back control keeps its proportionate visual circle and gets a real 44pt
+// target by growing the circle to 40 and the slop to 4 on each side, which is 48.
+const HEADER_CIRCLE = 40;
+const HEADER_CIRCLE_SLOP = 4;
 // BUG-09-11b. The ledger rows this screen reads on demand feed the export and the
 // currency conversion dialogs, so a read failure has to be stated rather than
 // leaving a dialog showing nothing.
@@ -106,28 +110,41 @@ const SETTINGS_FRESHNESS_DOMAINS = ['ledger'] as const;
 // Reference currency list for the SH-06a candidate options. Shared reference data
 // only, the same set onboarding offers; symbols and names come from utils/currency.
 const SUPPORTED_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'NGN', 'CAD', 'AUD'] as const;
-// Decorative code preview surface. The export sample block has no functional
-// theme token in the pair, so it keeps a fixed dark code look in both modes.
-const CODE_SURFACE = '#17162A';
-const CODE_TEXT = '#D7D3E6';
-const CODE_MUTED = '#8B8B99';
+
+// B4-3: the export preview names its columns instead of printing a comma separated
+// header. The record is keyed by the sample row contract, so a column added to or
+// removed from the export shape fails the type check here rather than leaving the
+// summary describing a file that changed underneath it.
+type ExportSampleRowShape = ExportPreview['sample'][number];
+const EXPORT_COLUMN_LABELS: Record<keyof ExportSampleRowShape, string> = {
+  date: 'Date',
+  merchant: 'Merchant',
+  amount: 'Amount',
+  currency: 'Currency',
+  category: 'Category',
+};
+const EXPORT_COLUMN_SUMMARY = (Object.keys(EXPORT_COLUMN_LABELS) as (keyof ExportSampleRowShape)[])
+  .map((key) => EXPORT_COLUMN_LABELS[key])
+  .join(', ');
 
 // Data Stewardship copy is built from the D8/D9 scope facts so the dialog can
 // never claim a wider or narrower clear than the database and the media erasure
 // boundary perform (S-06R-01, S-06R-02). The key-to-label maps are presentation
-// only; every action named here is read from the exported scope constants.
+// only; every action named here is read from the exported scope constants. B4-3:
+// the labels are written in plain human terms, because the scope keys that named
+// database tables were never meant for a user to read.
 const CLEAR_SCOPE_LABELS: Record<string, string> = {
-  expenses: 'expenses',
-  income: 'income',
-  chat_expense_confirmations: 'chat expense confirmations',
-  capture_events: 'capture records',
-  capture_queue: 'queued captures',
+  expenses: 'expense records',
+  income: 'income records',
+  chat_expense_confirmations: 'expenses you saved from chat',
+  capture_events: 'auto-capture history',
+  capture_queue: 'pending auto-captures',
 };
 const KEPT_SCOPE_LABELS: Record<string, string> = {
-  categories: 'categories',
-  settings: 'settings and budgets',
-  api_keys: 'stored provider keys',
-  achievements: 'achievements',
+  categories: 'your categories',
+  settings: 'your settings and budget',
+  api_keys: 'your saved provider keys',
+  achievements: 'your badges',
   merchant_category_memory: 'merchant memory',
 };
 type MediaScopeKey = 'receiptImages' | 'profileAvatars' | 'exportFiles';
@@ -163,26 +180,26 @@ const CLEAR_MEDIA = mediaLabels(CLEAR_ALL_DATA_MEDIA_SCOPE);
 const RESET_MEDIA = mediaLabels(RESET_APP_MEDIA_SCOPE);
 
 const CLEAR_ROW_SUBTITLE =
-  `Removes ${joinLabels(CLEARED_RECORDS)} and their ${joinLabels(CLEAR_MEDIA)}; ` +
-  `keeps ${joinLabels(KEPT_RECORDS)}.`;
+  `Deletes ${joinLabels(CLEARED_RECORDS)} and their ${joinLabels(CLEAR_MEDIA)}. ` +
+  `Keeps ${joinLabels(KEPT_RECORDS)}.`;
 const RESET_ROW_SUBTITLE =
-  `Erases all local data and keys, and removes ${joinLabels(RESET_MEDIA)}; returns to onboarding.`;
+  `Deletes every financial record, every saved provider key and ${joinLabels(RESET_MEDIA)}, and returns the app to setup.`;
 const CLEAR_DIALOG_BODY =
-  `This removes ${joinLabels(CLEARED_RECORDS)} from this device, along with their ` +
-  `${joinLabels(CLEAR_MEDIA)}. ${capitalizeFirst(joinLabels(KEPT_RECORDS))} are kept.`;
+  `This deletes ${joinLabels(CLEARED_RECORDS)} from this device, along with their ` +
+  `${joinLabels(CLEAR_MEDIA)}. ${capitalizeFirst(joinLabels(KEPT_RECORDS))} stay exactly as they are.`;
 const RESET_DIALOG_BODY =
-  `This erases all local database content and every stored provider key, and removes ` +
-  `${joinLabels(RESET_MEDIA)}. The app returns to onboarding.`;
+  `This deletes every financial record and every saved provider key, and removes ` +
+  `${joinLabels(RESET_MEDIA)}. The app returns to setup with nothing in it.`;
 const CLEAR_IMPACT = [
-  `Removed: ${capitalizeFirst(joinLabels(CLEARED_RECORDS))}`,
-  `Removed media: ${capitalizeFirst(joinLabels(CLEAR_MEDIA))}`,
+  `Deleted: ${capitalizeFirst(joinLabels(CLEARED_RECORDS))}`,
+  `Deleted files: ${capitalizeFirst(joinLabels(CLEAR_MEDIA))}`,
   `Kept: ${capitalizeFirst(joinLabels(KEPT_RECORDS))}`,
 ];
 const RESET_IMPACT = [
-  'All local database content is cleared',
-  'Stored provider keys are deleted',
-  `Removed media: ${capitalizeFirst(joinLabels(RESET_MEDIA))}`,
-  'Returns to onboarding',
+  'Deleted: every financial record',
+  'Deleted: every saved provider key',
+  `Deleted files: ${capitalizeFirst(joinLabels(RESET_MEDIA))}`,
+  'Afterwards: the app returns to setup',
 ];
 
 function initialsOf(name: string): string {
@@ -195,10 +212,6 @@ function initialsOf(name: string): string {
 function formatMemberSince(timestamp: number | null): string | null {
   if (!timestamp) return null;
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
-}
-
-function formatSampleDate(timestamp: number): string {
-  return new Date(timestamp).toISOString().slice(0, 10);
 }
 
 type ThemeRaw = ReturnType<typeof useThemeStyles>['raw'];
@@ -241,9 +254,9 @@ function SettingsSkeleton() {
         <View style={styles.headerCircle} />
       </View>
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]}>
-        {/* Account & Identity */}
+        {/* Daily Preferences */}
         <View>
-          <Skeleton width={120} height={11} style={styles.skeletonSectionLabel} />
+          <Skeleton width={140} height={11} style={styles.skeletonSectionLabel} />
           <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
             <View style={styles.profileRow}>
               <View style={styles.rowLeft}>
@@ -255,13 +268,6 @@ function SettingsSkeleton() {
               </View>
               <Skeleton width={64} height={36} borderRadius={Radii.full} />
             </View>
-          </LuminousCard>
-        </View>
-
-        {/* Preferences & Core Setup */}
-        <View>
-          <Skeleton width={180} height={11} style={styles.skeletonSectionLabel} />
-          <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
             <View style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
               <View style={styles.rowLeft}>
                 <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
@@ -285,7 +291,7 @@ function SettingsSkeleton() {
                 <Skeleton width={40} height={32} borderRadius={Radii.sm} />
               </View>
             </View>
-            <View style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
+            <View style={styles.row}>
               <View style={styles.rowLeft}>
                 <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
                 <View style={[styles.rowText, styles.skeletonStack]}>
@@ -298,15 +304,44 @@ function SettingsSkeleton() {
                 <Skeleton width={12} height={12} />
               </View>
             </View>
-            <View style={styles.row}>
-              <View style={styles.rowLeft}>
-                <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
-                <View style={[styles.rowText, styles.skeletonStack]}>
-                  <Skeleton width="40%" height={14} />
-                  <Skeleton width="60%" height={11} />
+          </LuminousCard>
+        </View>
+
+        {/* Financial System */}
+        <View>
+          <Skeleton width={150} height={11} style={styles.skeletonSectionLabel} />
+          <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
+            {Array.from({ length: 3 }).map((_, index) => (
+              <View
+                key={index}
+                style={[styles.row, index < 2 ? styles.rowDivider : null, index < 2 ? { borderBottomColor: ts.raw.outline } : null]}
+              >
+                <View style={styles.rowLeft}>
+                  <Skeleton width={ICON_CHIP} height={ICON_CHIP} />
+                  <View style={[styles.rowText, styles.skeletonStack]}>
+                    <Skeleton width="55%" height={14} />
+                    <Skeleton width="70%" height={11} />
+                  </View>
                 </View>
+                <Skeleton width={12} height={12} />
               </View>
-            </View>
+            ))}
+          </LuminousCard>
+        </View>
+
+        {/* Data Vault and Privacy */}
+        <View>
+          <Skeleton width={180} height={11} style={styles.skeletonSectionLabel} />
+          <LuminousCard variant="low" style={[styles.card, styles.stewardCard, { backgroundColor: ts.raw.surface }]}>
+            {Array.from({ length: 3 }).map((_, index) => (
+              <View key={index} style={styles.actionRow}>
+                <View style={[styles.rowText, styles.skeletonStack]}>
+                  <Skeleton width="60%" height={14} />
+                  <Skeleton width="90%" height={11} />
+                </View>
+                <Skeleton width={72} height={32} borderRadius={Radii.sm} />
+              </View>
+            ))}
           </LuminousCard>
         </View>
       </ScrollView>
@@ -338,6 +373,10 @@ export default function SettingsScreen() {
   const [budgetDraft, setBudgetDraft] = useState('');
   const [budgetError, setBudgetError] = useState<string | null>(null);
   const [budgetSaving, setBudgetSaving] = useState(false);
+  // D6 suggestion, offered only when there is no budget yet. Null means "no
+  // suggestion", which renders as nothing rather than a made up amount.
+  const [budgetSuggestion, setBudgetSuggestion] = useState<{ amount: number; currency: string } | null>(null);
+  const [budgetSuggestionLoading, setBudgetSuggestionLoading] = useState(false);
   const [themeBusy, setThemeBusy] = useState(false);
 
   const [editingProfile, setEditingProfile] = useState(false);
@@ -410,7 +449,26 @@ export default function SettingsScreen() {
   const startBudgetEdit = () => {
     setBudgetDraft(settingsSnapshot.budget > 0 ? String(settingsSnapshot.budget) : '');
     setBudgetError(null);
+    setBudgetSuggestion(null);
     setBudgetEditing(true);
+    // D6 is asked for only when there is nothing to edit, so an existing budget is
+    // never replaced by a suggestion. A null result, a different currency, or a read
+    // failure all leave the editor alone; none of them produce an amount.
+    if (settingsSnapshot.budget <= 0) void loadBudgetSuggestion();
+  };
+
+  const loadBudgetSuggestion = async () => {
+    setBudgetSuggestionLoading(true);
+    try {
+      const suggestion = await databaseService.getSuggestedMonthlyBudget();
+      if (suggestion && suggestion.currency === settingsSnapshot.budgetCurrency) {
+        setBudgetSuggestion(suggestion);
+      }
+    } catch {
+      // No suggestion is an honest outcome here, not a failure the user must act on.
+    } finally {
+      setBudgetSuggestionLoading(false);
+    }
   };
 
   const saveBudget = async () => {
@@ -618,12 +676,6 @@ export default function SettingsScreen() {
     </Text>
   );
 
-  const sectionLabelInline = (label: string) => (
-    <Text style={[Typography.captionBold, styles.sectionLabelInline, { color: ts.raw.onSurfaceVariant }]}>
-      {label}
-    </Text>
-  );
-
   const iconChip = (node: React.ReactNode, background: string) => (
     <View style={[styles.iconChip, { backgroundColor: background }]}>{node}</View>
   );
@@ -638,7 +690,7 @@ export default function SettingsScreen() {
           onPress={() => (router.canGoBack() ? router.back() : router.replace('/(tabs)/profile'))}
           accessibilityRole="button"
           accessibilityLabel="Back"
-          hitSlop={4}
+          hitSlop={HEADER_CIRCLE_SLOP}
           style={[styles.headerCircle, { backgroundColor: ts.bg.card, borderColor: ts.raw.outline }]}
         >
           <ArrowLeft size={18} color={ts.raw.onSurface} />
@@ -672,9 +724,10 @@ export default function SettingsScreen() {
           contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]}
           keyboardShouldPersistTaps="handled"
         >
-          {/* Section 1: Account & Identity */}
+          {/* Group 1: Daily Preferences. Identity, appearance, budget, currency and the
+              AI provider link, all in one card. Grouping only, nothing collapsible. */}
           <View>
-            {sectionLabel('Account & Identity')}
+            {sectionLabel('Daily Preferences')}
             <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
               <ScalePressable
                 onPress={() => setEditingProfile(true)}
@@ -717,13 +770,9 @@ export default function SettingsScreen() {
                   <ChevronRight size={13} color={ts.raw.primary} />
                 </View>
               </ScalePressable>
-            </LuminousCard>
-          </View>
 
-          {/* Section 2: Preferences & Core Setup */}
-          <View>
-            {sectionLabel('Preferences & Core Setup')}
-            <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
+              <View style={[styles.divider, { backgroundColor: ts.raw.outline }]} />
+
               {/* Appearance: light/dark only, independent of the theme pack */}
               <View style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
                 <View style={styles.rowLeft}>
@@ -750,6 +799,26 @@ export default function SettingsScreen() {
                   thumbColor="#FFFFFF"
                 />
               </View>
+
+              {/* Notification Channels. DEC-11-08: alerts are a daily preference, so
+                  this row lives here and not with the financial workflow modules. */}
+              <ScalePressable
+                onPress={() => router.push('/notifications')}
+                accessibilityRole="button"
+                accessibilityLabel="Notification channels"
+                style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}
+              >
+                <View style={styles.rowLeft}>
+                  {iconChip(<Bell size={16} color={ts.raw.danger} />, ts.raw.dangerSoft)}
+                  <View style={styles.rowText}>
+                    <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Notification Channels</Text>
+                    <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+                      Recap and threshold digests
+                    </Text>
+                  </View>
+                </View>
+                {chevron}
+              </ScalePressable>
 
               {/* Monthly Budget: display + inline editor */}
               <View style={[styles.rowBlock, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}>
@@ -780,6 +849,31 @@ export default function SettingsScreen() {
                     </ScalePressable>
                   </View>
                 </View>
+
+                {budgetEditing && budgetSuggestion ? (
+                  /* D6 anchor: a real trailing 30 day figure, offered rather than
+                     applied, so a blank field is never the only starting point. */
+                  <View style={[styles.budgetSuggestion, { backgroundColor: ts.bg.primary10, borderColor: ts.raw.primaryBorder + '40' }]}>
+                    <Text style={[Typography.micro, { color: ts.raw.onSurface, flex: 1 }]}>
+                      Based on your last 30 days: {formatCurrency(budgetSuggestion.amount, budgetSuggestion.currency)}
+                    </Text>
+                    <PeachButton
+                      title="Apply"
+                      onPress={() => {
+                        setBudgetDraft(String(budgetSuggestion.amount));
+                        setBudgetError(null);
+                      }}
+                      variant="secondary"
+                      size="xs"
+                      accessibilityLabel="Apply the suggested monthly budget"
+                    />
+                  </View>
+                ) : null}
+                {budgetEditing && budgetSuggestionLoading && !budgetSuggestion ? (
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant, marginTop: Spacing.s2, paddingHorizontal: Spacing.s4 }]}>
+                    Checking your recent spending for a starting point
+                  </Text>
+                ) : null}
 
                 {budgetEditing ? (
                   <View style={[styles.budgetTray, { borderTopColor: ts.raw.outline }]}>
@@ -814,6 +908,7 @@ export default function SettingsScreen() {
                       onPress={() => {
                         setBudgetEditing(false);
                         setBudgetError(null);
+                        setBudgetSuggestion(null);
                       }}
                       variant="quiet"
                       size="xs"
@@ -852,7 +947,7 @@ export default function SettingsScreen() {
                 </View>
               </ScalePressable>
 
-              {/* AI Provider -> S-17, link only, no key field here */}
+              {/* AI Provider -> the AI settings screen, link only, no key field here */}
               <ScalePressable
                 onPress={() => router.push('/settings/chat')}
                 accessibilityRole="button"
@@ -862,17 +957,10 @@ export default function SettingsScreen() {
                 <View style={styles.rowLeft}>
                   {iconChip(<Sparkles size={16} color={ts.raw.primary} />, ts.raw.purple100)}
                   <View style={styles.rowText}>
-                    <View style={styles.titleRow}>
-                      <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>
-                        AI Provider &amp; Keys
-                      </Text>
-                      <View style={[styles.tagChip, { backgroundColor: ts.raw.warningContainer }]}>
-                        <Text style={[Typography.micro, { color: ts.raw.warningContainerText, fontFamily: 'Manrope_700Bold' }]}>
-                          S-17 Hub
-                        </Text>
-                      </View>
-                    </View>
-                    <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+                    <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>
+                      AI Provider &amp; Keys
+                    </Text>
+                    <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
                       Manage provider keys and model selection
                     </Text>
                   </View>
@@ -897,9 +985,9 @@ export default function SettingsScreen() {
             </LuminousCard>
           </View>
 
-          {/* Section 3: Sub-Systems & Workflows */}
+          {/* Group 2: Financial System. Every workflow module that shapes the ledger. */}
           <View>
-            {sectionLabel('Sub-Systems & Workflows')}
+            {sectionLabel('Financial System')}
             <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
               <ScalePressable
                 onPress={() => router.push('/settings/categories')}
@@ -967,7 +1055,7 @@ export default function SettingsScreen() {
                 onPress={() => router.push('/import')}
                 accessibilityRole="button"
                 accessibilityLabel="Statement and CSV import"
-                style={[styles.row, styles.rowDivider, { borderBottomColor: ts.raw.outline }]}
+                style={styles.row}
               >
                 <View style={styles.rowLeft}>
                   {iconChip(<Download size={16} color={ts.raw.primary} />, ts.bg.primary10)}
@@ -980,35 +1068,13 @@ export default function SettingsScreen() {
                 </View>
                 {chevron}
               </ScalePressable>
-
-              <ScalePressable
-                onPress={() => router.push('/notifications')}
-                accessibilityRole="button"
-                accessibilityLabel="Notification channels"
-                style={styles.row}
-              >
-                <View style={styles.rowLeft}>
-                  {iconChip(<Bell size={16} color={ts.raw.danger} />, ts.raw.dangerSoft)}
-                  <View style={styles.rowText}>
-                    <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Notification Channels</Text>
-                    <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
-                      Recap and threshold digests
-                    </Text>
-                  </View>
-                </View>
-                {chevron}
-              </ScalePressable>
             </LuminousCard>
           </View>
 
-          {/* Section 4: Data Portability & Stewardship */}
+          {/* Group 3: Data Vault and Privacy. Export, restore, the two destructive
+              actions, and the app level policy and help rows, in one card. */}
           <View>
-            <View style={styles.sectionHeadRow}>
-              {sectionLabelInline('Data Portability & Stewardship')}
-              <Text style={[Typography.micro, { color: ts.raw.primary, fontFamily: 'Manrope_600SemiBold' }]}>
-                SQLite Offline First
-              </Text>
-            </View>
+            {sectionLabel('Data Vault and Privacy')}
             <LuminousCard variant="low" style={[styles.card, styles.stewardCard, { backgroundColor: ts.raw.surface }]}>
               <View style={styles.exportRow}>
                 <View style={styles.rowText}>
@@ -1105,13 +1171,9 @@ export default function SettingsScreen() {
                   size="xs"
                 />
               </View>
-            </LuminousCard>
-          </View>
 
-          {/* Section 5: About & Support */}
-          <View>
-            {sectionLabel('About & Support')}
-            <LuminousCard variant="low" style={[styles.card, { backgroundColor: ts.raw.surface }]}>
+              <View style={[styles.divider, { backgroundColor: ts.raw.outline }]} />
+
               <ScalePressable
                 onPress={() => router.push('/privacy-policy')}
                 accessibilityRole="button"
@@ -1139,15 +1201,21 @@ export default function SettingsScreen() {
                 <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Release Notes</Text>
                 {chevron}
               </ScalePressable>
+
+              {/* DEC-11-08: the version row belongs to this group too. It is one block
+                  of two lines, so both move together and neither is dropped. */}
+              <View style={[styles.divider, { backgroundColor: ts.raw.outline }]} />
+              <View style={styles.footerRow}>
+                {appVersion ? (
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant, textAlign: 'center' }]}>
+                    PeachSpend v{appVersion}
+                  </Text>
+                ) : null}
+                <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant, textAlign: 'center' }]}>
+                  Your financial data stays on device
+                </Text>
+              </View>
             </LuminousCard>
-            <View style={styles.footer}>
-              {appVersion ? (
-                <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>PeachSpend v{appVersion}</Text>
-              ) : null}
-              <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant, textAlign: 'center' }]}>
-                Your financial data stays on device
-              </Text>
-            </View>
           </View>
         </ScrollView>
       )}
@@ -1202,24 +1270,46 @@ export default function SettingsScreen() {
               </View>
             </View>
 
-            <ScrollView style={[styles.codeBlock, { backgroundColor: CODE_SURFACE }]} contentContainerStyle={styles.codeBlockContent}>
-              <Text style={[styles.codeText, { color: CODE_MUTED }]}>
-                {'date,merchant,amount,currency,category'}
-              </Text>
+            <View style={[styles.exportSummary, { backgroundColor: ts.bg.low, borderColor: ts.raw.outline }]}>
+              <View style={styles.exportSummaryHead}>
+                <View style={styles.rowText}>
+                  <Text style={[Typography.labelBold, { color: ts.raw.onSurface }]}>Spreadsheet columns</Text>
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
+                    {EXPORT_COLUMN_SUMMARY}
+                  </Text>
+                </View>
+                <View style={[styles.readyBadge, { backgroundColor: ts.raw.successContainer }]}>
+                  <Text style={[Typography.micro, { color: ts.raw.statusSuccessText, fontFamily: 'Manrope_700Bold' }]}>
+                    CSV Spreadsheet Ready
+                  </Text>
+                </View>
+              </View>
+
               {(exportPreview?.sample ?? []).map((row, index) => (
-                <Text key={`${row.date}-${index}`} style={[styles.codeText, { color: CODE_TEXT }]}>
-                  {`${formatSampleDate(row.date)},${row.merchant},${row.amount.toFixed(2)},${row.currency},${row.category}`}
-                </Text>
+                <View key={`${row.date}-${index}`} style={[styles.exportSampleRow, { borderTopColor: ts.raw.outline }]}>
+                  <View style={styles.rowText}>
+                    <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.raw.onSurface }]}>
+                      {row.merchant}
+                    </Text>
+                    <Text numberOfLines={1} style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+                      {new Date(row.date).toLocaleDateString()} | {row.category}
+                    </Text>
+                  </View>
+                  <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.labelBold, { color: ts.raw.onSurface }]}>
+                    {formatCurrency(row.amount, row.currency)}
+                  </Text>
+                </View>
               ))}
+
               {exportPreview && exportPreview.validRowCount > exportPreview.sample.length ? (
-                <Text style={[styles.codeText, { color: CODE_MUTED }]}>
-                  {`... (+${exportPreview.validRowCount - exportPreview.sample.length} more records)`}
+                <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+                  {`and ${exportPreview.validRowCount - exportPreview.sample.length} more rows`}
                 </Text>
               ) : null}
               {exportPreview && exportPreview.validRowCount === 0 ? (
-                <Text style={[styles.codeText, { color: CODE_MUTED }]}>No exportable records yet.</Text>
+                <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>No exportable records yet.</Text>
               ) : null}
-            </ScrollView>
+            </View>
 
             {exportError ? (
               <Text accessibilityLiveRegion="polite" style={[Typography.micro, { color: ts.raw.danger, marginBottom: Spacing.s2 }]}>
@@ -1288,7 +1378,7 @@ export default function SettingsScreen() {
             <View style={styles.dialogActions}>
               <View style={{ flex: 1 }}>
                 <PeachButton
-                  title="Cancel Safe"
+                  title="Keep My Data"
                   onPress={() => setPendingAction(null)}
                   variant="quiet"
                   size="md"
@@ -1298,7 +1388,7 @@ export default function SettingsScreen() {
               </View>
               <View style={{ flex: 1 }}>
                 <PeachButton
-                  title={pendingAction === 'reset_app' ? 'Erase Everything' : 'Clear Transactions'}
+                  title={pendingAction === 'reset_app' ? 'Reset Everything' : 'Clear Transactions'}
                   onPress={() => void confirmStewardship()}
                   variant="destructive"
                   size="md"
@@ -1347,8 +1437,8 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
   },
   headerCircle: {
-    width: 36,
-    height: 36,
+    width: HEADER_CIRCLE,
+    height: HEADER_CIRCLE,
     borderRadius: Radii.full,
     borderWidth: 1,
     alignItems: 'center',
@@ -1373,17 +1463,6 @@ const styles = StyleSheet.create({
     marginBottom: Spacing.s2,
   },
   skeletonStack: { gap: Spacing.s1 },
-  sectionLabelInline: {
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
-    paddingHorizontal: Spacing.s1,
-  },
-  sectionHeadRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: Spacing.s2,
-  },
   card: { padding: 0, borderRadius: Radii.md },
   row: {
     flexDirection: 'row',
@@ -1441,10 +1520,15 @@ const styles = StyleSheet.create({
     minHeight: 32,
     justifyContent: 'center',
   },
-  tagChip: {
-    paddingHorizontal: Spacing.s2,
-    paddingVertical: 2,
+  budgetSuggestion: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    marginTop: Spacing.s2,
+    marginHorizontal: Spacing.s4,
     borderRadius: Radii.sm,
+    borderWidth: 1,
+    padding: Spacing.s2,
   },
   budgetTray: {
     flexDirection: 'row',
@@ -1494,7 +1578,7 @@ const styles = StyleSheet.create({
   },
   statusDot: { width: 8, height: 8, borderRadius: Radii.full },
   errorCard: { padding: Spacing.s5, gap: Spacing.s1 },
-  footer: { alignItems: 'center', gap: 2, marginTop: Spacing.s3 },
+  footerRow: { alignItems: 'center', gap: 2, paddingHorizontal: Spacing.s4, paddingVertical: Spacing.s3 },
   sheetFill: { flex: 1, justifyContent: 'flex-end' },
   sheetBackdrop: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   sheet: {
@@ -1544,9 +1628,33 @@ const styles = StyleSheet.create({
     padding: Spacing.s3,
     marginBottom: Spacing.s3,
   },
-  codeBlock: { borderRadius: Radii.sm, maxHeight: 180, marginBottom: Spacing.s4 },
-  codeBlockContent: { padding: Spacing.s3, gap: 2 },
-  codeText: { fontFamily: 'Manrope_500Medium', fontSize: 11, lineHeight: 16 },
+  exportSummary: {
+    borderRadius: Radii.sm,
+    borderWidth: 1,
+    padding: Spacing.s3,
+    gap: Spacing.s2,
+    marginBottom: Spacing.s4,
+  },
+  exportSummaryHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+  },
+  readyBadge: {
+    paddingHorizontal: Spacing.s2,
+    paddingVertical: 2,
+    borderRadius: Radii.sm,
+    flexShrink: 0,
+  },
+  exportSampleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.s2,
+    borderTopWidth: 1,
+    paddingTop: Spacing.s2,
+  },
   sheetActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3 },
   dialogBackdrop: {
     flex: 1,

@@ -43,6 +43,16 @@ const CAPTURE_SOURCE_LABELS: Record<string, string> = {
   auto_capture: 'Auto-capture',
 };
 
+// B4-6: when nothing is detected, the empty state names the kinds of app the
+// listener can read. These are descriptions of the notification, not a bank list,
+// because the parser reads an alert's text and no template for a specific bank is
+// promised here.
+const SUPPORTED_SOURCE_KINDS = [
+  'Bank apps that post a transaction or debit alert',
+  'Card apps that post a purchase alert',
+  'Wallet apps that post a payment alert',
+];
+
 function describeSource(source: string): string {
   return CAPTURE_SOURCE_LABELS[source] ?? source;
 }
@@ -203,10 +213,18 @@ export default function AutoCaptureSettingsScreen() {
     if (!isAvailable) return;
     void Haptics.selectionAsync();
     setToggleError(false);
+    const next = !masterEnabled;
     try {
-      await updateSetting('auto_capture_enabled', masterEnabled ? 'false' : 'true');
+      await updateSetting('auto_capture_enabled', next ? 'true' : 'false');
     } catch {
       setToggleError(true);
+      return;
+    }
+    // Switching on with no OS grant would leave a switch that reads on but can never
+    // work. The existing adapter opens the one screen that can grant it, so the user
+    // does not have to hunt for a second control.
+    if (next && !isGranted) {
+      void adapter.openSystemSettings();
     }
   };
 
@@ -283,18 +301,32 @@ export default function AutoCaptureSettingsScreen() {
             <View style={styles.masterInfo}>
               <View style={styles.masterTitleRow}>
                 <Text style={[Typography.bodyBold, { color: ts.text.onSurface, flexShrink: 1 }]}>Auto-Capture Master</Text>
+                {/* The switch state and the working state are two different facts, so
+                    they get two different pills. On never borrows the success colour,
+                    and a missing grant adds its own access pill beside it. */}
                 <View
                   style={[
                     styles.pill,
-                    {
-                      backgroundColor: listenerActive ? ts.raw.statusSuccessContainer : ts.raw.dangerSoft,
-                    },
+                    { backgroundColor: masterEnabled ? ts.bg.primary20 : ts.raw.disabledBg },
                   ]}
                 >
-                  <Text style={[Typography.micro, { color: listenerActive ? ts.raw.statusSuccessText : ts.raw.dangerContainerText, fontFamily: 'Manrope_700Bold' }]}>
-                    {listenerActive ? 'Active' : 'Paused'}
+                  <Text style={[Typography.micro, { color: masterEnabled ? ts.text.primary : ts.text.onSurfaceVariant, fontFamily: 'Manrope_700Bold' }]}>
+                    {masterEnabled ? 'On' : 'Off'}
                   </Text>
                 </View>
+                {isAvailable && masterEnabled && !isGranted ? (
+                  <View style={[styles.pill, { backgroundColor: ts.raw.warningContainer }]}>
+                    <Text style={[Typography.micro, { color: ts.raw.warningContainerText, fontFamily: 'Manrope_700Bold' }]}>
+                      Needs access
+                    </Text>
+                  </View>
+                ) : isAvailable && listenerActive ? (
+                  <View style={[styles.pill, { backgroundColor: ts.raw.statusSuccessContainer }]}>
+                    <Text style={[Typography.micro, { color: ts.raw.statusSuccessText, fontFamily: 'Manrope_700Bold' }]}>
+                      Working
+                    </Text>
+                  </View>
+                ) : null}
               </View>
               <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, marginTop: Spacing.s1 }]}>
                 {masterSub}
@@ -399,8 +431,8 @@ export default function AutoCaptureSettingsScreen() {
                     <PauseCircle color={ts.icon.muted} size={18} />
                     <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, flex: 1 }]}>
                       {isUnsupported
-                        ? 'Notification-listener auto-capture runs on Android only and stays safely inactive here.'
-                        : 'This build has no native listener. Expo Go stays safely inactive; nothing is read.'}
+                        ? 'Notification listener auto-capture runs on Android only and stays safely inactive here.'
+                        : 'This device cannot read financial notifications, so auto-capture stays inactive and nothing is read.'}
                     </Text>
                   </View>
                 )}
@@ -425,9 +457,20 @@ export default function AutoCaptureSettingsScreen() {
                     <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
                       <Search color={ts.icon.primary} size={20} />
                     </View>
-                    <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>No Parsers Installed</Text>
+                    <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>No supported apps detected yet</Text>
                     <Text style={[Typography.labelMd, styles.emptySub, { color: ts.text.onSurfaceVariant }]}>
-                      We could not detect supported banking or card payment applications on this device.
+                      Auto-capture reads transaction alerts from apps already on this phone. It can read:
+                    </Text>
+                    <View style={styles.kindList}>
+                      {SUPPORTED_SOURCE_KINDS.map((kind) => (
+                        <View key={kind} style={styles.bulletRow}>
+                          <Check color={ts.raw.success} size={14} />
+                          <Text style={[Typography.labelMd, { color: ts.text.onSurface, flex: 1 }]}>{kind}</Text>
+                        </View>
+                      ))}
+                    </View>
+                    <Text style={[Typography.labelMd, styles.emptySub, { color: ts.text.onSurfaceVariant }]}>
+                      Install the app you bank with, allow its transaction notifications, then come back to this screen.
                     </Text>
                   </View>
                 ) : (
@@ -532,7 +575,7 @@ export default function AutoCaptureSettingsScreen() {
                   {activity === null
                     ? (isUnsupported
                       ? 'Notification parsing runs on Android only. No activity is read here.'
-                      : 'This build has no native listener, so no parsed notification activity exists.')
+                      : 'This device cannot read financial notifications, so there is no parsed activity to show.')
                     : activity.status === 'empty'
                       ? 'Parsed push notifications from the last 30 days will display here with their outcome.'
                       : 'Parsed notification outcomes could not be read. Retry to try again.'}
@@ -643,5 +686,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: Spacing.s1,
   },
-  emptySub: { maxWidth: 240, textAlign: 'center' },
+  emptySub: { maxWidth: 280, textAlign: 'center' },
+  kindList: { alignSelf: 'stretch', gap: Spacing.s2, paddingHorizontal: Spacing.s2 },
 });
