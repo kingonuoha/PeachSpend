@@ -1,6 +1,8 @@
-import React, { useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   Modal,
+  Pressable,
   ScrollView,
   Share,
   StyleSheet,
@@ -8,6 +10,8 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
+import { GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated from 'react-native-reanimated';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Calendar, Check, Lock, Share2, X, Zap } from 'lucide-react-native';
@@ -16,6 +20,8 @@ import { BadgeGlyph } from './BadgeGlyph';
 import { LuminousCard } from './LuminousCard';
 import { PeachButton } from './PeachButton';
 import { ScalePressable } from './ScalePressable';
+import { useReduceMotion } from '../../hooks/useReduceMotion';
+import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Colors, Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import type { AchievementState } from '../../data/ProfileContracts';
@@ -25,6 +31,9 @@ import type { AchievementState } from '../../data/ProfileContracts';
 // shared card, button, press and glyph primitives instead of forking them. The
 // visual language (brand gradient emblem, progress track, streak row) matches
 // SH-05b and SH-02a so the streak and badge systems read as one story (FR-05.3).
+// Dismissal (backdrop tap, close, Done, Android back, drag) routes through one
+// guarded path, and the sheet uses the shared drag-to-dismiss hook like the
+// other polished sheets.
 
 interface BadgeDetailModalProps {
   visible: boolean;
@@ -41,6 +50,10 @@ const CLOSE_SIZE = 36;
 // Earns the remainder of the 44pt target through hitSlop (36 + 4 + 4).
 const CLOSE_HIT_SLOP = { top: 4, bottom: 4, left: 4, right: 4 };
 const SHEET_MAX_WIDTH = 640;
+// Longest exit (the drag-dismiss spring) plus a frame, so the Modal stays
+// mounted through the slide instead of popping when the native animation is
+// off. Mirrors CategoryPickerSheet's hold.
+const EXIT_HOLD_MS = 320;
 
 function formatEarnedDate(timestamp: number): string {
   return new Date(timestamp).toLocaleDateString(undefined, {
@@ -50,13 +63,74 @@ function formatEarnedDate(timestamp: number): string {
   });
 }
 
-export function BadgeDetailModal({ visible, badge, currentStreak = 0, onClose }: BadgeDetailModalProps) {
+export function BadgeDetailModal({ visible, badge: badgeProp, currentStreak = 0, onClose }: BadgeDetailModalProps) {
   const ts = useThemeStyles();
   const { height } = useWindowDimensions();
+  const reduceMotion = useReduceMotion();
+  const sheetRef = useRef<View>(null);
 
   const sheetMaxHeight = useMemo(() => Math.min(height * 0.85, 760), [height]);
 
-  if (!badge) return null;
+  // The parent nulls `badge` in the same update that flips `visible`, so hold
+  // the last real badge in state to render through the exit slide. Never a
+  // placeholder: it is the previous prop value, and the component renders
+  // nothing before the first real badge arrives. Derived during render like
+  // the visible-edge state below.
+  const [heldBadge, setHeldBadge] = useState<AchievementState | null>(badgeProp);
+  if (badgeProp && badgeProp !== heldBadge) setHeldBadge(badgeProp);
+
+  // The Modal stays mounted through the exit slide, then unmounts, so the sheet
+  // animates out instead of popping now that the native animation is off
+  // (CategoryPickerSheet pattern).
+  const [isMounted, setIsMounted] = useState(visible);
+  const [wasVisible, setWasVisible] = useState(visible);
+  if (visible !== wasVisible) {
+    setWasVisible(visible);
+    if (visible) setIsMounted(true);
+  }
+
+  // Single guarded close path: backdrop tap, close control, Done, Android back
+  // and a drag dismiss all land here, so any future guard (an async share or a
+  // save) survives every dismiss route. There is no async state to block on
+  // today: Share fires the OS sheet and reports nothing back.
+  const dismiss = useCallback(() => {
+    onClose();
+  }, [onClose]);
+
+  // Shared drag-to-dismiss (POLISH Section 5): the handle and header track the
+  // finger, the backdrop opacity is derived from the same translate, and a flick
+  // or a long pull dismisses through the guarded path.
+  const { translateY, pan, sheetStyle, backdropStyle } = useSheetDragToDismiss({
+    height: sheetMaxHeight,
+    visible,
+    reduceMotion,
+    onDismiss: dismiss,
+  });
+
+  // Hold the Modal mounted for the exit slide, then drop it. A drag already
+  // carried the sheet off-screen, so it can go now; the tap paths wait out the
+  // slide instead.
+  useEffect(() => {
+    if (visible || !isMounted) return;
+    const alreadyOffScreen = translateY.get() >= sheetMaxHeight;
+    const timer = setTimeout(
+      () => setIsMounted(false),
+      reduceMotion || alreadyOffScreen ? 0 : EXIT_HOLD_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [visible, isMounted, reduceMotion, translateY, sheetMaxHeight]);
+
+  // POLISH Section 7: move screen-reader focus into the sheet when it opens.
+  // Best effort, same AccessibilityInfo approach as EditProfileSheet; returning
+  // focus to the opening control belongs to the host screen.
+  useEffect(() => {
+    if (isMounted && sheetRef.current !== null) {
+      AccessibilityInfo.sendAccessibilityEvent(sheetRef.current, 'focus');
+    }
+  }, [isMounted]);
+
+  if (!isMounted || heldBadge === null) return null;
+  const badge = heldBadge;
 
   const percent = Math.max(0, Math.min(100, Math.round(badge.progress.ratio * 100)));
   const showStreak = currentStreak > 0;
@@ -75,29 +149,30 @@ export function BadgeDetailModal({ visible, badge, currentStreak = 0, onClose }:
 
   return (
     <Modal
-      visible={visible}
+      visible={isMounted}
       transparent
-      animationType="slide"
-      onRequestClose={onClose}
+      animationType="none"
+      onRequestClose={dismiss}
       accessibilityViewIsModal
     >
-      <View style={styles.root}>
-        <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill} />
-        <View
-          style={[StyleSheet.absoluteFill, { backgroundColor: ts.bg.overlay }]}
-          importantForAccessibility="no-hide-descendants"
-        />
-        <ScalePressable
-          haptic={false}
-          accessibilityElementsHidden
-          importantForAccessibility="no-hide-descendants"
-          onPress={onClose}
+      <GestureHandlerRootView style={styles.root}>
+        <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFill, backdropStyle]}>
+          <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill} />
+          <View
+            style={[StyleSheet.absoluteFill, { backgroundColor: ts.bg.overlay }]}
+            importantForAccessibility="no-hide-descendants"
+          />
+        </Animated.View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Dismiss badge detail"
+          onPress={dismiss}
           style={styles.backdrop}
-        >
-          <View />
-        </ScalePressable>
+        />
 
-        <View
+        <Animated.View
+          ref={sheetRef}
+          accessibilityLabel="Badge detail"
           style={[
             styles.sheet,
             {
@@ -105,32 +180,39 @@ export function BadgeDetailModal({ visible, badge, currentStreak = 0, onClose }:
               borderTopColor: ts.raw.outline,
               maxHeight: sheetMaxHeight,
             },
+            sheetStyle,
           ]}
         >
+          {/* The drag is attached to the handle and header only, so a vertical
+              drag never fights the scrollable badge body below. */}
+          <GestureDetector gesture={pan}>
+            <View style={styles.dragRegion}>
+              <View
+                style={[styles.handle, { backgroundColor: ts.raw.onSurfaceVariant + '66' }]}
+                accessible={false}
+                importantForAccessibility="no-hide-descendants"
+              />
+
+              <View style={styles.header}>
+                <ScalePressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Dismiss badge detail"
+                  hitSlop={CLOSE_HIT_SLOP}
+                  onPress={dismiss}
+                  style={[styles.close, { backgroundColor: ts.isDark ? ts.bg.card : ts.bg.low }]}
+                >
+                  <X size={16} color={ts.raw.onSurfaceVariant} strokeWidth={2} />
+                </ScalePressable>
+              </View>
+            </View>
+          </GestureDetector>
+
           <ScrollView
             style={styles.sheetScroll}
             contentContainerStyle={styles.sheetContent}
             showsVerticalScrollIndicator={false}
             bounces={false}
           >
-            <View
-              style={[styles.handle, { backgroundColor: ts.raw.onSurfaceVariant + '66' }]}
-              accessible={false}
-              importantForAccessibility="no-hide-descendants"
-            />
-
-            <View style={styles.header}>
-              <ScalePressable
-                accessibilityRole="button"
-                accessibilityLabel="Dismiss badge detail"
-                hitSlop={CLOSE_HIT_SLOP}
-                onPress={onClose}
-                style={[styles.close, { backgroundColor: ts.isDark ? ts.bg.card : ts.bg.low }]}
-              >
-                <X size={16} color={ts.raw.onSurfaceVariant} strokeWidth={2} />
-              </ScalePressable>
-            </View>
-
             <View style={styles.hero}>
               <View style={styles.emblemWrap}>
                 <View
@@ -275,11 +357,11 @@ export function BadgeDetailModal({ visible, badge, currentStreak = 0, onClose }:
                 onPress={handleShare}
                 style={styles.shareButton}
               />
-              <PeachButton title="Done" variant="ghost" size="lg" onPress={onClose} />
+              <PeachButton title="Done" variant="ghost" size="lg" onPress={dismiss} />
             </View>
           </ScrollView>
-        </View>
-      </View>
+        </Animated.View>
+      </GestureHandlerRootView>
     </Modal>
   );
 }
@@ -309,10 +391,17 @@ const styles = StyleSheet.create({
     flexGrow: 0,
   },
   sheetContent: {
-    // Pair p-5 pt-3 (HTML 307): 20 horizontal/bottom, 12 top.
+    // Pair p-5 pt-3 (HTML 307): 20 horizontal/bottom. The 12pt top inset now
+    // lives on the drag region above the ScrollView; the hero's own margin
+    // (unchanged) separates the scroll body from the header.
+    paddingHorizontal: Spacing.s5,
+    paddingBottom: Spacing.s5,
+  },
+  // Handle + close header live outside the ScrollView so the pan gesture never
+  // fights the scrollable body. Padding matches the sheet content insets.
+  dragRegion: {
     paddingHorizontal: Spacing.s5,
     paddingTop: Spacing.s3,
-    paddingBottom: Spacing.s5,
   },
   handle: {
     width: 48,

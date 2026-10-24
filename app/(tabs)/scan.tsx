@@ -8,13 +8,13 @@ import Animated, {
   withRepeat,
   withTiming,
 } from 'react-native-reanimated';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import { CameraView, useCameraPermissions, type BarcodeScanningResult, type BarcodeType } from 'expo-camera';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Camera, CameraOff, Image as ImageIcon, Pencil, X, Zap } from 'lucide-react-native';
+import { Barcode, Camera, CameraOff, Image as ImageIcon, Pencil, X, Zap } from 'lucide-react-native';
 import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 
@@ -23,7 +23,10 @@ import { geminiService } from '../../services/GeminiService';
 import { databaseService } from '../../services/DatabaseService';
 import { notificationService } from '../../services/NotificationService';
 import { logger } from '../../utils/logger';
+import { formatCurrency } from '../../utils/currency';
 import { AIProcessingOverlay } from '../../components/capture/AIProcessingOverlay';
+import { pipelineSteps, type PipelineStage } from '../../components/capture/pipelineStages';
+import { PendingReceiptsBar, PendingReceiptsSheet } from '../../components/capture/PendingReceipts';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { VerificationSheet } from '../../components/expense/VerificationSheet';
 import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
@@ -31,8 +34,9 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useAchievements } from '../../components/ui/AchievementProvider';
-import { AiError, getAiErrorMessage, normalizeAiError } from '../../ai/contracts';
+import { AiError, getAiErrorMessage, normalizeAiError, type AiErrorCode } from '../../ai/contracts';
 import { resolveExpenseBatchSave, runCaptureSideEffects, normalizeCurrencyTotal, type DuplicateMatch, type CaptureCandidate } from '../../data';
+import type { ReceiptDraft } from '../../data/ReceiptDrafts';
 import { copyReceiptImageToAppCache, deleteOwnedReceiptImage, readOwnedReceiptImageAsBase64 } from '../../utils/ownedReceiptImage';
 import { ScannedReceipt } from '../../types/gemini';
 import type { Expense } from '../../types/database';
@@ -54,18 +58,173 @@ const OFFLINE_TOP_OFFSET = 64;
 // 44pt touch floor vertically through hitSlop without changing its look.
 const MODE_OPTION_HIT_SLOP = { top: 10, bottom: 10 } as const;
 
+// Barcode decoding is the product mode affordance the pair names at
+// code.html:543-545 ("UPC item matcher switch") and switches on at :780-785.
+// The installed expo-camera derives native scanning from the presence of
+// onBarcodeScanned (node_modules/expo-camera/build/utils/props.js sets
+// barcodeScannerEnabled from it), so receipt mode passes undefined for both
+// props and never runs the scanner at all. The types are the retail codes the
+// pair means by UPC or EAN.
+const BARCODE_TYPES: BarcodeType[] = ['upc_a', 'upc_e', 'ean13', 'ean8'];
+const BARCODE_SCANNER_SETTINGS = { barcodeTypes: BARCODE_TYPES };
+// The decoded code pill uses the same safe-area anchor as the offline notice
+// (pair code.html:486 places that notice at top-16), and the notice moves down
+// by this much when both are on screen, which the offline product state can
+// produce because decoding happens on the device.
+const BARCODE_PILL_CLEARANCE = Spacing.s9;
+
 type ScanMode = 'receipt' | 'product';
 type ProcessingContext = 'receipt' | 'gallery' | 'product';
 
-const isIllegibleCode = (code: string): boolean => code === 'illegible_image' || code === 'invalid_response';
+// The two codes that mean the scan produced nothing usable, so they get the recovery dialog rather
+// than a toast. They are exactly the two codes ai/contracts.ts keeps mode aware copy for.
+export const SCAN_DIALOG_CODES = ['illegible_image', 'invalid_response'] as const;
+export type ScanDialogCode = (typeof SCAN_DIALOG_CODES)[number];
 
-const hasRequiredReceiptFields = (item: ScannedReceipt): boolean => (
-  item.merchant.trim().length > 0 &&
-  Number.isFinite(item.amount) &&
-  item.amount > 0 &&
-  item.currency.trim().length > 0 &&
-  item.category.trim().length > 0
-);
+export const isScanDialogCode = (code: string): code is ScanDialogCode =>
+  (SCAN_DIALOG_CODES as readonly string[]).includes(code);
+
+// The recovery dialog names the object being scanned in the active mode and the failure class, and
+// its body is the settled sentence from ai/contracts.ts. Neither asserts a photographic cause (blur,
+// dim light): the app only ever knows what the provider returned, which is the defect BUG-09-09
+// removes. Each code also names its own failure class in the title: `illegible_image` is the case
+// where the photograph was the problem, and `invalid_response` is a response the app could not use,
+// so that title names the response rather than borrowing the reading class the photo failure owns.
+const SCAN_DIALOG_TITLE: Record<ScanMode, Record<ScanDialogCode, string>> = {
+  receipt: {
+    illegible_image: 'Receipt Unclear',
+    invalid_response: 'Receipt Response Unusable',
+  },
+  product: {
+    illegible_image: 'Product Unclear',
+    invalid_response: 'Product Response Unusable',
+  },
+};
+
+// The mode the scan pipeline actually ran in: a gallery image is read as a receipt, and product only
+// when the context is product. This is the same mapping the extraction call uses to pick the provider
+// prompt, so the failure copy names the object the app actually tried to read.
+export function processingMode(context: ProcessingContext): ScanMode {
+  return context === 'product' ? 'product' : 'receipt';
+}
+
+export function scanFailureDialogCopy(code: ScanDialogCode, mode: ScanMode): { title: string; body: string } {
+  return { title: SCAN_DIALOG_TITLE[mode][code], body: getAiErrorMessage(code, mode) };
+}
+
+export type ScanFailureSurface =
+  | { kind: 'dialog'; code: ScanDialogCode; title: string; body: string }
+  | { kind: 'toast'; message: string };
+
+// Every failure on this screen resolves here, so the real mode always reaches the copy and neither
+// mode is ever described in the other's nouns.
+export function resolveScanFailure(code: AiErrorCode, mode: ScanMode): ScanFailureSurface {
+  if (isScanDialogCode(code)) return { kind: 'dialog', code, ...scanFailureDialogCopy(code, mode) };
+  return { kind: 'toast', message: getAiErrorMessage(code, mode) };
+}
+
+export interface BarcodeGate {
+  mode: ScanMode;
+  isScanning: boolean;
+  cameraActive: boolean;
+}
+
+// A decoded code is accepted as product context only: product mode, a camera
+// that is live, and no scan already in flight. Receipt mode can never accept
+// one, so a receipt scan can never carry a barcode even if one were in state.
+export function acceptBarcodeScan(gate: BarcodeGate, scanned: string): string | null {
+  if (gate.mode !== 'product' || gate.isScanning || !gate.cameraActive) return null;
+  const code = scanned.trim();
+  return code.length > 0 ? code : null;
+}
+
+// How a scan ends. A confirmed result is the only outcome that keeps the code, because the
+// code belongs to the result the user just saved (DEC-B18). Every other outcome drops it, so a
+// stale code can never be shown against, or sent with, a later frame.
+export type ScanOutcome = 'cancelled' | 'failed' | 'abandoned' | 'confirmed';
+
+export type BarcodeScanEvent =
+  | { kind: 'decoded'; gate: BarcodeGate; data: string }
+  | { kind: 'ended'; outcome: ScanOutcome };
+
+// The decoded code's lifecycle, one pure reducer so the screen and its tests share the same rules.
+// `decoded` is one barcode event: the scanner reports a code on every frame it stays in view, so a
+// repeat of the code already held is dropped and one barcode produces one scan rather than one per
+// frame. `ended` is any terminal outcome that is not a confirmed result (see ScanOutcome) and drops
+// the code, because it no longer belongs to any frame. The screen sends that event for a cancel, a
+// failure and an abandoned result, and never for a confirmed save: a confirmed code belongs to the
+// result the user just saved and the screen navigates away.
+export function reduceBarcode(held: string | null, event: BarcodeScanEvent): string | null {
+  if (event.kind === 'ended') return event.outcome === 'confirmed' ? held : null;
+  const code = acceptBarcodeScan(event.gate, event.data);
+  if (code === null || code === held) return held;
+  return code;
+}
+
+// The decoded code reaches the provider as product context only. The provider
+// call is the single channel into the product prompt in
+// services/GeminiService.ts, so receipt context never carries one.
+export function productScanOptions(
+  context: ProcessingContext,
+  barcode: string | null,
+  signal: AbortSignal,
+): { signal: AbortSignal; barcode?: string } {
+  if (context !== 'product' || !barcode) return { signal };
+  return { signal, barcode };
+}
+
+// The pre-save gate, mode aware (BUG-09-17b). It is the last check before a
+// capture reaches the save boundary, so it requires exactly what that boundary
+// requires, except where a mode genuinely knows better. Receipt mode keeps the
+// store name it always required, because a receipt carries one. Product mode
+// does not require a merchant: a product photograph normally has none, and the
+// boundary accepts an empty merchant for a scanned product and stores that empty
+// value rather than an invented one (BUG-09-17a). Product mode calls the amount
+// a price, because the parse deliberately leaves it at zero when the photograph
+// showed no price, which is a real and common thing to be missing.
+const isBlank = (value: string): boolean => value.trim().length === 0;
+const isMissingAmount = (item: ScannedReceipt): boolean => !Number.isFinite(item.amount) || item.amount <= 0;
+
+interface CaptureGateCheck {
+  isMissing: (item: ScannedReceipt) => boolean;
+  message: string;
+}
+
+// Each mode's required fields in the order the gate reports them. The message
+// names the field that is actually missing, in the mode's own words: product
+// mode never names a merchant or a receipt, because it never requires a merchant
+// and no receipt exists on that screen.
+const CAPTURE_GATE_CHECKS: Record<ScanMode, readonly CaptureGateCheck[]> = {
+  receipt: [
+    { isMissing: (item) => isBlank(item.merchant), message: 'Add the store name before saving this receipt.' },
+    { isMissing: isMissingAmount, message: 'Add the total before saving this receipt.' },
+    { isMissing: (item) => isBlank(item.currency), message: 'Add the currency before saving this receipt.' },
+    { isMissing: (item) => isBlank(item.category), message: 'Add a category before saving this receipt.' },
+  ],
+  product: [
+    { isMissing: isMissingAmount, message: 'Add a price before saving this product.' },
+    { isMissing: (item) => isBlank(item.currency), message: 'Add the currency before saving this product.' },
+    { isMissing: (item) => isBlank(item.category), message: 'Add a category before saving this product.' },
+  ],
+};
+
+export type CaptureGateDecision = { canSave: true } | { canSave: false; message: string };
+
+export function evaluateCaptureGate(item: ScannedReceipt, mode: ScanMode): CaptureGateDecision {
+  const blocked = CAPTURE_GATE_CHECKS[mode].find((check) => check.isMissing(item));
+  return blocked ? { canSave: false, message: blocked.message } : { canSave: true };
+}
+
+// The message for the first item the gate refuses, or null when the whole batch
+// can be saved. Both save paths use it, so the confirm path and the save-anyway
+// path cannot disagree about what is saveable.
+export function firstBlockedCaptureMessage(items: ScannedReceipt[], mode: ScanMode): string | null {
+  for (const item of items) {
+    const decision = evaluateCaptureGate(item, mode);
+    if (!decision.canSave) return decision.message;
+  }
+  return null;
+}
 
 const PROCESSING_COPY: Record<ProcessingContext, { contextLabel: string; title: string; description: string }> = {
   receipt: {
@@ -149,27 +308,29 @@ function HudButton({ label, onPress, disabled, checked, children }: { label: str
   );
 }
 
-function PermissionRecovery({ onGrant, onManual, canAskAgain }: { onGrant: () => void; onManual: () => void; canAskAgain: boolean }) {
+function PermissionRecovery({ onGrant, onManual, canAskAgain, insets }: { onGrant: () => void; onManual: () => void; canAskAgain: boolean; insets: { top: number; bottom: number } }) {
   return (
-    <View style={styles.recoveryLayer}>
-      <View style={styles.recoveryIcon}>
-        <CameraOff size={30} color={Colors.primary} />
+    <View style={[styles.recoveryLayer, { paddingTop: insets.top + Spacing.s6, paddingBottom: insets.bottom + Spacing.s6 }]}>
+      <View style={styles.recoveryCard}>
+        <View style={styles.recoveryIcon}>
+          <CameraOff size={30} color={Colors.primary} />
+        </View>
+        <Text accessibilityRole="header" style={styles.recoveryTitle}>Camera Access Required</Text>
+        <Text style={styles.recoveryBody}>
+          Allow camera access to scan receipts. Your capture stays on this device until you confirm it.
+        </Text>
+        <PeachButton
+          title={canAskAgain ? 'Grant Camera Permission' : 'Open Settings'}
+          onPress={onGrant}
+          variant="primary"
+          size="lg"
+          fullWidth
+          style={styles.recoveryAction}
+        />
+        <Pressable onPress={onManual} accessibilityRole="button" accessibilityLabel="Enter expense manually" hitSlop={8} style={styles.recoveryLink}>
+          <Text style={styles.recoveryLinkText}>Enter Manually</Text>
+        </Pressable>
       </View>
-      <Text accessibilityRole="header" style={styles.recoveryTitle}>Camera Access Required</Text>
-      <Text style={styles.recoveryBody}>
-        Allow camera access to scan receipts. Your capture stays on this device until you confirm it.
-      </Text>
-      <PeachButton
-        title={canAskAgain ? 'Grant Camera Permission' : 'Open Settings'}
-        onPress={onGrant}
-        variant="primary"
-        size="lg"
-        fullWidth
-        style={styles.recoveryAction}
-      />
-      <Pressable onPress={onManual} accessibilityRole="button" accessibilityLabel="Enter expense manually" hitSlop={8} style={styles.recoveryLink}>
-        <Text style={styles.recoveryLinkText}>Enter Manually</Text>
-      </Pressable>
     </View>
   );
 }
@@ -187,7 +348,10 @@ export default function ScanScreen() {
 
   const [isScanning, setIsScanning] = useState(false);
   const [processingContext, setProcessingContext] = useState<ProcessingContext>('receipt');
-  const [illegibleVisible, setIllegibleVisible] = useState(false);
+  const [pipelineStage, setPipelineStage] = useState<PipelineStage | null>(null);
+  // The failure code the recovery dialog is showing, or null when it is closed. Holding the code
+  // rather than a boolean lets the title and body come from the code and the active mode.
+  const [dialogCode, setDialogCode] = useState<ScanDialogCode | null>(null);
   const [flash, setFlash] = useState<'on' | 'off'>('off');
   const [scanMode, setScanMode] = useState<ScanMode>('receipt');
   const [scanResult, setScanResult] = useState<ScannedReceipt[] | null>(null);
@@ -198,14 +362,76 @@ export default function ScanScreen() {
   const [pendingBatch, setPendingBatch] = useState<ScannedReceipt[] | null>(null);
   const [ownedImageUri, setOwnedImageUri] = useState<string | null>(null);
   const [frameHeight, setFrameHeight] = useState(0);
+  // The space the viewfinder frame is laid out in. Sizing the frame from this rather
+  // than from a device width is what keeps it inside the HUD on a short screen.
+  const [frameSlot, setFrameSlot] = useState({ width: 0, height: 0 });
+  // Receipts that are waiting on this device, and the draft whose review is open. A
+  // draft id is kept rather than a boolean so the row can be marked saved or put back
+  // in the queue against its own record.
+  const [drafts, setDrafts] = useState<ReceiptDraft[]>([]);
+  const [isDraftsOpen, setIsDraftsOpen] = useState(false);
+  const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
+  const [isQueueProcessing, setIsQueueProcessing] = useState(false);
+  // Whether an AI key is stored. It explains why saved receipts cannot be processed
+  // yet; it never gates capture, because capture is local.
+  const [hasApiKey, setHasApiKey] = useState<boolean | null>(null);
+  // The image the screen currently owns, mirrored in a ref so an async callback reads
+  // the value it set rather than a stale render closure. It is the single owner: a
+  // draft, a handoff to manual entry, or a save clears it, and nothing deletes an
+  // image this ref no longer holds.
+  const ownedImageRef = useRef<string | null>(null);
+  // The code the device decoded in product mode, held for the frame currently being scanned. It is
+  // dropped when the scan ends without a confirmed result, so a stale code can never be shown
+  // against, or sent with, a later frame. The ref and the state are kept in step by
+  // applyDecodedBarcode so the scan handler and the pill can never disagree, and the dedupe lives in
+  // the ref so a repeated event cannot re-render.
+  const [decodedBarcode, setDecodedBarcode] = useState<string | null>(null);
+  const lastBarcodeRef = useRef<string | null>(null);
+
+  const applyDecodedBarcode = useCallback((next: string | null) => {
+    lastBarcodeRef.current = next;
+    setDecodedBarcode(next);
+  }, []);
+
+  const ownImage = useCallback((uri: string | null) => {
+    ownedImageRef.current = uri;
+    setOwnedImageUri(uri);
+  }, []);
 
   useEffect(() => {
-    const checkApiKey = async () => {
+    const readKeyState = async () => {
       const apiKey = await databaseService.getSecret('gemini_api_key');
-      if (!apiKey) showToast('Gemini API key missing. Open AI Provider Settings.', 'error');
+      setHasApiKey(Boolean(apiKey));
     };
-    void checkApiKey();
-  }, [showToast]);
+    void readKeyState();
+  }, []);
+
+  const refreshDrafts = useCallback(async () => {
+    try {
+      const store = await databaseService.getReceiptDraftStore();
+      const rows = await store.listReceiptDrafts();
+      setDrafts(rows.filter((row) => row.status !== 'saved'));
+    } catch {
+      // A failed read must not be rendered as "nothing saved": the previous rows stay
+      // on screen and the failure is logged instead of being shown as an empty state.
+      logger.error('Failed to read saved receipts', 'receipt_draft_list_failed');
+    }
+  }, []);
+
+  useEffect(() => {
+    // Deferred so the read runs after the effect body, which keeps the mount free of a
+    // synchronous cascade while the draft read resolves.
+    const timer = setTimeout(() => { void refreshDrafts(); }, 0);
+    return () => clearTimeout(timer);
+  }, [refreshDrafts]);
+
+  // A receipt image the screen still owns at unmount has no owner left, so it is
+  // removed. A draft, a save, or a handoff to manual entry clears the ref first and
+  // keeps the file.
+  useEffect(() => () => {
+    const uri = ownedImageRef.current;
+    if (uri) void deleteOwnedReceiptImage(uri);
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -260,19 +486,121 @@ export default function ScanScreen() {
     return { ...item, amount: normalized.total, currency: settings.currency };
   }), [conversionRates, settings.currency]);
 
-  const resolveItems = useCallback(async (base64: string, context: ProcessingContext, signal: AbortSignal): Promise<ScannedReceipt[]> => {
-    const rawItems = await geminiService.scanReceipt(base64, context === 'product' ? 'product' : 'receipt', { signal });
+  // Can OCR run right now? This is the only thing connection and key state decide.
+  // Whether the camera may capture is a separate question and never asks this, so a
+  // receipt in hand can always be photographed and kept on the device.
+  const canRunOcrNow = useCallback(async (): Promise<boolean> => {
+    const online = await ensureOnline();
+    let keyed = false;
+    try {
+      keyed = Boolean(await databaseService.getSecret('gemini_api_key'));
+    } catch {
+      keyed = false;
+    }
+    setHasApiKey(keyed);
+    return online && keyed;
+  }, [ensureOnline]);
+
+  // One extraction rule for every caller. The stage reporter marks `requesting`
+  // before the provider await and `parsing` after it resolves, so the overlay can
+  // only show a step as finished once the await behind it has returned.
+  const extractItems = useCallback(async (base64: string, context: ProcessingContext, signal: AbortSignal): Promise<ScannedReceipt[]> => {
+    setPipelineStage('requesting');
+    const mode = processingMode(context);
+    const rawItems = await geminiService.scanReceipt(base64, mode, productScanOptions(context, decodedBarcode, signal));
+    setPipelineStage('parsing');
     if (!rawItems || !Array.isArray(rawItems)) throw new AiError('invalid_response', 'gemini', 'AI response did not match the receipt contract');
     return convertToUserCurrency(rawItems);
-  }, [convertToUserCurrency]);
+  }, [convertToUserCurrency, decodedBarcode]);
 
-  const handleFailure = useCallback((error: unknown, logMessage: string) => {
+  // The scan ended without a confirmed result: a cancel, a failure, or a result the user
+  // abandoned. The decoded code no longer belongs to any frame, so it is dropped here rather than
+  // left to be shown against, or sent with, a later one.
+  const endDecodedBarcode = useCallback((outcome: ScanOutcome) => {
+    applyDecodedBarcode(reduceBarcode(lastBarcodeRef.current, { kind: 'ended', outcome }));
+  }, [applyDecodedBarcode]);
+
+  // The scanner reports the same code for as long as it stays in frame, so an
+  // identical read is dropped instead of re-rendering the HUD. The guard is the
+  // same one the props use, kept here so receipt mode cannot decode even if a
+  // handler were reached.
+  const handleBarcodeScanned = useCallback((result: BarcodeScanningResult) => {
+    const held = lastBarcodeRef.current;
+    const next = reduceBarcode(held, { kind: 'decoded', gate: { mode: scanMode, isScanning, cameraActive }, data: result.data });
+    if (next === held) return;
+    applyDecodedBarcode(next);
+    void Haptics.selectionAsync();
+  }, [applyDecodedBarcode, cameraActive, isScanning, scanMode]);
+
+  const handleModeChange = useCallback((mode: ScanMode) => {
+    setScanMode(mode);
+    endDecodedBarcode('abandoned');
+  }, [endDecodedBarcode]);
+
+  // The real mode of the operation that failed is passed in, so receipt mode gets receipt copy and
+  // product mode gets product copy rather than the receipt context being hardcoded. The normalized
+  // code is returned so the caller can also record it against a saved draft.
+  const handleFailure = useCallback((error: unknown, logMessage: string, context: ProcessingContext): AiErrorCode => {
     const normalized = normalizeAiError(error, 'gemini');
     logger.error(logMessage, normalized.code);
-    if (isIllegibleCode(normalized.code)) setIllegibleVisible(true);
-    else showToast(getAiErrorMessage(normalized.code, 'receipt'), 'error');
+    const surface = resolveScanFailure(normalized.code, processingMode(context));
+    if (surface.kind === 'dialog') setDialogCode(surface.code);
+    else showToast(surface.message, 'error');
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    return normalized.code;
   }, [showToast]);
+
+  // Keep a captured image on the device instead of discarding it. The row is the only
+  // pointer to the file, so the file is never deleted while a row points at it.
+  const keepAsDraft = useCallback(async (imageUri: string, errorCode: string | null): Promise<boolean> => {
+    try {
+      const store = await databaseService.getReceiptDraftStore();
+      const draft = await store.enqueueReceiptDraft({ imageUri, source: 'scan' });
+      if (errorCode) await store.markReceiptDraftFailed(draft.id, errorCode);
+      ownImage(null);
+      await refreshDrafts();
+      return true;
+    } catch {
+      logger.error('Failed to keep the captured receipt on this device', 'receipt_draft_enqueue_failed');
+      return false;
+    }
+  }, [ownImage, refreshDrafts]);
+
+  const saveDraftAndExplain = useCallback(async (imageUri: string, reason: 'offline' | 'no_key') => {
+    const kept = await keepAsDraft(imageUri, null);
+    if (!kept) {
+      showToast('Could not save the photo on this device. Try again.', 'error');
+      return;
+    }
+    showToast(
+      reason === 'offline'
+        ? 'Photo saved on this device. Open Saved receipts to process it once you are online.'
+        : 'Photo saved on this device. Open Saved receipts to process it after adding an AI key.',
+      'success',
+    );
+  }, [keepAsDraft, showToast]);
+
+  const requeueDraft = useCallback(async (draftId: string) => {
+    try {
+      const store = await databaseService.getReceiptDraftStore();
+      await store.retryReceiptDraft(draftId);
+    } catch {
+      logger.error('Failed to put a saved receipt back in the queue', 'receipt_draft_requeue_failed');
+    }
+    await refreshDrafts();
+  }, [refreshDrafts]);
+
+  const discardDraft = useCallback(async (draft: ReceiptDraft) => {
+    try {
+      const store = await databaseService.getReceiptDraftStore();
+      await store.deleteReceiptDraft(draft.id);
+    } catch {
+      logger.error('Failed to remove a saved receipt', 'receipt_draft_delete_failed');
+      return;
+    }
+    await deleteOwnedReceiptImage(draft.imageUri);
+    await refreshDrafts();
+  }, [refreshDrafts]);
 
   const runBatchSideEffects = useCallback(async (records: Expense[], candidates: CaptureCandidate[]) => {
     for (const [index, candidate] of candidates.entries()) {
@@ -280,7 +608,7 @@ export default function ScanScreen() {
         onExpenseSaved: checkForNewAchievements,
         onIncomeSaved: async () => undefined,
         scheduleNotification: (savedCandidate) => {
-          if ('merchant' in savedCandidate) notificationService.scheduleExpenseNotification(savedCandidate.merchant, `${savedCandidate.currency} ${savedCandidate.amount.toFixed(2)}`);
+          if ('merchant' in savedCandidate) notificationService.scheduleExpenseNotification(savedCandidate.merchant, formatCurrency(savedCandidate.amount, savedCandidate.currency));
         },
       });
     }
@@ -288,11 +616,27 @@ export default function ScanScreen() {
 
   const finalizeBatchSave = useCallback(async (items: ScannedReceipt[]) => {
     setIsSheetVisible(false);
+    const draftId = activeDraftId;
+    if (draftId) {
+      // The expense now points at this image, so the draft row is closed and removed
+      // while the file stays. A save that came from the queue stays on this screen,
+      // because the user never left it to reach the review.
+      try {
+        const store = await databaseService.getReceiptDraftStore();
+        await store.markReceiptDraftSaved(draftId);
+        await store.deleteReceiptDraft(draftId);
+      } catch {
+        logger.error('Failed to close the saved receipt draft', 'receipt_draft_save_marker_failed');
+      }
+      setActiveDraftId(null);
+      setScanResult(null);
+    }
     showToast(`Successfully saved ${items.length} expense${items.length > 1 ? 's' : ''}`, 'success');
     await checkForNewAchievements();
-    setOwnedImageUri(null);
-    returnToOrigin();
-  }, [checkForNewAchievements, returnToOrigin, showToast]);
+    ownImage(null);
+    await refreshDrafts();
+    if (!draftId) returnToOrigin();
+  }, [activeDraftId, checkForNewAchievements, ownImage, refreshDrafts, returnToOrigin, showToast]);
 
   const buildCandidates = useCallback((items: ScannedReceipt[]): CaptureCandidate[] => {
     const now = Date.now();
@@ -313,8 +657,10 @@ export default function ScanScreen() {
   // Save Anyway only. A clean confirm persists inside handleConfirm through the
   // same shared boundary, so calling this on a clean batch would insert twice.
   const executeSave = useCallback(async (items: ScannedReceipt[]) => {
-    if (items.length === 0 || items.some(item => !hasRequiredReceiptFields(item))) {
-      showToast('Review missing receipt fields before saving.', 'error');
+    if (items.length === 0) return;
+    const blocked = firstBlockedCaptureMessage(items, processingMode(processingContext));
+    if (blocked) {
+      showToast(blocked, 'error');
       return;
     }
     const repository = await databaseService.getCaptureRepository();
@@ -323,14 +669,15 @@ export default function ScanScreen() {
     if (resolution.status !== 'saved') throw new Error('capture_save_failed');
     await runBatchSideEffects(resolution.records, candidates);
     await finalizeBatchSave(items);
-  }, [buildCandidates, finalizeBatchSave, runBatchSideEffects, showToast]);
+  }, [buildCandidates, finalizeBatchSave, processingContext, runBatchSideEffects, showToast]);
 
   const handleConfirm = useCallback(async (items: ScannedReceipt[]) => {
     try {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       if (items.length === 0) return;
-      if (items.some(item => !hasRequiredReceiptFields(item))) {
-        showToast('Review missing receipt fields before saving.', 'error');
+      const blocked = firstBlockedCaptureMessage(items, processingMode(processingContext));
+      if (blocked) {
+        showToast(blocked, 'error');
         return;
       }
       const repository = await databaseService.getCaptureRepository();
@@ -353,75 +700,104 @@ export default function ScanScreen() {
       showToast('Failed to save expenses', 'error');
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [buildCandidates, finalizeBatchSave, runBatchSideEffects, showToast]);
+  }, [buildCandidates, finalizeBatchSave, processingContext, runBatchSideEffects, showToast]);
 
   const runScan = useCallback(async (base64: string, context: ProcessingContext) => {
     setProcessingContext(context);
     setIsScanning(true);
+    setPipelineStage('captured');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const controller = new AbortController();
     scanAbortRef.current = controller;
     try {
-      const items = await resolveItems(base64, context, controller.signal);
+      const items = await extractItems(base64, context, controller.signal);
+      setPipelineStage('ready');
       setScanResult(items);
       setIsSheetVisible(true);
     } catch (error) {
       // A user cancel owns its own cleanup in cancelProcessing; do not surface it
       // as an OCR failure.
       if (!(error instanceof AiError && error.code === 'cancelled')) {
-        handleFailure(error, 'Failed to scan receipt');
-        await deleteOwnedReceiptImage(ownedImageUri ?? undefined);
-        setOwnedImageUri(null);
+        const code = handleFailure(error, 'Failed to scan receipt', context);
+        const draftId = activeDraftId;
+        const imageUri = ownedImageRef.current;
+        if (draftId) {
+          // The draft row keeps the file, so a failed attempt records the error
+          // against that row and leaves the row retryable.
+          try {
+            const store = await databaseService.getReceiptDraftStore();
+            await store.markReceiptDraftFailed(draftId, code);
+          } catch {
+            logger.error('Failed to record a failed attempt on the saved receipt', 'receipt_draft_fail_marker_failed');
+          }
+          await refreshDrafts();
+          setIsDraftsOpen(true);
+        } else if (imageUri && !isScanDialogCode(code)) {
+          // Nothing user-readable came back (offline, provider, timeout): keep the photo
+          // as a retryable draft instead of discarding the capture.
+          const kept = await keepAsDraft(imageUri, code);
+          if (!kept) ownImage(null);
+        }
         setCameraActive(true);
+        endDecodedBarcode('failed');
       }
     } finally {
       if (scanAbortRef.current === controller) scanAbortRef.current = null;
       setIsScanning(false);
+      setPipelineStage(null);
     }
-  }, [handleFailure, ownedImageUri, resolveItems]);
+  }, [activeDraftId, endDecodedBarcode, extractItems, handleFailure, keepAsDraft, ownImage, refreshDrafts]);
 
   const cancelProcessing = useCallback(async () => {
     scanAbortRef.current?.abort();
     setIsScanning(false);
-    await deleteOwnedReceiptImage(ownedImageUri ?? undefined);
-    setOwnedImageUri(null);
+    setPipelineStage(null);
+    const draftId = activeDraftId;
+    if (draftId) {
+      // Cancelling a queued review leaves the draft owning its image, so the row goes
+      // back in the queue and the file stays.
+      setActiveDraftId(null);
+      ownImage(null);
+      await requeueDraft(draftId);
+    } else {
+      await deleteOwnedReceiptImage(ownedImageRef.current ?? undefined);
+      ownImage(null);
+    }
     setCameraActive(true);
-  }, [ownedImageUri]);
+    endDecodedBarcode('cancelled');
+  }, [activeDraftId, endDecodedBarcode, ownImage, requeueDraft]);
 
   const handleGalleryPick = useCallback(async () => {
     if (isScanning) return;
     let copiedUri: string | undefined;
     try {
-      if (!(await ensureOnline())) return;
-      const apiKey = await databaseService.getSecret('gemini_api_key');
-      if (!apiKey) {
-        showToast('Gemini API key missing. Open AI Provider Settings.', 'error');
-        return;
-      }
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], base64: false, quality: 0.5 });
       if (result.canceled || !result.assets[0]?.uri) return;
       const asset = result.assets[0];
       if (!asset.mimeType) throw new Error('unsupported_image_type');
       copiedUri = await copyReceiptImageToAppCache(asset.uri, asset.mimeType, asset.fileSize);
-      setOwnedImageUri(copiedUri);
+      ownImage(copiedUri);
+      if (!(await canRunOcrNow())) {
+        await saveDraftAndExplain(copiedUri, isOffline === false ? 'no_key' : 'offline');
+        setCameraActive(true);
+        return;
+      }
       await runScan(await readOwnedReceiptImageAsBase64(copiedUri), 'gallery');
     } catch (error) {
-      handleFailure(error, 'Failed to scan gallery image');
-      await deleteOwnedReceiptImage(copiedUri ?? ownedImageUri ?? undefined);
-      setOwnedImageUri(null);
+      const code = handleFailure(error, 'Failed to scan gallery image', 'gallery');
+      if (copiedUri) {
+        const kept = await keepAsDraft(copiedUri, code);
+        if (kept) showToast('Photo saved on this device. Open Saved receipts to try it again.', 'success');
+      }
+      setCameraActive(true);
+      endDecodedBarcode('failed');
     }
-  }, [ensureOnline, handleFailure, isScanning, ownedImageUri, runScan, showToast]);
+  }, [canRunOcrNow, endDecodedBarcode, handleFailure, isOffline, isScanning, keepAsDraft, ownImage, runScan, saveDraftAndExplain, showToast]);
 
   const handleCapture = useCallback(async () => {
     if (isScanning) return;
     let copiedUri: string | undefined;
     try {
-      if (!(await ensureOnline())) return;
-      const apiKey = await databaseService.getSecret('gemini_api_key');
-      if (!apiKey) {
-        showToast('Gemini API key missing. Open AI Provider Settings.', 'error');
-        return;
-      }
       if (!cameraRef.current) return;
       setFlash('off');
       const photo = await cameraRef.current.takePictureAsync({ base64: false, quality: 0.5 });
@@ -431,50 +807,143 @@ export default function ScanScreen() {
         return;
       }
       copiedUri = await copyReceiptImageToAppCache(photo.uri, 'image/jpeg');
-      setOwnedImageUri(copiedUri);
+      ownImage(copiedUri);
+      // Capture never depends on the network or on a key: the photo is already safe on
+      // the device at this point. Only the OCR that follows needs them.
+      if (!(await canRunOcrNow())) {
+        await saveDraftAndExplain(copiedUri, isOffline === true ? 'offline' : 'no_key');
+        setCameraActive(true);
+        return;
+      }
       await runScan(await readOwnedReceiptImageAsBase64(copiedUri), scanMode === 'product' ? 'product' : 'receipt');
     } catch (error) {
-      handleFailure(error, 'Failed to capture or scan receipt');
-      await deleteOwnedReceiptImage(copiedUri ?? ownedImageUri ?? undefined);
-      setOwnedImageUri(null);
+      const code = handleFailure(error, 'Failed to capture or scan receipt', scanMode === 'product' ? 'product' : 'receipt');
+      if (copiedUri) {
+        const kept = await keepAsDraft(copiedUri, code);
+        if (kept) showToast('Photo saved on this device. Open Saved receipts to try it again.', 'success');
+      }
       setCameraActive(true);
+      endDecodedBarcode('failed');
     }
-  }, [ensureOnline, handleFailure, isScanning, ownedImageUri, runScan, scanMode, showToast]);
+  }, [canRunOcrNow, endDecodedBarcode, handleFailure, isOffline, isScanning, keepAsDraft, ownImage, runScan, saveDraftAndExplain, scanMode, showToast]);
 
   const handleRetryScan = useCallback(async () => {
-    if (!ownedImageUri || isScanning) return;
+    const imageUri = ownedImageRef.current;
+    if (!imageUri || isScanning) return;
     const controller = new AbortController();
     scanAbortRef.current = controller;
     try {
-      if (!(await ensureOnline())) return;
-      const apiKey = await databaseService.getSecret('gemini_api_key');
-      if (!apiKey) {
-        showToast('Gemini API key missing. Open AI Provider Settings.', 'error');
+      if (!(await canRunOcrNow())) {
+        showToast(
+          isOffline === true
+            ? 'Connect to the internet to read this receipt again.'
+            : 'Add an AI provider key to read this receipt again.',
+          'error',
+        );
         return;
       }
-      setProcessingContext(scanMode === 'product' ? 'product' : 'receipt');
+      const context = scanMode === 'product' ? 'product' : 'receipt';
+      setProcessingContext(context);
       setIsScanning(true);
-      const items = await resolveItems(await readOwnedReceiptImageAsBase64(ownedImageUri), scanMode === 'product' ? 'product' : 'receipt', controller.signal);
+      setPipelineStage('captured');
+      const items = await extractItems(await readOwnedReceiptImageAsBase64(imageUri), context, controller.signal);
+      setPipelineStage('ready');
       setScanResult(items);
     } catch (error) {
-      if (!(error instanceof AiError && error.code === 'cancelled')) handleFailure(error, 'Failed to retry receipt extraction');
+      if (!(error instanceof AiError && error.code === 'cancelled')) handleFailure(error, 'Failed to retry receipt extraction', scanMode === 'product' ? 'product' : 'receipt');
     } finally {
       if (scanAbortRef.current === controller) scanAbortRef.current = null;
       setIsScanning(false);
+      setPipelineStage(null);
     }
-  }, [ensureOnline, handleFailure, isScanning, ownedImageUri, resolveItems, scanMode, showToast]);
+  }, [canRunOcrNow, extractItems, handleFailure, isOffline, isScanning, scanMode, showToast]);
+
+  // Read one saved draft. The row's own image is read, never a copy, and the claim is
+  // the store's, so a second tap cannot process the same row twice.
+  const processQueuedDraft = useCallback(async () => {
+    if (isQueueProcessing || isScanning) return;
+    setIsQueueProcessing(true);
+    try {
+      if (!(await canRunOcrNow())) {
+        showToast(
+          isOffline === true ? 'Connect to the internet to process saved receipts.' : 'Add an AI provider key to process saved receipts.',
+          'error',
+        );
+        return;
+      }
+      const store = await databaseService.getReceiptDraftStore();
+      let claimed = await store.claimNextReceiptDraft();
+      if (!claimed) {
+        // Nothing was claimable: put the oldest stuck row back in the queue, then claim
+        // it. This is a user action, not an automatic retry loop.
+        const stuck = drafts.find((draft) => draft.status === 'failed' || draft.status === 'processing');
+        if (stuck) {
+          await store.retryReceiptDraft(stuck.id);
+          claimed = await store.claimNextReceiptDraft();
+        }
+      }
+      await refreshDrafts();
+      if (!claimed) {
+        showToast('Nothing is waiting to be processed.', 'error');
+        return;
+      }
+      setIsDraftsOpen(false);
+      setActiveDraftId(claimed.id);
+      ownImage(claimed.imageUri);
+      setCameraActive(false);
+      await runScan(await readOwnedReceiptImageAsBase64(claimed.imageUri), 'receipt');
+    } catch (error) {
+      const code = handleFailure(error, 'Failed to process a saved receipt', 'receipt');
+      const draftId = activeDraftId;
+      if (draftId) {
+        try {
+          const store = await databaseService.getReceiptDraftStore();
+          await store.markReceiptDraftFailed(draftId, code);
+        } catch {
+          logger.error('Failed to record a failed attempt on the saved receipt', 'receipt_draft_fail_marker_failed');
+        }
+      }
+      setActiveDraftId(null);
+      ownImage(null);
+      setCameraActive(true);
+      await refreshDrafts();
+      setIsDraftsOpen(true);
+    } finally {
+      setIsQueueProcessing(false);
+    }
+  }, [activeDraftId, canRunOcrNow, drafts, handleFailure, isOffline, isQueueProcessing, isScanning, ownImage, refreshDrafts, runScan, showToast]);
 
   const resetCamera = useCallback(() => {
     setCameraActive(true);
-    void deleteOwnedReceiptImage(ownedImageUri ?? undefined);
-    setOwnedImageUri(null);
-  }, [ownedImageUri]);
+    endDecodedBarcode('abandoned');
+    void deleteOwnedReceiptImage(ownedImageRef.current ?? undefined);
+    ownImage(null);
+  }, [endDecodedBarcode, ownImage]);
 
   const handleCloseSheet = useCallback(() => {
     setIsSheetVisible(false);
     setScanResult(null);
+    const draftId = activeDraftId;
+    if (draftId) {
+      // The draft row still points at this image, so dismissing the review puts the row
+      // back in the queue instead of deleting the file.
+      setActiveDraftId(null);
+      ownImage(null);
+      setCameraActive(true);
+      void requeueDraft(draftId);
+      return;
+    }
     resetCamera();
-  }, [resetCamera]);
+  }, [activeDraftId, ownImage, requeueDraft, resetCamera]);
+
+  // The captured image is handed to manual entry, which owns it from here: the ref is
+  // cleared so this screen never deletes a file the other screen is showing.
+  const openManualEntry = useCallback((imageUri?: string | null) => {
+    const uri = imageUri ?? ownedImageRef.current;
+    if (uri) ownImage(null);
+    setDialogCode(null);
+    router.push(uri ? { pathname: '/expense/manual', params: { imageUri: uri } } : '/expense/manual');
+  }, [ownImage, router]);
 
   const handleGrantPermission = useCallback(async () => {
     if (permission?.canAskAgain === false) {
@@ -490,58 +959,71 @@ export default function ScanScreen() {
   }
 
   const granted = permission.granted;
-  const canCapture = granted && !isOffline && !isScanning;
+  // Capture is local, so only the camera and an in-flight scan decide it. Connection
+  // and key state are asked later, and only about processing the photo.
+  const canCapture = granted && !isScanning;
   const instruction = scanMode === 'product' ? 'Point at barcode or grocery item' : 'Align receipt within the frame';
   const processing = PROCESSING_COPY[processingContext];
+  const showBarcode = scanMode === 'product' && decodedBarcode !== null;
+  const failureDialog = dialogCode ? scanFailureDialogCopy(dialogCode, scanMode) : null;
+  // The frame keeps the pair's 280x380 proportion and takes the largest size that fits,
+  // bounded by the pair's 300pt cap. Height is derived from width, never independent.
+  const frameWidth = Math.min(
+    frameSlot.width * 0.92,
+    VIEWFINDER_MAX_WIDTH,
+    frameSlot.height * VIEWFINDER_ASPECT,
+  );
+  const steps = pipelineSteps(pipelineStage, processingContext);
+  const canProcessQueue = isOffline === false && hasApiKey === true;
+  const queueBlocker = isOffline !== false
+    ? 'Connect to the internet to process saved receipts.'
+    : hasApiKey === false
+      ? 'Add an AI provider key to process saved receipts.'
+      : null;
 
   return (
     <View style={styles.screen}>
       {granted && cameraActive ? (
-        <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" enableTorch={flash === 'on'} />
+        <CameraView
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          facing="back"
+          enableTorch={flash === 'on'}
+          barcodeScannerSettings={scanMode === 'product' ? BARCODE_SCANNER_SETTINGS : undefined}
+          onBarcodeScanned={scanMode === 'product' ? handleBarcodeScanned : undefined}
+        />
       ) : (
         <LinearGradient colors={[Gradients.dark[0], Colors.black]} style={StyleSheet.absoluteFill} />
       )}
 
       {granted ? (
         <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
-          {/* Top controls */}
+          {/* Top controls. The close control and the flash stay here; the mode selector
+              moved to the thumb zone above the shutter (audit fix 4). */}
           <View style={[styles.topBar, { paddingTop: insets.top + Spacing.s3 }]}>
             <HudButton label="Close receipt scanner" onPress={returnToOrigin}>
               <X size={22} color={Colors.white} />
             </HudButton>
-            <View style={styles.modePill}>
-              <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
-              <Pressable
-                onPress={() => { void Haptics.selectionAsync(); setScanMode('receipt'); }}
-                hitSlop={MODE_OPTION_HIT_SLOP}
-                accessibilityRole="button"
-                accessibilityLabel="Receipt mode"
-                accessibilityState={{ selected: scanMode === 'receipt' }}
-                style={[styles.modeOption, scanMode === 'receipt' && styles.modeOptionActive]}
-              >
-                <Text style={[styles.modeLabel, scanMode === 'receipt' && styles.modeLabelActive]}>Receipt</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => { void Haptics.selectionAsync(); setScanMode('product'); }}
-                hitSlop={MODE_OPTION_HIT_SLOP}
-                accessibilityRole="button"
-                accessibilityLabel="Product mode"
-                accessibilityState={{ selected: scanMode === 'product' }}
-                style={[styles.modeOption, scanMode === 'product' && styles.modeOptionActive]}
-              >
-                <Text style={[styles.modeLabel, scanMode === 'product' && styles.modeLabelActive]}>Product</Text>
-              </Pressable>
-            </View>
             <HudButton label={flash === 'on' ? 'Turn flash off' : 'Turn flash on'} checked={flash === 'on'} onPress={() => setFlash(current => (current === 'on' ? 'off' : 'on'))}>
               <Zap size={22} color={flash === 'on' ? Colors.warning : Colors.white} fill={flash === 'on' ? Colors.warning : 'transparent'} />
             </HudButton>
           </View>
 
-          {/* Viewfinder */}
+          {/* Viewfinder. The frame is sized from the space it is given rather than from a
+              device width, so it cannot overflow the HUD on a short viewport or leave dead
+              space on a wide one. */}
           <View pointerEvents="none" style={styles.viewfinderArea}>
-            <View style={styles.viewfinderFrame} onLayout={(event) => setFrameHeight(event.nativeEvent.layout.height)}>
-              <ScanLine trackHeight={frameHeight} reduceMotion={reduceMotion} />
-              <CornerBrackets />
+            <View
+              style={styles.frameSlot}
+              onLayout={(event) => {
+                const { width, height } = event.nativeEvent.layout;
+                setFrameSlot({ width, height });
+              }}
+            >
+              <View style={[styles.viewfinderFrame, { width: frameWidth }]} onLayout={(event) => setFrameHeight(event.nativeEvent.layout.height)}>
+                <ScanLine trackHeight={frameHeight} reduceMotion={reduceMotion} />
+                <CornerBrackets />
+              </View>
             </View>
             <View style={styles.alignPill}>
               <BlurView intensity={30} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
@@ -550,65 +1032,116 @@ export default function ScanScreen() {
             </View>
           </View>
 
-          {/* Offline banner */}
-          {isOffline ? (
-            <View accessibilityLiveRegion="polite" style={[styles.offlineBanner, { top: insets.top + OFFLINE_TOP_OFFSET }]}>
+          {/* Capture status. Offline and a missing key never stop a capture: they only say
+              what will happen to the photo once it is taken. */}
+          {isOffline || hasApiKey === false ? (
+            <View accessibilityLiveRegion="polite" style={[styles.offlineBanner, { top: insets.top + OFFLINE_TOP_OFFSET + (showBarcode ? BARCODE_PILL_CLEARANCE : 0) }]}>
               <View style={styles.offlineDot} />
-              <Text style={styles.offlineText}>Offline. OCR needs a connection.</Text>
-              <Pressable onPress={() => router.push('/expense/manual')} accessibilityRole="button" accessibilityLabel="Enter expense manually" style={styles.offlineAction}>
-                <Text style={styles.offlineActionText}>Manual Entry</Text>
-              </Pressable>
+              <Text style={styles.offlineText}>
+                {isOffline
+                  ? 'Offline. Captures are saved on this device.'
+                  : 'No AI key set. Captures are saved on this device.'}
+              </Text>
+              {isOffline ? null : (
+                <Pressable onPress={() => router.push('/settings/chat')} accessibilityRole="button" accessibilityLabel="Open AI provider settings" style={styles.offlineAction}>
+                  <Text style={styles.offlineActionText}>Add key</Text>
+                </Pressable>
+              )}
             </View>
           ) : null}
 
-          {/* Bottom thumb-zone controls */}
-          <View style={[styles.bottomRow, { paddingBottom: Math.max(insets.bottom, Spacing.s8) }]} pointerEvents="box-none">
-            <HudButton label="Choose image from gallery" onPress={() => { void handleGalleryPick(); }} disabled={!canCapture}>
-              <ImageIcon size={22} color={Colors.white} />
-            </HudButton>
-            <Pressable
-              onPress={() => { void handleCapture(); }}
-              disabled={!canCapture}
-              accessibilityRole="button"
-              accessibilityLabel="Capture receipt for OCR"
-              accessibilityState={{ disabled: !canCapture, busy: isScanning }}
-              style={({ pressed }) => [styles.shutterWrap, pressed && !reduceMotion && styles.shutterPressed, !canCapture && styles.shutterDisabled]}
-            >
-              <View style={styles.shutterGlow} />
-              <LinearGradient colors={[Colors.primaryContainer, Gradients.light[0]]} start={{ x: 0, y: 0 }} end={{ x: 0, y: 1 }} style={styles.shutterRing}>
-                <View style={styles.shutterInnerRing}>
-                  <View style={styles.shutterCore} />
-                </View>
-              </LinearGradient>
-            </Pressable>
-            <HudButton label="Enter expense manually" onPress={() => router.push('/expense/manual')}>
-              <Pencil size={20} color={Colors.white} />
-            </HudButton>
+          {/* Bottom thumb-zone controls: mode selector, saved receipts, then the shutter row. */}
+          <View style={[styles.bottomStack, { paddingBottom: Math.max(insets.bottom, Spacing.s6) }]} pointerEvents="box-none">
+            {drafts.length > 0 ? (
+              <View style={styles.bottomBar}>
+                <PendingReceiptsBar count={drafts.length} onOpen={() => setIsDraftsOpen(true)} />
+              </View>
+            ) : null}
+            <View style={styles.modePillWrap}>
+              <View style={styles.modePill}>
+                <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
+                <Pressable
+                  onPress={() => { void Haptics.selectionAsync(); handleModeChange('receipt'); }}
+                  hitSlop={MODE_OPTION_HIT_SLOP}
+                  accessibilityRole="button"
+                  accessibilityLabel="Receipt mode"
+                  accessibilityState={{ selected: scanMode === 'receipt' }}
+                  style={[styles.modeOption, scanMode === 'receipt' && styles.modeOptionActive]}
+                >
+                  <Text style={[styles.modeLabel, scanMode === 'receipt' && styles.modeLabelActive]}>Receipt</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => { void Haptics.selectionAsync(); handleModeChange('product'); }}
+                  hitSlop={MODE_OPTION_HIT_SLOP}
+                  accessibilityRole="button"
+                  accessibilityLabel="Product mode"
+                  accessibilityState={{ selected: scanMode === 'product' }}
+                  style={[styles.modeOption, scanMode === 'product' && styles.modeOptionActive]}
+                >
+                  <Text style={[styles.modeLabel, scanMode === 'product' && styles.modeLabelActive]}>Product</Text>
+                </Pressable>
+              </View>
+            </View>
+            <View style={styles.bottomRow}>
+              <View style={styles.bottomEdge}>
+                <HudButton label="Choose image from gallery" onPress={() => { void handleGalleryPick(); }} disabled={!canCapture}>
+                  <ImageIcon size={22} color={Colors.white} />
+                </HudButton>
+              </View>
+              <Pressable
+                onPress={() => { void handleCapture(); }}
+                disabled={!canCapture}
+                accessibilityRole="button"
+                accessibilityLabel="Capture receipt for OCR"
+                accessibilityState={{ disabled: !canCapture, busy: isScanning }}
+                style={({ pressed }) => [styles.shutterWrap, pressed && !reduceMotion && styles.shutterPressed, !canCapture && styles.shutterDisabled]}
+              >
+                <View style={styles.shutterGlow} />
+                <LinearGradient colors={[Colors.primaryContainer, Gradients.light[0]]} start={{ x: 0, y: 0 }} end={{ x: 0, y: 1 }} style={styles.shutterRing}>
+                  <View style={styles.shutterInnerRing}>
+                    <View style={styles.shutterCore} />
+                  </View>
+                </LinearGradient>
+              </Pressable>
+              <View style={[styles.bottomEdge, styles.bottomEdgeEnd]}>
+                <Pressable
+                  onPress={() => { void Haptics.selectionAsync(); openManualEntry(); }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Enter expense manually"
+                  style={({ pressed }) => [styles.manualButton, pressed && styles.hudButtonPressed]}
+                >
+                  <BlurView intensity={40} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
+                  <Pencil size={18} color={Colors.white} />
+                  <Text numberOfLines={1} style={styles.manualLabel}>Manual</Text>
+                </Pressable>
+              </View>
+            </View>
           </View>
         </View>
       ) : (
         <PermissionRecovery
           onGrant={() => { void handleGrantPermission(); }}
-          onManual={() => router.push('/expense/manual')}
+          onManual={() => openManualEntry()}
           canAskAgain={permission.canAskAgain !== false}
+          insets={insets}
         />
       )}
 
-      {/* Illegible image recovery */}
-      {illegibleVisible ? (
+      {/* Scan recovery, for the two codes that mean nothing usable came back. The title and body are
+          derived from the code and the active mode, so a product failure is never described with
+          receipt nouns and no cause the app did not establish is asserted. */}
+      {failureDialog ? (
         <View style={styles.illegibleScrim}>
           <View style={styles.illegibleCard} accessibilityViewIsModal>
             <View style={styles.illegibleIcon}>
               <Camera size={24} color={Colors.primary} />
             </View>
-            <Text accessibilityRole="header" style={styles.illegibleTitle}>Receipt Unclear</Text>
-            <Text style={styles.illegibleBody}>
-              Text was too blurry or lighting was too dim to reliably parse the merchant and totals.
-            </Text>
-            <PeachButton title="Try Again" onPress={() => setIllegibleVisible(false)} variant="primary" size="lg" fullWidth tone="dark" />
+            <Text accessibilityRole="header" style={styles.illegibleTitle}>{failureDialog.title}</Text>
+            <Text style={styles.illegibleBody}>{failureDialog.body}</Text>
+            <PeachButton title="Try Again" onPress={() => setDialogCode(null)} variant="primary" size="lg" fullWidth tone="dark" />
             <PeachButton
               title="Enter Manually"
-              onPress={() => { setIllegibleVisible(false); router.push('/expense/manual'); }}
+              onPress={() => openManualEntry()}
               variant="secondary"
               tone="dark"
               size="lg"
@@ -624,6 +1157,7 @@ export default function ScanScreen() {
         contextLabel={processing.contextLabel}
         title={processing.title}
         description={processing.description}
+        steps={steps}
         onCancel={() => { void cancelProcessing(); }}
       />
 
@@ -636,6 +1170,21 @@ export default function ScanScreen() {
         onConfirm={handleConfirm}
         onCancel={handleCloseSheet}
       />
+
+      {/* The code the device decoded, product mode only. It is rendered after the
+          verification sheet so it stays visible alongside the result, which is
+          what DEC-B18 asks for and what the sheet, a shared locked-pair
+          component this row may not extend, cannot show itself. It is
+          information, not a control, so it never takes a touch. */}
+      {showBarcode ? (
+        <View pointerEvents="none" style={[styles.barcodeLayer, { top: insets.top + OFFLINE_TOP_OFFSET }]}>
+          <View accessible accessibilityLabel={`Scanned barcode ${decodedBarcode}`} style={styles.barcodePill}>
+            <BlurView intensity={30} tint="dark" style={StyleSheet.absoluteFill} pointerEvents="none" />
+            <Barcode size={16} color={Colors.primaryContainer} />
+            <Text numberOfLines={1} style={styles.barcodeText}>{decodedBarcode}</Text>
+          </View>
+        </View>
+      ) : null}
 
       {duplicateWarning && pendingBatch && pendingBatch[0] ? (
         <DuplicateWarningModal
@@ -663,16 +1212,27 @@ export default function ScanScreen() {
           }}
         />
       ) : null}
+
+      <PendingReceiptsSheet
+        visible={isDraftsOpen}
+        drafts={drafts}
+        canProcess={canProcessQueue}
+        blockerMessage={queueBlocker}
+        isProcessing={isQueueProcessing}
+        onClose={() => setIsDraftsOpen(false)}
+        onProcessQueue={() => { void processQueuedDraft(); }}
+        onQueueAgain={(draft) => { void requeueDraft(draft.id); }}
+        onDiscard={(draft) => { void discardDraft(draft); }}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: DarkTheme.background },
-  viewfinderArea: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: Spacing.s6 },
+  viewfinderArea: { flex: 1, alignItems: 'center', paddingHorizontal: Spacing.s6 },
+  frameSlot: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center' },
   viewfinderFrame: {
-    width: '72%',
-    maxWidth: VIEWFINDER_MAX_WIDTH,
     aspectRatio: VIEWFINDER_ASPECT,
     position: 'relative',
   },
@@ -698,7 +1258,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     alignSelf: 'center',
     gap: Spacing.s2,
-    marginTop: Spacing.s4,
+    marginBottom: Spacing.s2,
     maxWidth: '90%',
     paddingHorizontal: Spacing.s4,
     paddingVertical: Spacing.s2,
@@ -709,8 +1269,7 @@ const styles = StyleSheet.create({
   },
   alignDot: { width: 8, height: 8, borderRadius: Radii.full, backgroundColor: Colors.primaryContainer },
   alignText: { ...Typography.labelMd, color: 'rgba(255,255,255,0.9)', flexShrink: 1 },
-  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.s5 },
-  hudButton: {
+  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.s5 },  hudButton: {
     width: HUD_BUTTON_SIZE,
     height: HUD_BUTTON_SIZE,
     borderRadius: Radii.full,
@@ -756,7 +1315,29 @@ const styles = StyleSheet.create({
   offlineText: { ...Typography.micro, color: Colors.white, flex: 1, minWidth: 0 },
   offlineAction: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s1, borderRadius: Radii.sm, backgroundColor: Colors.primaryContainer, minHeight: HUD_BUTTON_SIZE, justifyContent: 'center' },
   offlineActionText: { ...Typography.micro, color: Colors.white, fontFamily: 'Manrope_700Bold' },
-  bottomRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.s7 },
+  // The bottom controls are one stack so the mode selector, the saved-receipt bar and the
+  // shutter row keep their order and their separation at every width. Nothing here is a
+  // fixed device size: the rows are flex rows and the shutter is the only fixed square.
+  bottomStack: { marginTop: 'auto', gap: Spacing.s4 },
+  bottomBar: { paddingHorizontal: Spacing.s4 },
+  modePillWrap: { alignItems: 'center' },
+  bottomRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: Spacing.s4 },
+  bottomEdge: { flex: 1, flexShrink: 1, minWidth: 0, alignItems: 'flex-start' },
+  bottomEdgeEnd: { alignItems: 'flex-end' },
+  manualButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    maxWidth: '100%',
+    minHeight: HUD_BUTTON_SIZE,
+    paddingHorizontal: Spacing.s3,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    overflow: 'hidden',
+  },
+  manualLabel: { ...Typography.captionBold, color: Colors.white, flexShrink: 1 },
   shutterWrap: { width: SHUTTER_GLOW_SIZE, height: SHUTTER_GLOW_SIZE, alignItems: 'center', justifyContent: 'center' },
   shutterPressed: { transform: [{ scale: 0.95 }] },
   shutterDisabled: { opacity: 0.5 },
@@ -765,6 +1346,7 @@ const styles = StyleSheet.create({
   shutterInnerRing: { flex: 1, width: '100%', borderRadius: Radii.full, borderWidth: 2, borderColor: 'rgba(255,255,255,0.9)', backgroundColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center' },
   shutterCore: { width: SHUTTER_CORE_SIZE, height: SHUTTER_CORE_SIZE, borderRadius: Radii.full, backgroundColor: Colors.white },
   recoveryLayer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', paddingHorizontal: Spacing.s8 },
+  recoveryCard: { width: '100%', maxWidth: RECOVERY_MAX_WIDTH, alignItems: 'center' },
   recoveryIcon: {
     width: 64,
     height: 64,
@@ -806,4 +1388,22 @@ const styles = StyleSheet.create({
   illegibleTitle: { ...Typography.headlineMd, color: Colors.white, marginBottom: Spacing.s1 },
   illegibleBody: { ...Typography.labelMd, color: 'rgba(255,255,255,0.75)', textAlign: 'center', alignSelf: 'center', maxWidth: 260, marginBottom: Spacing.s5 },
   illegibleSecondary: { marginTop: Spacing.s2 },
+  // The decoded-code pill is the pair's instruction pill idiom (code.html:204-208)
+  // on the safe-area anchor the offline notice uses. It is not a touch target and
+  // adds no motion; the text shrinks and ellipsises rather than overflowing.
+  barcodeLayer: { position: 'absolute', left: 0, right: 0, alignItems: 'center', paddingHorizontal: Spacing.s6, zIndex: 20 },
+  barcodePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    maxWidth: '100%',
+    paddingHorizontal: Spacing.s4,
+    paddingVertical: Spacing.s2,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    overflow: 'hidden',
+  },
+  barcodeText: { ...Typography.labelMd, color: Colors.white, flexShrink: 1 },
 });

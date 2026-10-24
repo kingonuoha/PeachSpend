@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { databaseService } from '../services/DatabaseService';
 import {
   ExpenseDetailService,
@@ -41,6 +41,52 @@ const memory: ExpenseMemory = {
 
 const detailService = new ExpenseDetailService(dataSource, memory);
 
+type ExpenseDetailRead =
+  | { status: 'failed' }
+  | { status: 'missing' }
+  | {
+      status: 'loaded';
+      records: Expense[];
+      categories: Awaited<ReturnType<typeof databaseService.getCategories>>;
+      origin: ExpenseRecordOrigin;
+      index: number;
+    };
+
+// One read for the screen. It is an async helper of its own for two reasons: an
+// async function can never throw synchronously, so a failing source always lands
+// here as a typed result after an await, and the hook's state updates therefore
+// sit unambiguously past the await boundary instead of in a catch that a
+// synchronously throwing source could reach inside the mount effect.
+async function readExpenseDetail(initialId: string, orderedIds?: string[]): Promise<ExpenseDetailRead> {
+  try {
+    const [detail, all, categories] = await Promise.all([
+      detailService.readDetail(initialId, orderedIds),
+      databaseService.getExpenses(),
+      databaseService.getCategories(),
+    ]);
+    if (!detail) return { status: 'missing' };
+
+    let ordered: Expense[] = all;
+    if (orderedIds && orderedIds.length > 0) {
+      const byId = new Map(all.map(expense => [expense.id, expense]));
+      ordered = orderedIds
+        .map(recordId => byId.get(recordId))
+        .filter((expense): expense is Expense => Boolean(expense));
+    }
+
+    const index = ordered.findIndex(expense => expense.id === initialId);
+    return {
+      status: 'loaded',
+      records: ordered,
+      categories,
+      origin: detail.origin,
+      index: index >= 0 ? index : 0,
+    };
+  } catch {
+    return { status: 'failed' };
+  }
+}
+
 export interface ExpenseDetailState {
   records: Expense[];
   categoryOptions: ExpenseCategoryOption[];
@@ -67,56 +113,44 @@ export function useExpenseDetail(initialId: string, orderedIds?: string[]): Expe
   const [categoryMeta, setCategoryMeta] = useState<Record<string, ExpenseCategoryMeta>>({});
   const [initialOrigin, setInitialOrigin] = useState<ExpenseRecordOrigin>('unknown');
   const [initialIndex, setInitialIndex] = useState(0);
-  const [loading, setLoading] = useState(true);
+  // The id plus arrival order the last landed read belongs to. `loading` is derived
+  // from it so this hook's fetch effect never sets state synchronously; a read the
+  // screen is still waiting on simply has no key yet.
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
   const [missing, setMissing] = useState(false);
   const [failed, setFailed] = useState(false);
   const requestId = useRef(0);
 
+  const readKey = useMemo(
+    () => `${initialId}|${orderedIds && orderedIds.length > 0 ? orderedIds.join(',') : ''}`,
+    [initialId, orderedIds],
+  );
+
   const load = useCallback(async () => {
     const id = ++requestId.current;
-    setLoading(true);
-    setFailed(false);
-    try {
-      const [detail, all, categories] = await Promise.all([
-        detailService.readDetail(initialId, orderedIds),
-        databaseService.getExpenses(),
-        databaseService.getCategories(),
-      ]);
-      if (id !== requestId.current) return;
-      if (!detail) {
-        setMissing(true);
-        setRecords([]);
-        setLoading(false);
-        return;
-      }
+    const result = await readExpenseDetail(initialId, orderedIds);
+    if (id !== requestId.current) return;
 
-      let ordered: Expense[] = all;
-      if (orderedIds && orderedIds.length > 0) {
-        const byId = new Map(all.map(expense => [expense.id, expense]));
-        ordered = orderedIds
-          .map(recordId => byId.get(recordId))
-          .filter((expense): expense is Expense => Boolean(expense));
-      }
-
-      const index = ordered.findIndex(expense => expense.id === initialId);
-      const meta: Record<string, ExpenseCategoryMeta> = {};
-      for (const category of categories) {
-        meta[category.id] = { title: category.title, iconName: category.icon_name };
-      }
-
-      setRecords(ordered);
-      setCategoryOptions(categories.map(category => ({ id: category.id, title: category.title, icon_name: category.icon_name })));
-      setCategoryMeta(meta);
-      setInitialOrigin(detail.origin);
-      setInitialIndex(index >= 0 ? index : 0);
-      setMissing(false);
-      setLoading(false);
-    } catch {
-      if (id !== requestId.current) return;
-      setFailed(true);
-      setLoading(false);
+    // One unconditional commit of everything the read owns. Deriving the values
+    // first instead of setting them from inside a branch is what keeps the effect
+    // from cascading a render, and it means a failed or missing read cannot leave
+    // a stale field behind.
+    const loaded = result.status === 'loaded' ? result : null;
+    const categories = loaded?.categories ?? [];
+    const meta: Record<string, ExpenseCategoryMeta> = {};
+    for (const category of categories) {
+      meta[category.id] = { title: category.title, iconName: category.icon_name };
     }
-  }, [initialId, orderedIds]);
+
+    setRecords(loaded?.records ?? []);
+    setCategoryOptions(categories.map(category => ({ id: category.id, title: category.title, icon_name: category.icon_name })));
+    setCategoryMeta(meta);
+    setInitialOrigin(loaded?.origin ?? 'unknown');
+    setInitialIndex(loaded?.index ?? 0);
+    setMissing(result.status === 'missing');
+    setFailed(result.status === 'failed');
+    setLoadedKey(readKey);
+  }, [initialId, orderedIds, readKey]);
 
   useEffect(() => {
     void load();
@@ -152,16 +186,23 @@ export function useExpenseDetail(initialId: string, orderedIds?: string[]): Expe
 
   const originOf = useCallback((expense: Expense) => deriveExpenseOrigin(expense), []);
 
+  // The retry drops the landed key, which makes `loading` true again for the
+  // re-read, exactly as the previous setLoading(true) did before the fetch.
+  const retry = useCallback(() => {
+    setLoadedKey(null);
+    void load();
+  }, [load]);
+
   return {
     records,
     categoryOptions,
     categoryMeta,
     initialOrigin,
     initialIndex,
-    loading,
+    loading: loadedKey !== readKey,
     missing,
     failed,
-    retry: () => void load(),
+    retry,
     editCategory,
     remove,
     saveNote,

@@ -7,6 +7,19 @@ import { buildRecurringInsert, normalizeInterval, parseRecurrenceDays } from './
 import type { RecurrenceInterval } from './RecurringContracts';
 
 const keyFor = (merchant: string) => merchant.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
+// BUG-09-17a. Duplicate identity is the merchant, which is what the 24 hour
+// window is compared against. A merchantless candidate, which is what a product
+// photograph legitimately produces, has no identity to compare: matching it on
+// amount alone would make two unrelated merchantless purchases of the same
+// amount on the same day duplicates of each other, so the second would be
+// skipped without ever being saved. Such a candidate is therefore not duplicate
+// matched at all, and it is saved on its own merits.
+//
+// The note is deliberately not used as a substitute identity. It is free text
+// rather than a name the capture treats as an identity, it is not guaranteed to
+// hold an item name for every merchantless source, and a match on it would
+// surface a duplicate prompt whose existing record has an empty merchant.
+const hasDuplicateIdentity = (candidate: Pick<CaptureCandidate, 'merchant'>): boolean => candidate.merchant.trim().length > 0;
 const QUEUE_RETENTION_MS = 7 * 86400000;
 const DUPLICATE_WINDOW_MS = 86400000;
 // FR-22.3 scopes the Diagnostic Activity log to a recent window rather than an
@@ -29,20 +42,23 @@ export class SqliteCaptureRepository implements CaptureRepository {
   constructor(private readonly db: SQLite.SQLiteDatabase) {}
 
   async findDuplicate(candidate: Pick<CaptureCandidate, 'merchant' | 'amount' | 'date'>): Promise<DuplicateMatch | null> {
+    if (!hasDuplicateIdentity(candidate)) return null;
     const row = await this.db.getFirstAsync<Expense>('SELECT * FROM expenses WHERE LOWER(TRIM(merchant)) = LOWER(TRIM(?)) AND amount = ? AND date BETWEEN ? AND ? LIMIT 1', [candidate.merchant, candidate.amount, candidate.date - DUPLICATE_WINDOW_MS, candidate.date + DUPLICATE_WINDOW_MS]);
     return row ? { existing: row, reason: 'merchant_amount_24h' } : null;
   }
 
   async findBatchDuplicates(candidates: CaptureCandidate[]): Promise<BatchDuplicateMatch[]> {
     const matches: BatchDuplicateMatch[] = [];
-    const rowsByCandidate = await Promise.all(candidates.map(candidate => this.db.getAllAsync<Expense>('SELECT * FROM expenses WHERE LOWER(TRIM(merchant)) = LOWER(TRIM(?)) AND amount = ? AND date BETWEEN ? AND ?', [candidate.merchant, candidate.amount, candidate.date - DUPLICATE_WINDOW_MS, candidate.date + DUPLICATE_WINDOW_MS])));
+    const rowsByCandidate = await Promise.all(candidates.map(candidate => hasDuplicateIdentity(candidate)
+      ? this.db.getAllAsync<Expense>('SELECT * FROM expenses WHERE LOWER(TRIM(merchant)) = LOWER(TRIM(?)) AND amount = ? AND date BETWEEN ? AND ?', [candidate.merchant, candidate.amount, candidate.date - DUPLICATE_WINDOW_MS, candidate.date + DUPLICATE_WINDOW_MS])
+      : Promise.resolve<Expense[]>([])));
     for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
       const candidate = candidates[candidateIndex];
       const rows = rowsByCandidate[candidateIndex];
       rows.forEach(existing => matches.push({ candidateIndex, match: { existing, reason: 'merchant_amount_24h' } }));
       for (let otherCandidateIndex = 0; otherCandidateIndex < candidateIndex; otherCandidateIndex += 1) {
         const other = candidates[otherCandidateIndex];
-        if (keyFor(candidate.merchant) === keyFor(other.merchant) && candidate.amount === other.amount && Math.abs(candidate.date - other.date) <= DUPLICATE_WINDOW_MS) matches.push({ candidateIndex, otherCandidateIndex, reason: 'same_batch_24h' });
+        if (hasDuplicateIdentity(candidate) && hasDuplicateIdentity(other) && keyFor(candidate.merchant) === keyFor(other.merchant) && candidate.amount === other.amount && Math.abs(candidate.date - other.date) <= DUPLICATE_WINDOW_MS) matches.push({ candidateIndex, otherCandidateIndex, reason: 'same_batch_24h' });
       }
     }
     return matches;
@@ -94,7 +110,7 @@ export class SqliteCaptureRepository implements CaptureRepository {
   }
 
   async withTransaction<T>(operation: () => Promise<T>): Promise<T> {
-    await this.db.execAsync('BEGIN');
+    await this.db.execAsync('BEGIN IMMEDIATE');
     try {
       const result = await operation();
       await this.db.execAsync('COMMIT');
@@ -138,6 +154,12 @@ export class SqliteCaptureRepository implements CaptureRepository {
   }
 
   async rememberCategory(merchant: string, category: string, source: CaptureCandidate['source']): Promise<void> {
+    // Required consequence of BUG-09-17a. The memory is keyed per merchant, so a
+    // capture with no merchant has nothing to be remembered against. Writing the
+    // empty key would make every merchantless capture share one bucket, and
+    // `getRememberedCategory('')` would then pre-select an unrelated capture's
+    // category as if it had been remembered for this one. No identity, no entry.
+    if (!hasDuplicateIdentity({ merchant })) return;
     await this.db.runAsync('INSERT OR REPLACE INTO merchant_category_memory (merchant_key, merchant, category, source, updated_at) VALUES (?, ?, ?, ?, ?)', [keyFor(merchant), merchant, category, source, Date.now()]);
   }
 

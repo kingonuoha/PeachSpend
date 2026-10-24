@@ -2,12 +2,14 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { databaseService } from '../../services/DatabaseService';
 import { logger } from '../../utils/logger';
 import { isSecretSettingKey, maskSecret } from '../../data/secrets';
+import { toStoredBudget } from '../../data/SettingsContracts';
 import type { OnboardingSettings } from '../../data/contracts';
 import { getCurrencyPrefix, resolveCurrency } from '../../utils/currency';
 
 interface SettingsContextType {
   settings: Record<string, string>;
   updateSetting: (key: string, value: string) => Promise<void>;
+  updateSettings: (entries: Record<string, string>) => Promise<void>;
   // Read-only re-read of every setting. Lets a typed contract (for example the
   // theme-pack write) surface in the app without opening a second settings writer.
   refreshSettings: () => Promise<void>;
@@ -31,6 +33,29 @@ const DEFAULT_RATES: Record<string, number> = {
   CAD: 1.36,
   AUD: 1.52,
 };
+
+// Pure form of the onboarding mirror (BUG-09-04b), exported so the refused-value
+// branch is testable without a render harness. The budget is routed through the
+// shared write rule, so the in-memory snapshot carries exactly what the store
+// wrote; a value the rule refuses, for example a grouped "66,000", leaves the
+// previous snapshot value alone instead of injecting a string no strict reader
+// can honour.
+export function mergeOnboardingSettings(
+  prev: Record<string, string>,
+  onboarding: OnboardingSettings,
+): Record<string, string> {
+  const next: Record<string, string> = {
+    ...prev,
+    currency: onboarding.currency,
+    budget_currency: onboarding.currency,
+    onboarding_complete: 'true',
+  };
+  const profileName = onboarding.profileName?.trim();
+  if (profileName) next.profile_name = profileName;
+  const storedBudget = toStoredBudget(onboarding.monthlyBudget);
+  if (storedBudget !== null) next.monthly_budget = storedBudget;
+  return next;
+}
 
 export function SettingsProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<Record<string, string>>({});
@@ -82,20 +107,29 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const updateSettings = async (entries: Record<string, string>) => {
+    try {
+      await databaseService.updateSettings(entries);
+      setSettings(prev => {
+        const next = { ...prev };
+        for (const [key, value] of Object.entries(entries)) {
+          next[key] = isSecretSettingKey(key) ? (maskSecret(value) || '') : value;
+        }
+        return next;
+      });
+    } catch (error) {
+      logger.error('settings_batch_write_failed');
+      throw error;
+    }
+  };
+
   // Single entry point for onboarding complete and skip. The store writes the
   // whole state in one transaction, then the provider mirrors it in one state
   // update so the re-entry guard never sees a partial result. No secret key is
   // touched here.
   const completeOnboarding = useCallback(async (onboarding: OnboardingSettings) => {
     await databaseService.completeOnboarding(onboarding);
-    const profileName = onboarding.profileName?.trim();
-    const monthlyBudget = onboarding.monthlyBudget?.trim();
-    setSettings(prev => {
-      const next: Record<string, string> = { ...prev, currency: onboarding.currency, budget_currency: onboarding.currency, onboarding_complete: 'true' };
-      if (profileName) next.profile_name = profileName;
-      if (monthlyBudget) next.monthly_budget = monthlyBudget;
-      return next;
-    });
+    setSettings(prev => mergeOnboardingSettings(prev, onboarding));
   }, []);
 
   const currency = resolveCurrency(undefined, settings.currency || 'NGN');
@@ -129,6 +163,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       value={{ 
         settings, 
         updateSetting, 
+        updateSettings,
         refreshSettings: loadSettings,
         completeOnboarding,
         isLoading, 

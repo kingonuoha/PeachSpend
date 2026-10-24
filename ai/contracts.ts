@@ -2,7 +2,25 @@ import type { CaptureCandidate } from '../data/contracts';
 
 export type AiProvider = 'gemini' | 'openrouter';
 export type AiFeature = 'receipt_ocr' | 'chat' | 'narrative_insight' | 'auto_capture' | 'semantic_search';
-export type AiErrorCode = 'offline' | 'missing_key' | 'unauthorized' | 'rate_limited' | 'timeout' | 'illegible_image' | 'invalid_response' | 'provider' | 'cancelled';
+// The runtime list is the source of the union, so a caller that has to walk every
+// code (the failure message table test, or a screen that enumerates them) cannot
+// drift from the type. Members and their meaning are unchanged.
+export const AI_ERROR_CODES = [
+  'offline',
+  'missing_key',
+  'unauthorized',
+  'rate_limited',
+  'timeout',
+  'illegible_image',
+  'invalid_response',
+  'provider',
+  'cancelled',
+] as const;
+export type AiErrorCode = (typeof AI_ERROR_CODES)[number];
+// What the app was looking at when the call failed. Product and receipt are not a
+// copy switch, per DEC-B17: each names its own object, and a product failure must
+// never be described with receipt nouns.
+export type AiMessageContext = 'receipt' | 'chat' | 'product';
 
 export class AiError extends Error {
   readonly code: AiErrorCode;
@@ -23,19 +41,53 @@ export function normalizeAiError(error: unknown, provider: AiProvider): AiError 
   return new AiError('provider', provider, 'AI provider request failed', true);
 }
 
-export function getAiErrorMessage(code: AiErrorCode, context: 'receipt' | 'chat' = 'chat'): string {
-  if (context === 'receipt' && (code === 'invalid_response' || code === 'illegible_image')) return 'Receipt could not be processed. Try a clearer image.';
-  switch (code) {
-    case 'offline': return 'AI provider is unavailable offline.';
-    case 'missing_key': return 'AI provider key is not configured.';
-    case 'unauthorized': return 'AI provider authorization failed.';
-    case 'rate_limited': return 'AI provider rate limit reached. Try again later.';
-    case 'timeout': return 'AI provider request timed out. Try again.';
-    case 'illegible_image': return 'Receipt image is not clear enough. Try again.';
-    case 'invalid_response': return 'AI provider returned an invalid response.';
-    case 'cancelled': return 'AI provider request was cancelled.';
-    case 'provider': return 'AI provider request failed. Try again.';
-  }
+// Codes that describe the provider request itself rather than the object that was
+// scanned. They read the same in every context because the sentence names no scanned
+// object, so there is no receipt or product noun that could be wrong.
+type ProviderLevelCode = Exclude<AiErrorCode, 'illegible_image' | 'invalid_response'>;
+
+const PROVIDER_MESSAGE: Record<ProviderLevelCode, string> = {
+  offline: 'AI provider is unavailable offline.',
+  missing_key: 'AI provider key is not configured.',
+  unauthorized: 'AI provider authorization failed.',
+  rate_limited: 'AI provider rate limit reached. Try again later.',
+  timeout: 'AI provider request timed out. Try again.',
+  cancelled: 'AI provider request was cancelled.',
+  provider: 'AI provider request failed. Try again.',
+};
+
+// The two codes that describe the outcome of reading the scan itself, so they are the
+// two that need mode aware copy.
+// illegible_image means the provider could not read the image, which is a fact about
+// the photograph. invalid_response means the response could not be used, which is a
+// schema problem, not a photographic one, so it must not offer a retake as the remedy.
+// Neither sentence claims blur or dim lighting, because the app never establishes
+// either: it only knows what the provider returned.
+// The chat sentences are byte identical to the ones this table replaced, because the
+// row's constraint is to unflatten the two codes and change nothing else outside
+// receipt and product mode.
+type ScanOutcomeCode = 'illegible_image' | 'invalid_response';
+
+const SCAN_MESSAGE: Record<AiMessageContext, Record<ScanOutcomeCode, string>> = {
+  receipt: {
+    illegible_image: 'Receipt image could not be read. Retake the photo and try again.',
+    invalid_response: 'The AI response for this receipt could not be used. Try scanning again.',
+  },
+  chat: {
+    illegible_image: 'Receipt image is not clear enough. Try again.',
+    invalid_response: 'AI provider returned an invalid response.',
+  },
+  product: {
+    illegible_image: 'Product image could not be read. Retake the photo and try again.',
+    invalid_response: 'The AI response for this product could not be used. Try scanning again.',
+  },
+};
+
+// Pure and total: both tables are exhaustive records over their code sets, so every
+// code in the union returns a sentence and there is no fallthrough to undefined.
+export function getAiErrorMessage(code: AiErrorCode, context: AiMessageContext = 'chat'): string {
+  if (code === 'illegible_image' || code === 'invalid_response') return SCAN_MESSAGE[context][code];
+  return PROVIDER_MESSAGE[code];
 }
 
 export interface ProviderRequest { feature: AiFeature; prompt: string; imageBase64?: string; model: string; signal?: AbortSignal; }

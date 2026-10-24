@@ -64,6 +64,10 @@ export interface HomeSnapshot {
 
 export interface HomeDataSource {
   getExpenses(): Promise<Expense[]>;
+  getExpensesForPeriod?(startDate: number, endDate: number): Promise<Expense[]>;
+  // F-09, F-10. The recent list is its own bounded read rather than a slice of the
+  // period range, so a record outside the current and previous period still appears.
+  getRecentExpenses?(limit: number): Promise<Expense[]>;
   getSetting(key: string): Promise<string | null>;
   getIncomeForPeriod(start: number, end: number): Promise<number>;
   getIncomesForPeriod(start: number, end: number): Promise<Income[]>;

@@ -27,7 +27,14 @@ export interface VirtualNumpadProps {
   statusLabel?: string;
   pressedKeyPreview?: string;
   pressBadgeLabel?: string;
+  /**
+   * Key height in points. Defaults to the pair's docked value. A caller that docks the
+   * pad on a short viewport passes a smaller value, never below the 44pt touch floor.
+   */
+  keyHeight?: number;
 }
+
+const DEFAULT_KEY_HEIGHT = MIN_KEY_HEIGHT;
 
 function Cursor({ color, reduceMotion }: { color: string; reduceMotion: boolean }) {
   const [opacity] = useState(() => new Animated.Value(1));
@@ -49,7 +56,7 @@ function Cursor({ color, reduceMotion }: { color: string; reduceMotion: boolean 
   return <Animated.View pointerEvents="none" style={[numpadStyles.cursor, { backgroundColor: color, opacity }]} />;
 }
 
-function NumpadKey({ valueKey, onPress, previewPressed, badgeLabel }: { valueKey: string; onPress: (key: string) => void; previewPressed: boolean; badgeLabel?: string }) {
+function NumpadKey({ valueKey, onPress, previewPressed, badgeLabel, keyHeight }: { valueKey: string; onPress: (key: string) => void; previewPressed: boolean; badgeLabel?: string; keyHeight: number }) {
   const ts = useThemeStyles();
   const accessibilityLabel = valueKey === 'delete' ? 'Delete last digit' : valueKey === '.' ? 'Decimal point' : `Enter ${valueKey}`;
   return (
@@ -61,7 +68,7 @@ function NumpadKey({ valueKey, onPress, previewPressed, badgeLabel }: { valueKey
         const active = pressed || previewPressed;
         return [
           numpadStyles.key,
-          { backgroundColor: active ? ts.raw.purple100 : ts.bg.surface, borderColor: active ? ts.raw.primary : ts.raw.outline },
+          { minHeight: keyHeight, backgroundColor: active ? ts.raw.purple100 : ts.bg.surface, borderColor: active ? ts.raw.primary : ts.raw.outline },
           !ts.isDark && (active ? numpadStyles.keyActiveShadow : numpadStyles.keyShadow),
           active && numpadStyles.keyActive,
         ];
@@ -82,7 +89,7 @@ function NumpadKey({ valueKey, onPress, previewPressed, badgeLabel }: { valueKey
   );
 }
 
-export function VirtualNumpad({ onKeyPress, value, currencySymbol, entryLabel = 'Current Entry', statusLabel, pressedKeyPreview, pressBadgeLabel }: VirtualNumpadProps) {
+export function VirtualNumpad({ onKeyPress, value, currencySymbol, entryLabel = 'Current Entry', statusLabel, pressedKeyPreview, pressBadgeLabel, keyHeight = DEFAULT_KEY_HEIGHT }: VirtualNumpadProps) {
   const ts = useThemeStyles();
   const reduceMotion = useReduceMotion();
   const press = (key: string) => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onKeyPress(key); };
@@ -103,7 +110,7 @@ export function VirtualNumpad({ onKeyPress, value, currencySymbol, entryLabel = 
       <View accessibilityLabel="Amount keypad" style={[numpadStyles.pad, { backgroundColor: ts.bg.surface, borderColor: ts.raw.outline }, !ts.isDark && numpadStyles.padShadow]}>
         {KEY_ROWS.map((row) => (
           <View key={row.join('-')} style={numpadStyles.row}>
-            {row.map((valueKey) => <NumpadKey key={valueKey} valueKey={valueKey} onPress={press} previewPressed={valueKey === pressedKeyPreview} badgeLabel={pressBadgeLabel} />)}
+            {row.map((valueKey) => <NumpadKey key={valueKey} valueKey={valueKey} onPress={press} previewPressed={valueKey === pressedKeyPreview} badgeLabel={pressBadgeLabel} keyHeight={keyHeight} />)}
           </View>
         ))}
       </View>
@@ -122,7 +129,7 @@ const numpadStyles = StyleSheet.create({
   pad: { borderWidth: 1, borderRadius: Radii.xl, padding: Spacing.s4, gap: Spacing.s3 },
   padShadow: { shadowColor: LightTheme.primary, shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.16, shadowRadius: 24, elevation: 6 },
   row: { flexDirection: 'row', gap: Spacing.s3 },
-  key: { flex: 1, minHeight: MIN_KEY_HEIGHT, borderRadius: Radii.md, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  key: { flex: 1, borderRadius: Radii.md, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   keyShadow: { shadowColor: LightTheme.primary, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.06, shadowRadius: 6, elevation: 1 },
   keyActiveShadow: { shadowColor: LightTheme.primary, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 12, elevation: 3 },
   keyActive: { transform: [{ scale: 0.94 }] },

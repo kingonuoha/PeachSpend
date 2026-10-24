@@ -1,5 +1,4 @@
 import type { Expense } from '../types/database';
-import type { SettingsPort } from './SettingsContracts';
 import type { ThemePackState } from './ThemePackContracts';
 
 export type ProfileLoadState = 'ready' | 'empty' | 'failure';
@@ -48,12 +47,22 @@ export interface BadgeProgressRow {
   target: number;
 }
 
+export interface ProfileExpenseSummary {
+  transactionCount: number;
+  scansCount: number;
+  totalSpent: number;
+  earliestExpenseDate: number | null;
+  hasForeignCurrencies: boolean;
+}
+
 export interface ProfileDataSource {
   getExpenses(): Promise<Expense[]>;
   getSetting(key: string): Promise<string | null>;
+  getAllSettings?(): Promise<Record<string, string>>;
   getStreak(): Promise<number>;
-  getBadgeProgress(): Promise<BadgeProgressRow[]>;
+  getBadgeProgress(cachedSettings?: Record<string, string>): Promise<BadgeProgressRow[]>;
   getUnreadNotificationCount(): Promise<number>;
+  getProfileExpenseSummary?(): Promise<ProfileExpenseSummary>;
 }
 
 // SH-05c save boundary (FR-05.4, FR-06.3). Only the canonical edit flow calls
