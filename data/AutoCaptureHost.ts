@@ -20,6 +20,14 @@ const INITIAL_STATE: AutoCaptureHostState = {
   pendingCount: 0,
 };
 const MAX_PENDING_EVENTS = 50;
+// Queue dedup window (FR-SHNEW.4, brief section 4, ESC-13-02). Push plus SMS
+// twins for the same transaction collapse into one draft inside this window;
+// a twin arriving later stays a separate draft. One line to retune.
+export const QUEUE_DEDUP_WINDOW_MS = 15 * 60 * 1000;
+
+function normalizeQueueMerchant(merchant: string): string {
+  return merchant.trim().toLowerCase().replace(/\s+/g, ' ');
+}
 
 export class RootAutoCaptureHost implements AutoCaptureHostContract {
   private state = INITIAL_STATE;
@@ -71,6 +79,22 @@ export class RootAutoCaptureHost implements AutoCaptureHostContract {
 
   async presentEvent(event: AutoCaptureEvent): Promise<void> {
     if (!this.state.enabled || this.state.permission !== 'granted') return;
+    // Queue dedup (FR-SHNEW.4): same normalized merchant plus same amount
+    // within the window of a pending or claimed event collapses into one
+    // draft. The dropped twin is recorded as duplicate_skipped so the S-22
+    // diagnostic card shows why, and the confirm time duplicate check in
+    // CaptureService stays untouched as the second net.
+    if (this.isQueueDuplicate(event)) {
+      await this.repository.recordEvent({
+        source: event.candidate.source,
+        status: 'duplicate_skipped',
+        merchant: event.candidate.merchant,
+        amount: event.candidate.amount,
+        category: event.candidate.category,
+        payload: JSON.stringify({ origin: event.candidate.origin ?? 'auto_capture' }),
+      });
+      return;
+    }
     if (this.currentEvent) {
       if (this.pendingEvents.length >= MAX_PENDING_EVENTS) this.pendingEvents.shift();
       this.pendingEvents.push(event);
@@ -153,6 +177,17 @@ export class RootAutoCaptureHost implements AutoCaptureHostContract {
   private clearPending(): void {
     this.currentEvent = null;
     this.pendingEvents = [];
+  }
+
+  private isQueueDuplicate(event: AutoCaptureEvent): boolean {
+    const merchant = normalizeQueueMerchant(event.candidate.merchant);
+    const held = this.currentEvent ? [this.currentEvent, ...this.pendingEvents] : this.pendingEvents;
+    return held.some(
+      existing =>
+        normalizeQueueMerchant(existing.candidate.merchant) === merchant &&
+        existing.candidate.amount === event.candidate.amount &&
+        Math.abs(event.receivedAt - existing.receivedAt) <= QUEUE_DEDUP_WINDOW_MS,
+    );
   }
 
   private totalPending(): number {

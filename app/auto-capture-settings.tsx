@@ -482,6 +482,9 @@ export default function AutoCaptureSettingsScreen() {
                   })
                 )}
               </View>
+              <Text style={[Typography.micro, styles.fallbackNote, { color: ts.text.onSurfaceVariant }]}>
+                Other apps on this device are covered too. Alerts shaped like a bank transaction still draft for review.
+              </Text>
             </>
           )}
 
@@ -640,6 +643,7 @@ const styles = StyleSheet.create({
   permissionIcon: { width: 34, height: 34, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },
   unavailableRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
   sectionTitleBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: Spacing.s1 },
+  fallbackNote: { textAlign: 'center', paddingHorizontal: Spacing.s4 },
   listCard: { padding: 0, overflow: 'hidden' },
   sourceRow: {
     flexDirection: 'row',

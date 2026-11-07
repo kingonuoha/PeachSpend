@@ -9,12 +9,19 @@ class AutoCaptureNotificationListenerService : NotificationListenerService() {
     if (!AutoCaptureModule.isCaptureEnabled(applicationContext)) return
     if (!AutoCaptureModule.isListenerEnabled(applicationContext)) return
     val packageName = sbn.packageName
-    if (!AutoCaptureModule.isSupportedPackage(packageName)) return
     val extras = sbn.notification.extras
     val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
     val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
     val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()
     val sanitized = sanitize(title, text, bigText) ?: return
+    // Single pipeline forward gate (Phase 13, FR-SHNEW.2): a named registry
+    // package forwards as today; any other package forwards only when the
+    // sanitized signal carries an amount like pattern. This is a cheap native
+    // pre-check to limit bridge wakeups only. The full keyword plus amount
+    // plus merchant gate lives in JS (parseNotificationCandidate), which is
+    // the sole decider of whether a draft is produced.
+    val combined = if (sanitized.title != null) "${sanitized.title} ${sanitized.text}" else sanitized.text
+    if (!AutoCaptureModule.isSupportedPackage(packageName) && !hasAmountLikeSignal(combined)) return
     val payload = mutableMapOf<String, Any?>(
       "id" to "${packageName}:${sbn.id}:${sbn.postTime}",
       "packageName" to packageName,
@@ -66,5 +73,17 @@ class AutoCaptureNotificationListenerService : NotificationListenerService() {
       "https?://|www\\.|\\b(?:card|account)\\s*(?:ending|number|no\\.?|#)?\\s*\\d{2,}|\\b\\d{13,19}\\b",
       RegexOption.IGNORE_CASE,
     )
+    // Cheap amount like pre-check for the forward gate above. Matches a
+    // currency token next to digits, a grouped or decimal digit run, or a
+    // bare run of 3 or more digits. Deliberately looser than the JS amount
+    // pattern so it never drops a transaction the full gate would accept;
+    // anything forwarded still passes the JS keyword plus merchant gate
+    // before a draft can exist.
+    private val AMOUNT_LIKE_PATTERN = Regex(
+      "(?:[$€£₦]|USD|EUR|GBP|NGN|N(?=\\s*\\d))\\s*\\d|\\d[\\d,]*\\.\\d{1,2}|\\d{1,3}(?:,\\d{3})+|\\b\\d{3,}\\b",
+      RegexOption.IGNORE_CASE,
+    )
   }
+
+  private fun hasAmountLikeSignal(combined: String): Boolean = AMOUNT_LIKE_PATTERN.containsMatchIn(combined)
 }

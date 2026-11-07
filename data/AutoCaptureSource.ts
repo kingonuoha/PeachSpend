@@ -22,12 +22,64 @@ export interface NotificationParser {
 
 const UNAVAILABLE_REASON = 'Optional Android notification source is not installed';
 const MAX_NOTIFICATION_TEXT = 280;
+// Named registry (Phase 13, FR-22.2). One row per verified banking app; the
+// package ID is the Play Store listing ID, never invented. Display names match
+// the Kotlin supportedPackages plus displayNames exactly; QA verifies parity.
 const ALLOWED_SOURCE_METADATA: Readonly<Record<string, { packageName: string; displayName: string }>> = Object.freeze({
   'google-wallet': { packageName: 'com.google.android.apps.walletnfcrel', displayName: 'Google Wallet' },
   chase: { packageName: 'com.chase.sig.android', displayName: 'Chase Mobile' },
   paypal: { packageName: 'com.paypal.android.p2pmobile', displayName: 'PayPal' },
   'cash-app': { packageName: 'com.squareup.cash', displayName: 'Cash App' },
+  // Nigerian commercial banks (brief section 4, Play Store verified).
+  'access-bank': { packageName: 'com.accessbank.nextgen', displayName: 'Access Bank' },
+  'first-bank': { packageName: 'com.firstbank.firstmobile', displayName: 'First Bank' },
+  gtbank: { packageName: 'com.gtbank.gtworldv1', displayName: 'GTBank' },
+  uba: { packageName: 'com.uba.vericash', displayName: 'UBA' },
+  'uba-mobile-app': { packageName: 'com.ubanquity.redd.uba', displayName: 'UBA Mobile App' },
+  'zenith-bank': { packageName: 'com.zenithBank.eazymoney', displayName: 'Zenith Bank' },
+  'fidelity-bank': { packageName: 'com.interswitchng.www', displayName: 'Fidelity Bank' },
+  fcmb: { packageName: 'com.appzonegroup.fcmb', displayName: 'FCMB' },
+  'union-bank': { packageName: 'com.ceva.ubmobile.stallion', displayName: 'Union Bank' },
+  'sterling-bank': { packageName: 'com.sterlingng.sterlingmobile', displayName: 'Sterling Bank' },
+  'wema-alat': { packageName: 'com.wemabank.alat.prod', displayName: 'ALAT by Wema' },
+  'stanbic-ibtc': { packageName: 'com.StanbicMobile', displayName: 'Stanbic IBTC' },
+  ecobank: { packageName: 'com.app.ecobank', displayName: 'Ecobank' },
+  'ecobank-mobile': { packageName: 'com.ecobank.mobileapp5', displayName: 'Ecobank Mobile' },
+  // Nigerian fintech (brief section 4, Play Store verified).
+  opay: { packageName: 'team.opay.pay', displayName: 'OPay' },
+  palmpay: { packageName: 'com.transsnet.palmpay', displayName: 'PalmPay' },
+  moniepoint: { packageName: 'com.moniepoint.personal', displayName: 'Moniepoint' },
+  'moniepoint-business': { packageName: 'com.moniepoint.business', displayName: 'Moniepoint Business' },
+  kuda: { packageName: 'com.kudabank.app', displayName: 'Kuda' },
+  carbon: { packageName: 'com.lenddo.mobile.paylater', displayName: 'Carbon' },
+  fairmoney: { packageName: 'ng.com.fairmoney.fairmoney', displayName: 'FairMoney' },
+  paga: { packageName: 'com.mypaga.customer', displayName: 'Paga' },
+  'chipper-cash': { packageName: 'com.chippercash', displayName: 'Chipper Cash' },
+  vbank: { packageName: 'com.vfd.app', displayName: 'Vbank' },
 });
+
+const REGISTRY_PACKAGE_NAMES: ReadonlySet<string> = new Set(
+  Object.values(ALLOWED_SOURCE_METADATA).map(metadata => metadata.packageName),
+);
+
+export function isRegistryPackage(packageName: string): boolean {
+  return REGISTRY_PACKAGE_NAMES.has(packageName);
+}
+
+// Shaped fallback gate (FR-SHNEW.1, brief section 4). A notification from a
+// package outside the named registry parses only when its combined title plus
+// text carries a debit or credit keyword plus a parseable amount plus a
+// merchant. Stems cover the brief word families: debit covers debited, credit
+// covers credited, transact covers transaction, pay covers paid and payment,
+// receiv covers receive and received, withdraw covers withdrawal, spend covers
+// spend while spent is listed outright, and balance counts only with the
+// separately required amount (a balance alert with movement). Registry
+// packages parse as today with no keyword required.
+const SHAPED_KEYWORD_PATTERN = /\b(debit|credit|spend|spent|pay|receiv|sent|transfer|withdraw|deposit|transact|balance)\w*/i;
+
+export function passesShapedGate(text: string): boolean {
+  return SHAPED_KEYWORD_PATTERN.test(text);
+}
 
 class UnavailableAutoCaptureSourceAdapter implements NativeAutoCaptureSourceAdapter {
   readonly capability: AutoCaptureCapability;
@@ -62,7 +114,8 @@ export function filterSupportedSources(
   // Allowlist gate with honest status pass through (FR-22.2). An unknown id
   // never invents a friendly name, a package mismatch never passes, and the
   // status Mobile supplies (active or not_detected) is preserved so S-22 can
-  // render Not detected. No bank package is added here; that waits on ESC-12-01.
+  // render Not detected. Shaped fallback packages carry no registry row and
+  // need none: they never reach this filter with a fabricated id.
   return sources.flatMap(source => {
     const metadata = ALLOWED_SOURCE_METADATA[source.id];
     if (!metadata || metadata.packageName !== source.packageName || !packageNames.has(source.packageName)) return [];
@@ -104,11 +157,21 @@ export function createParsedAutoCaptureSource(
     },
     subscribe(listener) {
       if (!lifecycleEnabled) return () => undefined;
+      // Single pipeline (FR-SHNEW.2): one notification yields at most one
+      // draft. A named registry package resolves to its descriptor; any other
+      // package gets a synthetic descriptor carrying its real package name
+      // (no invented friendly name) so the same parse call applies the shaped
+      // gate to it. The registry match and the shape match are OR conditions
+      // inside parseNotificationCandidate, never two pipelines.
       unsubscribe = adapter.subscribe(notification => {
         if (!lifecycleEnabled) return;
         if (!isSafeNotification(notification)) return;
-        const source = byPackage.get(notification.packageName);
-        if (!source) return;
+        const source = byPackage.get(notification.packageName) ?? {
+          id: notification.packageName,
+          packageName: notification.packageName,
+          displayName: notification.packageName,
+          status: 'active' as const,
+        };
         const outcome = parser.parse(notification, source);
         if (outcome.status === 'parsed') listener(outcome.event);
       });
@@ -158,8 +221,11 @@ export function parseNotificationCandidate(
   // carries the match when the title is absent and the title can carry the
   // merchant when the body holds only the amount. Debit and credit phrasing
   // both parse through the same amount plus merchant shape; direction is
-  // decided at the confirm sheet, not here.
+  // decided at the confirm sheet, not here. Packages outside the named
+  // registry must additionally pass the shaped gate (FR-SHNEW.1): a
+  // transaction keyword plus the amount plus the merchant below.
   const text = `${notification.title ?? ''} ${notification.text}`.trim();
+  if (!isRegistryPackage(source.packageName) && !passesShapedGate(text)) return null;
   const amountToken = text.match(PREFIX_AMOUNT_PATTERN)?.[1] ?? text.match(SUFFIX_AMOUNT_PATTERN)?.[1];
   if (!amountToken) return null;
   const amount = normalizeGroupedAmount(amountToken);

@@ -6,12 +6,21 @@ import {
   parseNotificationCandidate,
   sanitizeNativeNotification,
   filterSupportedSources,
+  isRegistryPackage,
+  passesShapedGate,
 } from './AutoCaptureSource';
 import type { AutoCaptureSourceDescriptor, NativeAutoCaptureNotification, NativeAutoCaptureSourceAdapter } from './contracts';
 
 const source: AutoCaptureSourceDescriptor = {
   id: 'chase', packageName: 'com.chase.sig.android', displayName: 'Chase Mobile', status: 'active',
 };
+const opaySource: AutoCaptureSourceDescriptor = {
+  id: 'opay', packageName: 'team.opay.pay', displayName: 'OPay', status: 'active',
+};
+const smsFallback: AutoCaptureSourceDescriptor = {
+  id: 'com.example.smsapp', packageName: 'com.example.smsapp', displayName: 'com.example.smsapp', status: 'active',
+};
+
 const notification: NativeAutoCaptureNotification = {
   id: 'notification-1', packageName: source.packageName, text: 'You made a $42.80 charge at Whole Foods Market.', receivedAt: 10,
 };
@@ -129,5 +138,72 @@ describe('optional auto-capture source boundary', () => {
   it('normalizes only immutable supported source metadata and rejects stale sources', () => {
     const stale = { ...source, id: 'removed', displayName: 'Attacker label' };
     expect(filterSupportedSources([source, stale], new Set([source.packageName]))).toEqual([source]);
+  });
+
+  it('parses a named NG bank debit alert from the extended registry', () => {
+    expect(isRegistryPackage('team.opay.pay')).toBe(true);
+    const candidate = parseNotificationCandidate(
+      { id: 'opay-debit', packageName: opaySource.packageName, title: 'Debit alert', text: 'N12,500.00 spent at Shoprite.', receivedAt: 30 },
+      opaySource,
+    );
+    expect(candidate).toMatchObject({ merchant: 'Shoprite', amount: 12500, currency: 'NGN' });
+  });
+
+  it('parses an unlisted package whose text is transaction shaped', () => {
+    expect(isRegistryPackage(smsFallback.packageName)).toBe(false);
+    expect(passesShapedGate('Your account was debited N25,000 to Jane Doe.')).toBe(true);
+    const candidate = parseNotificationCandidate(
+      { id: 'sms-debit', packageName: smsFallback.packageName, text: 'Your account was debited N25,000 to Jane Doe.', receivedAt: 31 },
+      smsFallback,
+    );
+    expect(candidate).toMatchObject({ merchant: 'Jane Doe', amount: 25000, currency: 'NGN' });
+  });
+
+  it('ignores an unlisted package with an amount but no transaction keyword', () => {
+    expect(passesShapedGate('Your reward of $42.80 at Whole Foods Market is ready.')).toBe(false);
+    const outcome = createNotificationParser(parseNotificationCandidate).parse(
+      { ...notification, packageName: smsFallback.packageName, text: 'Your reward of $42.80 at Whole Foods Market is ready.' },
+      smsFallback,
+    );
+    expect(outcome).toEqual({ status: 'ignored', code: 'not_transaction' });
+    expect(JSON.stringify(outcome)).not.toContain('Whole Foods');
+  });
+
+  it('yields exactly one event when registry and shape match the same notification', () => {
+    const adapter = fakeAdapter();
+    const events: unknown[] = [];
+    const sourceAdapter = createParsedAutoCaptureSource(adapter, createNotificationParser(parseNotificationCandidate), [source, opaySource]);
+    sourceAdapter.setLifecycle?.(true, 'granted');
+    sourceAdapter.subscribe(event => events.push(event));
+    adapter.emit({
+      id: 'dual-match', packageName: opaySource.packageName, title: 'Credit alert',
+      text: 'Your OPay account was credited with N25,000 from Jane Doe.', receivedAt: 32,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ candidate: { merchant: 'Jane Doe', amount: 25000, source: 'auto_capture' } });
+  });
+
+  it('forwards shaped fallback traffic through the same parse call with no invented name', () => {
+    const adapter = fakeAdapter();
+    const events: unknown[] = [];
+    const sourceAdapter = createParsedAutoCaptureSource(adapter, createNotificationParser(parseNotificationCandidate), [opaySource]);
+    sourceAdapter.setLifecycle?.(true, 'granted');
+    sourceAdapter.subscribe(event => events.push(event));
+    adapter.emit({
+      id: 'sms-shaped', packageName: smsFallback.packageName,
+      text: 'Your account was debited N25,000 to Jane Doe.', receivedAt: 33,
+    });
+    adapter.emit({
+      id: 'sms-noise', packageName: smsFallback.packageName,
+      text: 'Your reward of $42.80 at Whole Foods Market is ready.', receivedAt: 34,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      candidate: { merchant: 'Jane Doe', amount: 25000, note: `Detected from ${smsFallback.packageName}` },
+    });
+  });
+
+  it('gives shaped fallback packages no registry row', () => {
+    expect(filterSupportedSources([smsFallback], new Set([smsFallback.packageName]))).toEqual([]);
   });
 });
