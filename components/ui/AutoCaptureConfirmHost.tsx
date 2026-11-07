@@ -30,6 +30,33 @@ const SHEET_HEIGHT_RATIO = 0.85;
 
 type SheetView = 'summary' | 'edit';
 
+interface SaveDraft {
+  merchant: string;
+  amount: string;
+  categoryId: string;
+}
+
+// Pure derivation shared by the save path, the button label, and the duplicate
+// preview, so an edited merchant or amount is never silently dropped. In edit
+// view with valid input the draft wins; everywhere else the parser guess wins.
+// Invalid edit input falls back to the parser guess, and the edit save button
+// stays disabled until the input is valid.
+function buildSaveCandidate(
+  base: CaptureCandidate,
+  draftState: SaveDraft,
+  viewState: SheetView,
+  overrideCategory?: string,
+): CaptureCandidate {
+  const parsedAmount = parseFloat(draftState.amount);
+  const editedValid = draftState.merchant.trim().length > 0 && Number.isFinite(parsedAmount) && parsedAmount > 0;
+  return {
+    ...base,
+    merchant: viewState === 'edit' ? (draftState.merchant.trim() || base.merchant) : base.merchant,
+    amount: viewState === 'edit' && editedValid ? parsedAmount : base.amount,
+    category: overrideCategory ?? (draftState.categoryId || base.category),
+  };
+}
+
 function tintFor(category: string): { light: readonly [string, string]; dark: readonly [string, string] } {
   const key = category.trim().toLowerCase();
   const known = Object.prototype.hasOwnProperty.call(CategoryTints, key);
@@ -60,8 +87,8 @@ export default function AutoCaptureConfirmHost() {
   const adapter = useMemo(() => createNativeAutoCaptureAdapter(), []);
 
   useEffect(() => {
-    let unsubscribe = () => {};
     let disposed = false;
+    let hostUnsubscribe: (() => void) | null = null;
     let refreshGeneration = 0;
     const refreshLifecycle = () => {
       const generation = ++refreshGeneration;
@@ -79,8 +106,7 @@ export default function AutoCaptureConfirmHost() {
       const host = new RootAutoCaptureHost(repository);
       repositoryRef.current = repository;
       hostRef.current = host;
-      const hostUnsubscribe = host.subscribe(setState);
-      unsubscribe = () => { hostUnsubscribe(); host.stop(); };
+      hostUnsubscribe = host.subscribe(setState);
       setHostReady(true);
       refreshLifecycle();
     });
@@ -88,9 +114,16 @@ export default function AutoCaptureConfirmHost() {
       if (nextState !== 'active' || !hostRef.current) return;
       refreshLifecycle();
     });
-    const previousUnsubscribe = unsubscribe;
-    unsubscribe = () => { appState.remove(); previousUnsubscribe(); };
-    return () => { disposed = true; unsubscribe(); };
+    // The cleanup below must stop the exact host this run created. A previous
+    // revision captured the pre-resolution noop instead, so a settings toggle
+    // leaked the old host and its subscription while a second host started.
+    return () => {
+      disposed = true;
+      appState.remove();
+      hostUnsubscribe?.();
+      hostRef.current?.stop();
+      hostRef.current = null;
+    };
   }, [adapter, settings.auto_capture_enabled]);
 
   // Claim the next queued detection whenever the host has none rendered. This
@@ -100,6 +133,21 @@ export default function AutoCaptureConfirmHost() {
     const next = hostRef.current?.claimOverlay() ?? null;
     if (next) setEvent(next);
   }, [hostReady, event, state?.pendingCount]);
+
+  // When the host reports no active overlay and nothing queued (revoke, master
+  // off, capability loss), the rendered draft is unclaimable, so drop it and
+  // let the next real detection claim fresh. The releasedEventId guard keeps
+  // this render-phase update single-shot per event.
+  const [releasedEventId, setReleasedEventId] = useState<string | null>(null);
+  if (event && state && !state.overlayActive && state.pendingCount === 0 && event.id !== releasedEventId) {
+    setReleasedEventId(event.id);
+    setEvent(null);
+    setDuplicate(null);
+    setSaveError(false);
+    setView('summary');
+    setConfirming(false);
+    setPickerOpen(false);
+  }
 
   useEffect(() => {
     hostRef.current?.setEnabled(settings.auto_capture_enabled === 'true');
@@ -128,12 +176,14 @@ export default function AutoCaptureConfirmHost() {
 
   // Pull any per-merchant correction already stored for FR-SHNEW.4 and prefer it
   // over the parser guess. This is a real read; no correction means no change.
+  // When a stored rule applies, the summary shows the learned-rule banner.
   useEffect(() => {
     if (!event) return;
     let active = true;
     void repositoryRef.current?.getRememberedCategory(event.candidate.merchant).then(stored => {
       if (!active || !stored) return;
       setDraft(prev => ({ ...prev, categoryId: stored }));
+      setRuleLearned(true);
     }).catch(() => undefined);
     return () => { active = false; };
   }, [event]);
@@ -159,11 +209,11 @@ export default function AutoCaptureConfirmHost() {
     const host = hostRef.current;
     const repository = repositoryRef.current;
     if (event && repository && host) {
-      const candidate: CaptureCandidate = { ...event.candidate, category: draft.categoryId || event.candidate.category };
+      const candidate = buildSaveCandidate(event.candidate, draft, view);
       void resolveExpenseSave(repository, candidate, 'discard').catch(() => undefined);
     }
     dismiss();
-  }, [event, draft.categoryId, dismiss]);
+  }, [event, draft, view, dismiss]);
 
   const confirm = useCallback(async (decision: 'confirm' | 'save_anyway' = 'confirm', overrideCategory?: string) => {
     const host = hostRef.current;
@@ -174,7 +224,7 @@ export default function AutoCaptureConfirmHost() {
       setConfirming(true);
       setSaveError(false);
     }
-    const candidate: CaptureCandidate = { ...event.candidate, category: overrideCategory ?? (draft.categoryId || event.candidate.category) };
+    const candidate: CaptureCandidate = buildSaveCandidate(event.candidate, draft, view, overrideCategory);
     try {
       const resolution = await resolveExpenseSave(repository, candidate, decision);
       if (resolution.status === 'duplicate') {
@@ -194,10 +244,12 @@ export default function AutoCaptureConfirmHost() {
         },
       });
       // Persist a corrected category per merchant only when the user asked to
-      // remember it. The write is fire-and-forget; a failure never blocks the save.
+      // remember it. The write is fire-and-forget; a failure never blocks the
+      // save. The learned-rule banner surfaces on the next detection from this
+      // merchant through the remembered-category lookup, never here, because
+      // the sheet dismisses immediately after a successful save.
       if (rememberRule && candidate.category !== event.candidate.category) {
         await repository.rememberCategory(candidate.merchant, candidate.category, 'auto_capture').catch(() => undefined);
-        setRuleLearned(true);
       }
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       dismiss();
@@ -205,7 +257,7 @@ export default function AutoCaptureConfirmHost() {
       setConfirming(false);
       setSaveError(true);
     }
-  }, [event, draft.categoryId, rememberRule, checkForNewAchievements, dismiss]);
+  }, [event, draft, view, rememberRule, checkForNewAchievements, dismiss]);
 
   const openEdit = () => {
     if (!event) return;
@@ -234,7 +286,10 @@ export default function AutoCaptureConfirmHost() {
   const categoryTitle = categories.find(category => category.id === draft.categoryId)?.title ?? candidate.category;
   const categoryTint = tintFor(draft.categoryId);
   const resolvedTint = ts.isDark ? categoryTint.dark : categoryTint.light;
-  const amountText = formatCurrency((view === 'edit' ? amountValue : candidate.amount), candidate.currency);
+  // Same derivation the save path uses, so the confirm label, the merchant
+  // row, and the duplicate preview always match what Confirm would persist.
+  const savePreview = buildSaveCandidate(candidate, draft, view);
+  const amountText = formatCurrency(savePreview.amount, candidate.currency);
   const currencyCode = resolveCurrency(candidate.currency);
   const pending = state.pendingCount;
   const busy = confirming;
@@ -523,8 +578,8 @@ export default function AutoCaptureConfirmHost() {
           visible
           duplicate={duplicate}
           incoming={{
-            merchant: draft.merchant.trim() || candidate.merchant,
-            amount: Number.isFinite(amountValue) && amountValue > 0 ? amountValue : candidate.amount,
+            merchant: savePreview.merchant,
+            amount: savePreview.amount,
             currency: candidate.currency,
             category: categoryTitle,
             type: 'expense',

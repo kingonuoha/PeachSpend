@@ -25,7 +25,7 @@ class AutoCaptureModule : Module() {
            "displayName" to displayNames[packageName]!!,
           "status" to if (isPackageInstalled(packageName)) "active" else "not_detected",
         )
-      }.filter { it["status"] == "active" }
+      }
     }
 
     AsyncFunction("openSystemSettings") {

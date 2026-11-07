@@ -61,6 +61,56 @@ describe('optional auto-capture source boundary', () => {
     expect(adapter.setLifecycle).toHaveBeenLastCalledWith(false, 'granted');
   });
 
+  it('parses a 5 digit Naira debit with comma grouping and merchant after at', () => {
+    const candidate = parseNotificationCandidate(
+      { id: 'naira-debit', packageName: source.packageName, title: 'Debit alert', text: 'N12,500.00 spent at Shoprite on your card.', receivedAt: 20 },
+      source,
+    );
+    expect(candidate).toMatchObject({ merchant: 'Shoprite', amount: 12500, currency: 'NGN' });
+  });
+
+  it('parses credit phrasing with merchant after from and a grouped USD amount', () => {
+    const candidate = parseNotificationCandidate(
+      { id: 'credit', packageName: source.packageName, text: 'Credit alert: your account was credited with $1,234.56 from Jane Doe.', receivedAt: 21 },
+      source,
+    );
+    expect(candidate).toMatchObject({ merchant: 'Jane Doe', amount: 1234.56, currency: 'USD' });
+  });
+
+  it('parses merchant after to and survives a missing title without crashing', () => {
+    const candidate = parseNotificationCandidate(
+      { id: 'transfer', packageName: source.packageName, text: 'You sent NGN 25,000 to John Okoro.', receivedAt: 22 },
+      source,
+    );
+    expect(candidate).toMatchObject({ merchant: 'John Okoro', amount: 25000, currency: 'NGN' });
+  });
+
+  it('parses a whole 5 digit Naira amount with no decimals', () => {
+    const candidate = parseNotificationCandidate(
+      { id: 'naira-whole', packageName: source.packageName, text: 'Debit: N5,000 spent at Ebeano.', receivedAt: 23 },
+      source,
+    );
+    expect(candidate).toMatchObject({ merchant: 'Ebeano', amount: 5000, currency: 'NGN' });
+  });
+
+  it('rejects a card ending pattern through the parser without leaking raw text', () => {
+    const outcome = createNotificationParser(parseNotificationCandidate).parse(
+      { ...notification, text: 'Card ending 1234 charged $42 at Store.' }, source,
+    );
+    expect(outcome).toEqual({ status: 'failed', code: 'invalid_notification' });
+    expect(JSON.stringify(outcome)).not.toContain('1234');
+  });
+
+  it('passes through not_detected status instead of forcing active', () => {
+    const idle = { ...source, status: 'not_detected' as const };
+    expect(filterSupportedSources([idle], new Set([source.packageName]))).toEqual([idle]);
+  });
+
+  it('filters a package outside the allowlist even when installed', () => {
+    const clone = { id: 'chase', packageName: 'com.evil.clone', displayName: 'Chase Mobile', status: 'active' as const };
+    expect(filterSupportedSources([clone], new Set(['com.evil.clone']))).toEqual([]);
+  });
+
   it('rejects non-transaction notification without exposing raw text', () => {
     const outcome = createNotificationParser(parseNotificationCandidate).parse(
       { ...notification, text: 'Your weekly account summary is ready' }, source,

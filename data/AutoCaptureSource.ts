@@ -59,10 +59,14 @@ export function filterSupportedSources(
   sources: AutoCaptureSourceDescriptor[],
   packageNames: ReadonlySet<string>,
 ): AutoCaptureSourceDescriptor[] {
+  // Allowlist gate with honest status pass through (FR-22.2). An unknown id
+  // never invents a friendly name, a package mismatch never passes, and the
+  // status Mobile supplies (active or not_detected) is preserved so S-22 can
+  // render Not detected. No bank package is added here; that waits on ESC-12-01.
   return sources.flatMap(source => {
     const metadata = ALLOWED_SOURCE_METADATA[source.id];
-    if (!metadata || metadata.packageName !== source.packageName || !packageNames.has(source.packageName) || source.status !== 'active') return [];
-    return [{ id: source.id, ...metadata, status: 'active' as const }];
+    if (!metadata || metadata.packageName !== source.packageName || !packageNames.has(source.packageName)) return [];
+    return [{ id: source.id, packageName: metadata.packageName, displayName: metadata.displayName, status: source.status }];
   });
 }
 
@@ -84,7 +88,10 @@ export function createParsedAutoCaptureSource(
   parser: NotificationParser,
   sources: AutoCaptureSourceDescriptor[],
 ): AutoCaptureEventSource {
-  const activeSources = filterSupportedSources(sources, new Set(sources.filter(source => source.status === 'active').map(source => source.packageName)));
+  const supported = filterSupportedSources(sources, new Set(sources.map(source => source.packageName)));
+  // Only an active source can emit: not_detected rows pass through the filter
+  // above for S-22 rendering but never join the subscription map.
+  const activeSources = supported.filter(source => source.status === 'active');
   const byPackage = new Map(activeSources.map(source => [source.packageName, source]));
   let lifecycleEnabled = false;
   let unsubscribe: (() => void) | null = null;
@@ -113,18 +120,51 @@ export function createParsedAutoCaptureSource(
   };
 }
 
+// Amount core: thousands-grouped first (5,000 or 12,500.00), then a plain
+// integer or dot-decimal, then a comma-decimal. Order matters so a grouped
+// value is never truncated to its leading digits.
+const AMOUNT_CORE = String.raw`\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?|\d+,\d{1,2}`;
+// Currency tokens the parser recognises as patterns, never as fixture values.
+// Bare N matches only directly before a digit (N5,000), so ordinary words are
+// never treated as Naira. Suffix form omits bare N, which has no suffix use.
+const AMOUNT_PREFIX = String.raw`(?:[$€£₦]|USD|EUR|GBP|NGN|N(?=\s*\d))`;
+const AMOUNT_SUFFIX = String.raw`(?:[$€£₦]|USD|EUR|GBP|NGN)`;
+const PREFIX_AMOUNT_PATTERN = new RegExp(`${AMOUNT_PREFIX}\\s*(${AMOUNT_CORE})`, 'i');
+const SUFFIX_AMOUNT_PATTERN = new RegExp(`(${AMOUNT_CORE})\\s*${AMOUNT_SUFFIX}`, 'i');
+// Merchant follows at, to, or from as whole words, so a syllable inside a name
+// can never split it. Trailing context starting with on, with, or using, or a
+// sentence boundary, ends the capture.
+const MERCHANT_PATTERN = /\b(?:at|to|from)\b\s+([^.;|]+?)(?:\s+(?:on|with|using)\b|[.;|]|$)/i;
+
+function normalizeGroupedAmount(raw: string): number | null {
+  const value = raw.trim();
+  if (!value) return null;
+  let canonical: string;
+  if (value.includes('.') && value.includes(',')) canonical = value.replace(/,/g, '');
+  else if (value.includes(',') && /^\d{1,3}(?:,\d{3})+$/.test(value)) canonical = value.replace(/,/g, '');
+  else if (value.includes(',')) canonical = value.replace(',', '.');
+  else canonical = value;
+  const parsed = Number(canonical);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 export function parseNotificationCandidate(
   notification: NativeAutoCaptureNotification,
   source: AutoCaptureSourceDescriptor,
   userCurrency?: string | null,
 ): CaptureCandidate | null {
+  // Combined title plus text signal. Title is optional: a missing title reads
+  // as an empty prefix, never a crash. Neither field alone is required; text
+  // carries the match when the title is absent and the title can carry the
+  // merchant when the body holds only the amount. Debit and credit phrasing
+  // both parse through the same amount plus merchant shape; direction is
+  // decided at the confirm sheet, not here.
   const text = `${notification.title ?? ''} ${notification.text}`.trim();
-  const amountMatch = text.match(/(?:[$€£]|USD|EUR|GBP)\s*(\d+(?:[.,]\d{1,2})?)/i)
-    ?? text.match(/(\d+(?:[.,]\d{1,2})?)\s*(?:USD|EUR|GBP|[$€£])/i);
-  if (!amountMatch) return null;
-  const amount = Number(amountMatch[1].replace(',', '.'));
-  if (!Number.isFinite(amount) || amount <= 0) return null;
-  const merchantMatch = text.match(/(?:at|to|from)\s+([^.;|]+?)(?:\s+(?:on|with|using)\b|[.;|]|$)/i);
+  const amountToken = text.match(PREFIX_AMOUNT_PATTERN)?.[1] ?? text.match(SUFFIX_AMOUNT_PATTERN)?.[1];
+  if (!amountToken) return null;
+  const amount = normalizeGroupedAmount(amountToken);
+  if (amount === null) return null;
+  const merchantMatch = text.match(MERCHANT_PATTERN);
   const merchant = merchantMatch?.[1]?.trim();
   if (!merchant) return null;
   return {
@@ -144,6 +184,16 @@ export function sanitizeNativeNotification(notification: NativeAutoCaptureNotifi
   return { id: notification.id.slice(0, 100), packageName: notification.packageName, text: notification.text.trim(), title: notification.title?.trim(), receivedAt: notification.receivedAt };
 }
 
+// Native parity rule, recorded exactly: reject when the id, package name, or
+// non-blank text is missing, when the combined title plus text exceeds 280
+// chars, when the combined signal contains a URL (http://, https://, www.) or
+// a card or account identifier (card/account followed by an ending, number, or
+// digit run, or any 13 to 19 digit run), or when receivedAt is not a positive
+// finite timestamp. Plain amounts are never stripped or redacted; the check
+// only rejects, and a rejection returns null without logging raw text. This
+// mirrors the corrected Kotlin sanitizer, which must apply the same bound and
+// the same URL and identifier rejections and must not delete digit runs that
+// form real amounts.
 function isSafeNotification(notification: NativeAutoCaptureNotification): boolean {
   const combined = `${notification.title ?? ''} ${notification.text}`;
   if (!notification.id || !notification.packageName || !notification.text.trim()) return false;
@@ -154,6 +204,8 @@ function isSafeNotification(notification: NativeAutoCaptureNotification): boolea
 function inferCurrency(text: string, userCurrency?: string | null): string {
   if (/€|EUR/i.test(text)) return 'EUR';
   if (/£|GBP/i.test(text)) return 'GBP';
+  if (/₦|NGN/i.test(text) || /(?:^|\s)N(?=\s*\d)/.test(text)) return 'NGN';
+  if (/\$|USD/i.test(text)) return 'USD';
   return resolveUserCurrency(userCurrency);
 }
 

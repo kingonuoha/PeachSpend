@@ -1,6 +1,6 @@
 import { AndroidConfig, withAndroidManifest, type ConfigPlugin } from '@expo/config-plugins';
 
-const SERVICE_NAME = '.autocapture.AutoCaptureNotificationListenerService';
+const SERVICE_NAME = 'expo.modules.autocapture.AutoCaptureNotificationListenerService';
 const LISTENER_PERMISSION = 'android.permission.BIND_NOTIFICATION_LISTENER_SERVICE';
 const LISTENER_ACTION = 'android.service.notification.NotificationListenerService';
 

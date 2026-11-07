@@ -216,6 +216,10 @@ export interface AutoCaptureSourceDescriptor {
 export interface NativeAutoCaptureNotification {
   id: string;
   packageName: string;
+  // Forwarded from the Android notification extras (title plus android.text or
+  // bigText). Optional because older native builds send text only; the TS
+  // parser treats a missing title as an empty prefix and combines both fields,
+  // so Mobile must forward the title once available but text alone still parses.
   title?: string;
   text: string;
   receivedAt: number;

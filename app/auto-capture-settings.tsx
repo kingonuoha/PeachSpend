@@ -43,16 +43,6 @@ const CAPTURE_SOURCE_LABELS: Record<string, string> = {
   auto_capture: 'Auto-capture',
 };
 
-// B4-6: when nothing is detected, the empty state names the kinds of app the
-// listener can read. These are descriptions of the notification, not a bank list,
-// because the parser reads an alert's text and no template for a specific bank is
-// promised here.
-const SUPPORTED_SOURCE_KINDS = [
-  'Bank apps that post a transaction or debit alert',
-  'Card apps that post a purchase alert',
-  'Wallet apps that post a payment alert',
-];
-
 function describeSource(source: string): string {
   return CAPTURE_SOURCE_LABELS[source] ?? source;
 }
@@ -165,6 +155,12 @@ export default function AutoCaptureSettingsScreen() {
   const successTint = ts.isDark ? CategoryTints.groceries.dark : CategoryTints.groceries.light;
   const neutralTint = ts.isDark ? CategoryTints.other.dark : CategoryTints.other.light;
 
+  const activityGlyph = (status: CaptureEventStatus): string => {
+    if (status === 'discarded') return '✕';
+    if (status === 'duplicate_skipped') return '⟲';
+    return '✓';
+  };
+
   const activityTag = (status: CaptureEventStatus): { label: string; background: string; color: string } => {
     switch (status) {
       case 'confirmed':
@@ -172,7 +168,7 @@ export default function AutoCaptureSettingsScreen() {
       case 'discarded':
         return { label: 'Discarded', background: ts.raw.dangerSoft, color: ts.raw.dangerContainerText };
       case 'duplicate_skipped':
-        return { label: 'Duplicate', background: ts.raw.warningContainer, color: ts.raw.warningContainerText };
+        return { label: 'Duplicate Skip', background: ts.raw.warningContainer, color: ts.raw.warningContainerText };
       default:
         return { label: humanizeStatus(status), background: neutralTint[0], color: neutralTint[1] };
     }
@@ -301,32 +297,19 @@ export default function AutoCaptureSettingsScreen() {
             <View style={styles.masterInfo}>
               <View style={styles.masterTitleRow}>
                 <Text style={[Typography.bodyBold, { color: ts.text.onSurface, flexShrink: 1 }]}>Auto-Capture Master</Text>
-                {/* The switch state and the working state are two different facts, so
-                    they get two different pills. On never borrows the success colour,
-                    and a missing grant adds its own access pill beside it. */}
+                {/* One pill for the switch state, matching the pair: Active
+                    when the master is on, Paused when it is off. Permission
+                    access has its own card below, so no second pill is needed. */}
                 <View
                   style={[
                     styles.pill,
-                    { backgroundColor: masterEnabled ? ts.bg.primary20 : ts.raw.disabledBg },
+                    { backgroundColor: masterEnabled ? ts.raw.statusSuccessContainer : ts.raw.dangerSoft },
                   ]}
                 >
-                  <Text style={[Typography.micro, { color: masterEnabled ? ts.text.primary : ts.text.onSurfaceVariant, fontFamily: 'Manrope_700Bold' }]}>
-                    {masterEnabled ? 'On' : 'Off'}
+                  <Text style={[Typography.micro, { color: masterEnabled ? ts.raw.statusSuccessText : ts.raw.danger, fontFamily: 'Manrope_700Bold' }]}>
+                    {masterEnabled ? 'Active' : 'Paused'}
                   </Text>
                 </View>
-                {isAvailable && masterEnabled && !isGranted ? (
-                  <View style={[styles.pill, { backgroundColor: ts.raw.warningContainer }]}>
-                    <Text style={[Typography.micro, { color: ts.raw.warningContainerText, fontFamily: 'Manrope_700Bold' }]}>
-                      Needs access
-                    </Text>
-                  </View>
-                ) : isAvailable && listenerActive ? (
-                  <View style={[styles.pill, { backgroundColor: ts.raw.statusSuccessContainer }]}>
-                    <Text style={[Typography.micro, { color: ts.raw.statusSuccessText, fontFamily: 'Manrope_700Bold' }]}>
-                      Working
-                    </Text>
-                  </View>
-                ) : null}
               </View>
               <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, marginTop: Spacing.s1 }]}>
                 {masterSub}
@@ -457,20 +440,9 @@ export default function AutoCaptureSettingsScreen() {
                     <View style={[styles.emptyIcon, { backgroundColor: ts.raw.purple100 }]}>
                       <Search color={ts.icon.primary} size={20} />
                     </View>
-                    <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>No supported apps detected yet</Text>
+                    <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>No Parsers Installed</Text>
                     <Text style={[Typography.labelMd, styles.emptySub, { color: ts.text.onSurfaceVariant }]}>
-                      Auto-capture reads transaction alerts from apps already on this phone. It can read:
-                    </Text>
-                    <View style={styles.kindList}>
-                      {SUPPORTED_SOURCE_KINDS.map((kind) => (
-                        <View key={kind} style={styles.bulletRow}>
-                          <Check color={ts.raw.success} size={14} />
-                          <Text style={[Typography.labelMd, { color: ts.text.onSurface, flex: 1 }]}>{kind}</Text>
-                        </View>
-                      ))}
-                    </View>
-                    <Text style={[Typography.labelMd, styles.emptySub, { color: ts.text.onSurfaceVariant }]}>
-                      Install the app you bank with, allow its transaction notifications, then come back to this screen.
+                      We could not detect supported banking or card payment applications on this device.
                     </Text>
                   </View>
                 ) : (
@@ -532,33 +504,37 @@ export default function AutoCaptureSettingsScreen() {
                       index > 0 && { borderTopWidth: 1, borderTopColor: ts.border.subtle },
                     ]}
                   >
-                    <View style={[styles.activityChip, { backgroundColor: ts.bg.primary10 }]}>
-                      <ClipboardList color={ts.icon.primary} size={16} />
+                    <View accessible={false} style={[styles.activityChip, { backgroundColor: ts.raw.purple100 }]}>
+                      <Text style={[Typography.labelBold, { color: ts.text.primary }]}>
+                        {activityGlyph(entry.status)}
+                      </Text>
                     </View>
                     <View style={styles.flex}>
                       <Text style={[Typography.captionBold, { color: ts.text.onSurface }]} numberOfLines={1}>
                         {entry.merchant ?? 'Notification event'}
                       </Text>
                       <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]} numberOfLines={1}>
-                        {`${describeSource(entry.source)} · ${formatRelativeDateWithTime(entry.createdAt)}`}
+                        {`${describeSource(entry.source)} • ${formatRelativeDateWithTime(entry.createdAt)}`}
                       </Text>
                     </View>
-                    {entry.amount !== null ? (
-                      <Text
-                        numberOfLines={1}
-                        adjustsFontSizeToFit
-                        style={[Typography.captionBold, styles.activityAmount, { color: ts.text.onSurface }]}
+                    <View style={styles.actRight}>
+                      {entry.amount !== null ? (
+                        <Text
+                          numberOfLines={1}
+                          adjustsFontSizeToFit
+                          style={[Typography.captionBold, styles.activityAmount, { color: ts.text.onSurface }]}
+                        >
+                          {formatCurrency(entry.amount, settings.currency)}
+                        </Text>
+                      ) : null}
+                      <View
+                        accessibilityLabel={`Outcome: ${tag.label}`}
+                        style={[styles.pill, { backgroundColor: tag.background }]}
                       >
-                        {formatCurrency(entry.amount, settings.currency)}
-                      </Text>
-                    ) : null}
-                    <View
-                      accessibilityLabel={`Outcome: ${tag.label}`}
-                      style={[styles.pill, { backgroundColor: tag.background }]}
-                    >
-                      <Text style={[Typography.micro, { color: tag.color, fontFamily: 'Manrope_700Bold' }]}>
-                        {tag.label}
-                      </Text>
+                        <Text style={[Typography.micro, { color: tag.color, fontFamily: 'Manrope_700Bold' }]}>
+                          {tag.label}
+                        </Text>
+                      </View>
                     </View>
                   </View>
                 );
@@ -577,7 +553,7 @@ export default function AutoCaptureSettingsScreen() {
                       ? 'Notification parsing runs on Android only. No activity is read here.'
                       : 'This device cannot read financial notifications, so there is no parsed activity to show.')
                     : activity.status === 'empty'
-                      ? 'Parsed push notifications from the last 30 days will display here with their outcome.'
+                      ? 'Parsed push notifications from the last 30 days will display here with diagnostic outcomes.'
                       : 'Parsed notification outcomes could not be read. Retry to try again.'}
                 </Text>
                 {activity && activity.status === 'unavailable' ? (
@@ -676,6 +652,7 @@ const styles = StyleSheet.create({
   sourceChip: { width: 36, height: 36, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },
   activityChip: { width: 32, height: 32, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },
   activityAmount: { flexShrink: 0 },
+  actRight: { flexDirection: 'column', alignItems: 'flex-end', gap: Spacing.s1 },
   statusDot: { width: 5, height: 5, borderRadius: Radii.full },
   emptyState: { alignItems: 'center', paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s8, gap: Spacing.s2 },
   emptyIcon: {
@@ -687,5 +664,4 @@ const styles = StyleSheet.create({
     marginBottom: Spacing.s1,
   },
   emptySub: { maxWidth: 280, textAlign: 'center' },
-  kindList: { alignSelf: 'stretch', gap: Spacing.s2, paddingHorizontal: Spacing.s2 },
 });
