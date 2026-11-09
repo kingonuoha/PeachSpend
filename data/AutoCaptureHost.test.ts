@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { RootAutoCaptureHost, createAutoCaptureEvent } from './AutoCaptureHost';
+import { QUEUE_DEDUP_WINDOW_MS, RootAutoCaptureHost, createAutoCaptureEvent } from './AutoCaptureHost';
 import { resolveExpenseSave } from './CaptureService';
 import type { CaptureCandidate, CaptureRepository } from './contracts';
 
@@ -97,6 +97,66 @@ describe('RootAutoCaptureHost', () => {
     const saved = await resolveExpenseSave(repo, pending!.candidate, 'save_anyway');
     expect(saved.status).toBe('saved');
     expect(repo.save).toHaveBeenCalledTimes(1);
+  });
+
+  it('ships the queue dedup window as one named 15 minute constant', () => {
+    expect(QUEUE_DEDUP_WINDOW_MS).toBe(15 * 60 * 1000);
+  });
+
+  it('collapses push plus SMS twins inside the window with a duplicate_skipped record', async () => {
+    const listeners: ((event: ReturnType<typeof createAutoCaptureEvent>) => void)[] = [];
+    const repo = repository();
+    const source = { subscribe: (listener: (event: ReturnType<typeof createAutoCaptureEvent>) => void) => { listeners.push(listener); return () => undefined; } };
+    const host = new RootAutoCaptureHost(repo);
+    host.start(source);
+    host.setPermission('granted');
+    host.setEnabled(true);
+    const firstAt = 1_000_000;
+    listeners[0](createAutoCaptureEvent({ ...candidate, merchant: 'Shoprite', amount: 12500 }, firstAt));
+    listeners[0](createAutoCaptureEvent({ ...candidate, merchant: '  SHOPRITE ', amount: 12500 }, firstAt + 5 * 60 * 1000));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(repo.recordEvent).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'auto_capture', status: 'duplicate_skipped', merchant: '  SHOPRITE ', amount: 12500,
+    }));
+    expect(host.claimOverlay()?.candidate).toMatchObject({ merchant: 'Shoprite', amount: 12500 });
+    expect(host.getState()).toMatchObject({ pendingCount: 1 });
+  });
+
+  it('keeps twins outside the window as separate drafts', async () => {
+    const listeners: ((event: ReturnType<typeof createAutoCaptureEvent>) => void)[] = [];
+    const repo = repository();
+    const source = { subscribe: (listener: (event: ReturnType<typeof createAutoCaptureEvent>) => void) => { listeners.push(listener); return () => undefined; } };
+    const host = new RootAutoCaptureHost(repo);
+    host.start(source);
+    host.setPermission('granted');
+    host.setEnabled(true);
+    const firstAt = 2_000_000;
+    listeners[0](createAutoCaptureEvent({ ...candidate, merchant: 'Shoprite', amount: 12500 }, firstAt));
+    listeners[0](createAutoCaptureEvent({ ...candidate, merchant: 'Shoprite', amount: 12500 }, firstAt + 16 * 60 * 1000));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(repo.recordEvent).not.toHaveBeenCalled();
+    expect(host.getState()).toMatchObject({ pendingCount: 2 });
+    expect(host.claimOverlay()?.receivedAt).toBe(firstAt);
+    host.releaseOverlay();
+    expect(host.claimOverlay()?.receivedAt).toBe(firstAt + 16 * 60 * 1000);
+  });
+
+  it('keeps the same merchant with a different amount as a separate draft', async () => {
+    const listeners: ((event: ReturnType<typeof createAutoCaptureEvent>) => void)[] = [];
+    const repo = repository();
+    const source = { subscribe: (listener: (event: ReturnType<typeof createAutoCaptureEvent>) => void) => { listeners.push(listener); return () => undefined; } };
+    const host = new RootAutoCaptureHost(repo);
+    host.start(source);
+    host.setPermission('granted');
+    host.setEnabled(true);
+    listeners[0](createAutoCaptureEvent({ ...candidate, merchant: 'Shoprite', amount: 12500 }, 3_000_000));
+    listeners[0](createAutoCaptureEvent({ ...candidate, merchant: 'Shoprite', amount: 13000 }, 3_000_000 + 60 * 1000));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(repo.recordEvent).not.toHaveBeenCalled();
+    expect(host.getState()).toMatchObject({ pendingCount: 2 });
   });
 
   it('gates source publication on enabled and live permission without stale events', async () => {

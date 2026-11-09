@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   computeTabRowLayout,
@@ -6,6 +8,8 @@ import {
   DESIGN_PAIR_CENTER,
   firstIconCenter,
   pairIconCenterGap,
+  TAB_BAR_HEIGHT,
+  tabBarOccupiedHeight,
   TAB_TARGET,
 } from './tabBarGeometry';
 
@@ -49,5 +53,30 @@ describe('tab bar row geometry', () => {
     expect(computeTabRowLayout(100).scale).toBe(0.85);
     expect(computeTabRowLayout(2000).scale).toBe(1.35);
     expect(computeTabRowLayout(0).scale).toBe(1);
+  });
+});
+
+describe('tab bar occupied height', () => {
+  it('is the bar container the pair draws, with the safe area added at the anchor', () => {
+    // The bar's own height is the spec_8 90 tall container. This is the value
+    // every screen inside the tabs group clears, so it is pinned here.
+    expect(TAB_BAR_HEIGHT).toBe(90);
+    expect(tabBarOccupiedHeight(0)).toBe(90);
+    expect(tabBarOccupiedHeight(34)).toBe(124);
+    // Android reporting no inset must not shrink the bar.
+    expect(tabBarOccupiedHeight(0)).toBe(TAB_BAR_HEIGHT);
+  });
+
+  it('is consumed by the bar itself rather than copied as a literal', () => {
+    // The bar must read the exported geometry, so a future change to
+    // TAB_BAR_HEIGHT moves the bar and every screen's clearance together. A
+    // reintroduced local container-height literal is exactly the drift this row
+    // exists to remove, so the source is checked directly. Vitest runs from the
+    // app root, so the path is resolved from the working directory.
+    const source = readFileSync(resolve(process.cwd(), 'components', 'navigation', 'PeachTabBar.tsx'), 'utf8');
+    expect(source).toContain("from './tabBarGeometry'");
+    expect(source).toContain('TAB_BAR_HEIGHT');
+    expect(source).toContain('tabBarOccupiedHeight');
+    expect(source).not.toMatch(/CONTAINER_HEIGHT\s*=/);
   });
 });

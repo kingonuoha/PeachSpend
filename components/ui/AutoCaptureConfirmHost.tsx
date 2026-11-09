@@ -6,10 +6,17 @@ import { Check, Pencil, X } from 'lucide-react-native';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { RootAutoCaptureHost } from '../../data/AutoCaptureHost';
-import type { AutoCaptureEvent, AutoCaptureHostState, CaptureCandidate, CaptureRepository, DuplicateMatch } from '../../data/contracts';
+import type { AutoCaptureEvent, AutoCaptureEventSource, AutoCaptureHostState, CaptureCandidate, CaptureRepository, DuplicateMatch } from '../../data/contracts';
 import { databaseService } from '../../services/DatabaseService';
 import { createNativeAutoCaptureAdapter } from '../../data/NativeAutoCaptureAdapter';
-import { createNotificationParser, createParsedAutoCaptureSource, parseNotificationCandidate } from '../../data/AutoCaptureSource';
+import { createNotificationParser, createParsedAutoCaptureSource } from '../../data/AutoCaptureSource';
+import {
+  buildIncomeSaveCandidate,
+  isIncomeOverlayCandidate,
+  parseDirectedHostCandidate,
+  raiseIncomeDetectionAlert,
+  toIncomeCandidate,
+} from './autoCaptureConfirmIncome';
 import { DuplicateWarningModal } from '../expense/DuplicateWarningModal';
 import { CategoryPickerSheet, type CaptureCategory } from '../capture/CategoryPickerSheet';
 import { CategoryGlyph } from '../capture/CategoryGlyph';
@@ -17,7 +24,8 @@ import { PeachButton } from './PeachButton';
 import { useSettings } from './SettingsProvider';
 import { useAchievements } from './AchievementProvider';
 import { notificationService } from '../../services/NotificationService';
-import { resolveExpenseSave, runCaptureSideEffects } from '../../data/CaptureService';
+import { resolveExpenseSave, resolveIncomeSave, runCaptureSideEffects } from '../../data/CaptureService';
+import { raiseDetectionAlert } from '../../services/DetectionAlertService';
 import { CategoryTints, Radii, Spacing, Typography } from '../../constants/tokens';
 import { formatCurrency, resolveCurrency } from '../../utils/currency';
 import { formatRelativeDateWithTime } from '../../utils/dateFormat';
@@ -29,6 +37,33 @@ const SHEET_MAX_HEIGHT = 760;
 const SHEET_HEIGHT_RATIO = 0.85;
 
 type SheetView = 'summary' | 'edit';
+
+interface SaveDraft {
+  merchant: string;
+  amount: string;
+  categoryId: string;
+}
+
+// Pure derivation shared by the save path, the button label, and the duplicate
+// preview, so an edited merchant or amount is never silently dropped. In edit
+// view with valid input the draft wins; everywhere else the parser guess wins.
+// Invalid edit input falls back to the parser guess, and the edit save button
+// stays disabled until the input is valid.
+function buildSaveCandidate(
+  base: CaptureCandidate,
+  draftState: SaveDraft,
+  viewState: SheetView,
+  overrideCategory?: string,
+): CaptureCandidate {
+  const parsedAmount = parseFloat(draftState.amount);
+  const editedValid = draftState.merchant.trim().length > 0 && Number.isFinite(parsedAmount) && parsedAmount > 0;
+  return {
+    ...base,
+    merchant: viewState === 'edit' ? (draftState.merchant.trim() || base.merchant) : base.merchant,
+    amount: viewState === 'edit' && editedValid ? parsedAmount : base.amount,
+    category: overrideCategory ?? (draftState.categoryId || base.category),
+  };
+}
 
 function tintFor(category: string): { light: readonly [string, string]; dark: readonly [string, string] } {
   const key = category.trim().toLowerCase();
@@ -60,9 +95,64 @@ export default function AutoCaptureConfirmHost() {
   const adapter = useMemo(() => createNativeAutoCaptureAdapter(), []);
 
   useEffect(() => {
-    let unsubscribe = () => {};
     let disposed = false;
+    let hostUnsubscribe: (() => void) | null = null;
     let refreshGeneration = 0;
+    // Phase 14 M2 background raise for the forwarding source below. Only the
+    // native Android adapter can post the device ping, so any other platform
+    // drops the detection here, exactly like a background overlay event the
+    // host would have dropped on reconcile. Best effort throughout: a failure
+    // drops the detection rather than retrying, and no notification content
+    // is logged.
+    // Phase 16 M3: the overlay adopts the D1 directed parse, so a credit
+    // leg arrives as an income hybrid (sourceName plus merchant mirror) on
+    // the same single pipeline. Expense text parses exactly as today.
+    const raiseBackgroundDetection = (candidate: CaptureCandidate, receivedAt: number): void => {
+      if (adapter.capability !== 'available') return;
+      void (async () => {
+        const draftStore = await databaseService.getDetectionDraftStore();
+        // A backgrounded income detection persists an income draft (D2 shape:
+        // sender in source_name with a merchant mirror, kind income) plus an
+        // income worded inbox row plus the device ping through the same
+        // mechanism as expense. The M4 draft sheet confirms it through
+        // saveIncome; the foreground overlay path below confirms income
+        // directly through saveIncome with nothing persisted before tap.
+        if (isIncomeOverlayCandidate(candidate)) {
+          await raiseIncomeDetectionAlert(
+            {
+              // D2 income shape: the sender persists in source_name, so the
+              // M4 sheet can branch on kind and confirm through saveIncome.
+              // Same draft first, link loudly, ping best effort mechanism.
+              createDraft: input => draftStore.createIncomeDetectionDraft({
+                sourceName: input.merchant,
+                amount: input.amount,
+                currency: input.currency,
+                category: input.category,
+                note: input.note,
+                source: input.source,
+                detectedAt: input.detectedAt,
+              }),
+              linkDraftRow: (draftId, notificationId) => draftStore.setDetectionDraftNotificationId(draftId, notificationId),
+              insertInboxRow: row => databaseService.insertNotification(row),
+              showAlert: content => adapter.showDetectionAlert?.(content) ?? Promise.resolve({ posted: false }),
+            },
+            toIncomeCandidate(candidate),
+            receivedAt,
+          );
+          return;
+        }
+        await raiseDetectionAlert(
+          {
+            createDraft: input => draftStore.createDetectionDraft(input),
+            linkDraftRow: (draftId, notificationId) => draftStore.setDetectionDraftNotificationId(draftId, notificationId),
+            insertInboxRow: row => databaseService.insertNotification(row),
+            showAlert: content => adapter.showDetectionAlert?.(content) ?? Promise.resolve({ posted: false }),
+          },
+          candidate,
+          receivedAt,
+        );
+      })().catch(() => undefined);
+    };
     const refreshLifecycle = () => {
       const generation = ++refreshGeneration;
       void Promise.all([adapter.getPermissionState(), adapter.getSupportedSources()]).then(([permission, sources]) => {
@@ -70,8 +160,24 @@ export default function AutoCaptureConfirmHost() {
         const host = hostRef.current;
         if (!host) return;
         host.setCapability(adapter.capability, sources);
-        const source = createParsedAutoCaptureSource(adapter, createNotificationParser(parseNotificationCandidate), sources);
-        host.syncLifecycle(settings.auto_capture_enabled === 'true', permission.status, source, false);
+        const parsed = createParsedAutoCaptureSource(adapter, createNotificationParser(parseDirectedHostCandidate), sources);
+        // Phase 14 M2: the overlay sheet owns foreground detections. A
+        // detection that arrives while the app is backgrounded becomes a
+        // queued draft plus inbox row plus device ping instead, so one
+        // detection yields exactly one surface and a backgrounded overlay can
+        // never double handle it. Foreground behavior is byte identical.
+        const forwardingSource: AutoCaptureEventSource = {
+          capability: parsed.capability,
+          setLifecycle: (enabled, permissionStatus) => parsed.setLifecycle?.(enabled, permissionStatus),
+          subscribe: listener => parsed.subscribe(event => {
+            if (AppState.currentState === 'active') {
+              listener(event);
+              return;
+            }
+            void raiseBackgroundDetection(event.candidate, event.receivedAt);
+          }),
+        };
+        host.syncLifecycle(settings.auto_capture_enabled === 'true', permission.status, forwardingSource, false);
       });
     };
     void databaseService.getCaptureRepository().then(repository => {
@@ -79,8 +185,7 @@ export default function AutoCaptureConfirmHost() {
       const host = new RootAutoCaptureHost(repository);
       repositoryRef.current = repository;
       hostRef.current = host;
-      const hostUnsubscribe = host.subscribe(setState);
-      unsubscribe = () => { hostUnsubscribe(); host.stop(); };
+      hostUnsubscribe = host.subscribe(setState);
       setHostReady(true);
       refreshLifecycle();
     });
@@ -88,9 +193,16 @@ export default function AutoCaptureConfirmHost() {
       if (nextState !== 'active' || !hostRef.current) return;
       refreshLifecycle();
     });
-    const previousUnsubscribe = unsubscribe;
-    unsubscribe = () => { appState.remove(); previousUnsubscribe(); };
-    return () => { disposed = true; unsubscribe(); };
+    // The cleanup below must stop the exact host this run created. A previous
+    // revision captured the pre-resolution noop instead, so a settings toggle
+    // leaked the old host and its subscription while a second host started.
+    return () => {
+      disposed = true;
+      appState.remove();
+      hostUnsubscribe?.();
+      hostRef.current?.stop();
+      hostRef.current = null;
+    };
   }, [adapter, settings.auto_capture_enabled]);
 
   // Claim the next queued detection whenever the host has none rendered. This
@@ -100,6 +212,21 @@ export default function AutoCaptureConfirmHost() {
     const next = hostRef.current?.claimOverlay() ?? null;
     if (next) setEvent(next);
   }, [hostReady, event, state?.pendingCount]);
+
+  // When the host reports no active overlay and nothing queued (revoke, master
+  // off, capability loss), the rendered draft is unclaimable, so drop it and
+  // let the next real detection claim fresh. The releasedEventId guard keeps
+  // this render-phase update single-shot per event.
+  const [releasedEventId, setReleasedEventId] = useState<string | null>(null);
+  if (event && state && !state.overlayActive && state.pendingCount === 0 && event.id !== releasedEventId) {
+    setReleasedEventId(event.id);
+    setEvent(null);
+    setDuplicate(null);
+    setSaveError(false);
+    setView('summary');
+    setConfirming(false);
+    setPickerOpen(false);
+  }
 
   useEffect(() => {
     hostRef.current?.setEnabled(settings.auto_capture_enabled === 'true');
@@ -128,12 +255,14 @@ export default function AutoCaptureConfirmHost() {
 
   // Pull any per-merchant correction already stored for FR-SHNEW.4 and prefer it
   // over the parser guess. This is a real read; no correction means no change.
+  // When a stored rule applies, the summary shows the learned-rule banner.
   useEffect(() => {
     if (!event) return;
     let active = true;
     void repositoryRef.current?.getRememberedCategory(event.candidate.merchant).then(stored => {
       if (!active || !stored) return;
       setDraft(prev => ({ ...prev, categoryId: stored }));
+      setRuleLearned(true);
     }).catch(() => undefined);
     return () => { active = false; };
   }, [event]);
@@ -153,28 +282,84 @@ export default function AutoCaptureConfirmHost() {
   }, []);
 
   // User-initiated discard routes through the shared save/outcome boundary so
-  // the audit log records a `discarded` event (FR-22.3). A failed write never
-  // blocks the release; the overlay still closes.
+  // the audit log records a `discarded` event (FR-22.3). Income discards use
+  // the income boundary so the audit names the source, not a merchant. A
+  // failed write never blocks the release; the overlay still closes.
   const discard = useCallback(() => {
     const host = hostRef.current;
     const repository = repositoryRef.current;
     if (event && repository && host) {
-      const candidate: CaptureCandidate = { ...event.candidate, category: draft.categoryId || event.candidate.category };
-      void resolveExpenseSave(repository, candidate, 'discard').catch(() => undefined);
+      if (isIncomeOverlayCandidate(event.candidate)) {
+        const incomeCandidate = buildIncomeSaveCandidate(toIncomeCandidate(event.candidate), draft, view);
+        void resolveIncomeSave(repository, incomeCandidate, 'discard').catch(() => undefined);
+      } else {
+        const candidate = buildSaveCandidate(event.candidate, draft, view);
+        void resolveExpenseSave(repository, candidate, 'discard').catch(() => undefined);
+      }
     }
     dismiss();
-  }, [event, draft.categoryId, dismiss]);
+  }, [event, draft, view, dismiss]);
 
   const confirm = useCallback(async (decision: 'confirm' | 'save_anyway' = 'confirm', overrideCategory?: string) => {
     const host = hostRef.current;
     const repository = repositoryRef.current;
     if (!event || !repository || !host) return;
+    // Phase 16 M3 income path (brief section 4 item 5, FR-11.3): income
+    // drafts render the sender and confirm through the shared saveIncome
+    // boundary with duplicate check, streak only achievement, and the shared
+    // notification scheduling. Nothing persists before this tap, same as
+    // expense. The expense path below is byte identical behavior.
+    if (isIncomeOverlayCandidate(event.candidate)) {
+      if (decision === 'confirm') {
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        setConfirming(true);
+        setSaveError(false);
+      }
+      const incomeCandidate = buildIncomeSaveCandidate(toIncomeCandidate(event.candidate), draft, view, overrideCategory);
+      try {
+        const resolution = await resolveIncomeSave(repository, incomeCandidate, decision);
+        if (resolution.status === 'duplicate') {
+          setDuplicate(resolution.duplicate);
+          setConfirming(false);
+          return;
+        }
+        if (resolution.status !== 'saved') {
+          setConfirming(false);
+          return;
+        }
+        await runCaptureSideEffects(resolution, incomeCandidate, {
+          onExpenseSaved: async () => undefined,
+          // FR-11.3: income uses the income hook only, so it can never run
+          // the expense-only spend badge path. The check is
+          // streak and consistency based in effect because income never
+          // changes expense aggregates.
+          onIncomeSaved: checkForNewAchievements,
+          scheduleNotification: saved => {
+            if ('sourceName' in saved) notificationService.scheduleExpenseNotification(saved.sourceName, formatCurrency(saved.amount, saved.currency));
+          },
+        });
+        // Persist a corrected category per sender only when the user asked to
+        // remember it, mirroring the expense merchant memory. The lookup
+        // effect keys on the merchant mirror, which is the sender for income,
+        // so the learned-rule banner applies symmetrically on the next
+        // detection from this sender.
+        if (rememberRule && incomeCandidate.category !== event.candidate.category) {
+          await repository.rememberCategory(incomeCandidate.sourceName, incomeCandidate.category, 'auto_capture').catch(() => undefined);
+        }
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        dismiss();
+      } catch {
+        setConfirming(false);
+        setSaveError(true);
+      }
+      return;
+    }
     if (decision === 'confirm') {
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       setConfirming(true);
       setSaveError(false);
     }
-    const candidate: CaptureCandidate = { ...event.candidate, category: overrideCategory ?? (draft.categoryId || event.candidate.category) };
+    const candidate: CaptureCandidate = buildSaveCandidate(event.candidate, draft, view, overrideCategory);
     try {
       const resolution = await resolveExpenseSave(repository, candidate, decision);
       if (resolution.status === 'duplicate') {
@@ -194,10 +379,12 @@ export default function AutoCaptureConfirmHost() {
         },
       });
       // Persist a corrected category per merchant only when the user asked to
-      // remember it. The write is fire-and-forget; a failure never blocks the save.
+      // remember it. The write is fire-and-forget; a failure never blocks the
+      // save. The learned-rule banner surfaces on the next detection from this
+      // merchant through the remembered-category lookup, never here, because
+      // the sheet dismisses immediately after a successful save.
       if (rememberRule && candidate.category !== event.candidate.category) {
         await repository.rememberCategory(candidate.merchant, candidate.category, 'auto_capture').catch(() => undefined);
-        setRuleLearned(true);
       }
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       dismiss();
@@ -205,7 +392,7 @@ export default function AutoCaptureConfirmHost() {
       setConfirming(false);
       setSaveError(true);
     }
-  }, [event, draft.categoryId, rememberRule, checkForNewAchievements, dismiss]);
+  }, [event, draft, view, rememberRule, checkForNewAchievements, dismiss]);
 
   const openEdit = () => {
     if (!event) return;
@@ -229,12 +416,23 @@ export default function AutoCaptureConfirmHost() {
   if (!event || !state?.overlayActive) return null;
 
   const candidate = event.candidate;
+  // Phase 16 M3: the sender for income drafts, the parser guess for expense.
+  // The summary row shows the base value (parity with expense, which shows
+  // the parser merchant in summary); the confirm label and the duplicate
+  // preview below use the shared derivation so edits are never dropped.
+  const incomeOverlay = isIncomeOverlayCandidate(candidate);
+  const incomePreview = incomeOverlay ? buildIncomeSaveCandidate(toIncomeCandidate(candidate), draft, view) : null;
+  const displayName = incomeOverlay ? candidate.sourceName : candidate.merchant;
   const amountValue = parseFloat(draft.amount);
   const editValid = draft.merchant.trim().length > 0 && Number.isFinite(amountValue) && amountValue > 0;
   const categoryTitle = categories.find(category => category.id === draft.categoryId)?.title ?? candidate.category;
   const categoryTint = tintFor(draft.categoryId);
   const resolvedTint = ts.isDark ? categoryTint.dark : categoryTint.light;
-  const amountText = formatCurrency((view === 'edit' ? amountValue : candidate.amount), candidate.currency);
+  // Same derivation the save path uses, so the confirm label, the merchant
+  // row, and the duplicate preview always match what Confirm would persist.
+  // Income uses the income derivation above; expense is unchanged.
+  const savePreview = buildSaveCandidate(candidate, draft, view);
+  const amountText = formatCurrency(incomePreview ? incomePreview.amount : savePreview.amount, candidate.currency);
   const currencyCode = resolveCurrency(candidate.currency);
   const pending = state.pendingCount;
   const busy = confirming;
@@ -341,7 +539,7 @@ export default function AutoCaptureConfirmHost() {
                         <CategoryGlyph iconName={categories.find(c => c.id === candidate.category)?.icon_name} size={18} color={resolvedTint[1]} />
                       </View>
                       <View style={{ flex: 1, minWidth: 0 }}>
-                        <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.text.onSurface }]}>{candidate.merchant}</Text>
+                        <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.text.onSurface }]}>{displayName}</Text>
                         <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{formatRelativeDateWithTime(candidate.date)}</Text>
                       </View>
                     </View>
@@ -416,14 +614,14 @@ export default function AutoCaptureConfirmHost() {
                   </View>
 
                   <View>
-                    <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, fontFamily: 'Manrope_600SemiBold', marginBottom: Spacing.s1 }]}>Merchant Name</Text>
+                    <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, fontFamily: 'Manrope_600SemiBold', marginBottom: Spacing.s1 }]}>{incomeOverlay ? 'Income Source' : 'Merchant Name'}</Text>
                     <TextInput
                       value={draft.merchant}
                       onChangeText={value => setDraft(prev => ({ ...prev, merchant: value }))}
                       placeholder="Merchant"
                       placeholderTextColor={ts.text.onSurfaceVariant}
                       selectionColor={ts.raw.primary}
-                      accessibilityLabel="Merchant name"
+                      accessibilityLabel={incomeOverlay ? 'Income source' : 'Merchant name'}
                       style={[styles.input, { backgroundColor: ts.bg.screen, borderColor: ts.border.card, color: ts.text.onSurface }]}
                     />
                   </View>
@@ -511,7 +709,7 @@ export default function AutoCaptureConfirmHost() {
         visible={pickerOpen}
         categories={categories}
         selectedId={draft.categoryId}
-        flowType="expense"
+        flowType={incomeOverlay ? 'income' : 'expense'}
         originLabel={draft.merchant.trim() || candidate.merchant}
         originAmount={Number.isFinite(amountValue) && amountValue > 0 ? formatCurrency(amountValue, candidate.currency) : undefined}
         onSelect={category => { setDraft(prev => ({ ...prev, categoryId: category.id })); setPickerOpen(false); }}
@@ -523,11 +721,11 @@ export default function AutoCaptureConfirmHost() {
           visible
           duplicate={duplicate}
           incoming={{
-            merchant: draft.merchant.trim() || candidate.merchant,
-            amount: Number.isFinite(amountValue) && amountValue > 0 ? amountValue : candidate.amount,
+            merchant: incomePreview ? incomePreview.sourceName : savePreview.merchant,
+            amount: incomePreview ? incomePreview.amount : savePreview.amount,
             currency: candidate.currency,
             category: categoryTitle,
-            type: 'expense',
+            type: incomeOverlay ? 'income' : 'expense',
             date: candidate.date,
           }}
           onSaveAnyway={() => { setDuplicate(null); void confirm('save_anyway', draft.categoryId); }}

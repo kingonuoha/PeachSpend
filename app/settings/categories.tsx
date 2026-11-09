@@ -1,7 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Modal,
-  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -23,6 +22,7 @@ import { Skeleton } from '../../components/ui/Skeleton';
 import { useToast } from '../../components/ui/ToastProvider';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
+import { useSettings } from '../../components/ui/SettingsProvider';
 import { CategoryGlyph, CATEGORY_ICON_PICKER } from '../../components/capture/CategoryGlyph';
 import { Radii, Spacing, Typography } from '../../constants/tokens';
 import {
@@ -32,21 +32,50 @@ import {
   categoryService,
 } from '../../services/DataServices';
 import type { CategoryMutationResult, CategoryRecord } from '../../services/DataServices';
+import { databaseService } from '../../services/DatabaseService';
+import { formatCurrency, resolveDisplayCurrency } from '../../utils/currency';
 
 // S-16 Manage Categories. Rebuilt as the sole category create/edit owner
-// (FR-16.1-FR-16.4): safe-area header, category list with a Default badge and
-// Edit, and one shared inline editor used for both add and edit. Reads and
-// writes go through the typed category contract, never screen SQL. Deletion
-// stays unsupported and is stated from the contract constant.
+// (FR-16.1-FR-16.4): safe-area header, category list with a Default badge, an
+// optional monthly limit and Edit, and one shared inline editor used for both add
+// and edit. Reads and writes go through the typed category contract, never screen
+// SQL. Deletion stays unsupported and is stated from the contract constant.
 
 const MAX_CONTENT_WIDTH = 640;
 // Card content is the 44px icon chip; the design card is p-3 (12) around it, so
 // the row does not force the taller 56px box that pushed cards past the pair.
 const ROW_MIN_HEIGHT = 44;
 const ICON_CHIP = 44;
-const CLOSE_SIZE = 32;
-const CLOSE_HIT_SLOP = { top: 6, bottom: 6, left: 6, right: 6 };
+// B4-4: the mode icon in the sheet header is decoration, the close control is a
+// control, so they no longer share one size. The close is a 44pt target on its own
+// and needs no slop to reach it.
+const MODE_CHIP = 32;
+const CLOSE_SIZE = 44;
 const SHEET_MAX_HEIGHT = 760;
+
+// B4-4 preset starters. Every icon comes from CATEGORY_ICON_PICKER and every colour
+// from CATEGORY_COLOR_PALETTE, so a preset can only offer values the pickers below it
+// can also offer. A preset whose name already exists is filtered out at render time,
+// so tapping one can never create a duplicate.
+interface CategoryPreset {
+  name: string;
+  iconName: string;
+  color: string;
+}
+const CATEGORY_PRESETS: CategoryPreset[] = [
+  { name: 'Coffee', iconName: 'coffee', color: '#FFAB91' },
+  { name: 'Gym', iconName: 'dumbbell', color: '#60A5FA' },
+  { name: 'Entertainment', iconName: 'film', color: '#A78BFA' },
+  { name: 'Gifts', iconName: 'gift', color: '#F472B6' },
+  { name: 'Pet Care', iconName: 'paw-print', color: '#34D399' },
+];
+
+// The footer line is derived from the contract flag rather than a fixed sentence, so
+// if deletion support ever ships the copy follows the capability instead of claiming
+// the opposite. Today the flag is false, and the wording states that as a benefit.
+const DELETION_POLICY_NOTE = CATEGORY_DELETION_SUPPORT.supported
+  ? 'You can delete a category whenever you want. Past reports keep their label until you do.'
+  : 'Categories are permanent, so every past report keeps its label. Rename or restyle any time.';
 
 // The category color is a single stored value; the tinted chip derives its
 // background from that value so no pastel literal is inlined.
@@ -72,6 +101,8 @@ interface EditorState {
   color: string;
   iconName: string;
   isDefault: boolean;
+  // Draft text, not a number, so an empty field stays empty rather than becoming 0.
+  limit: string;
 }
 
 // Brief skeleton count for the category list. One Default-badged card plus two
@@ -150,15 +181,16 @@ export default function ManageCategoriesScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
   const { showToast } = useToast();
+  const { settings, getCurrencySymbol } = useSettings();
   const { height } = useWindowDimensions();
   const reduceMotion = useReduceMotion();
   // Surface 7 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
   // math, but measured and applied on the UI thread so the category sheet tracks the
-  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
-  // soft-input resize already shrinks the window, so adding this padding there would
-  // double-count the keyboard. Hooks run unconditionally; only the style is gated at
-  // render time.
-  const isIOS = Platform.OS === 'ios';
+  // keyboard without waiting on a JS bridge frame. Applies on both platforms: per the
+  // Reanimated docs, while useAnimatedKeyboard is mounted it disables Android's default
+  // window resize for the whole app, so Android gets no system resize and this padding
+  // is the only keyboard handling. With the keyboard closed the height is 0, so the
+  // resting layout is unchanged.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
@@ -171,18 +203,33 @@ export default function ManageCategoriesScreen() {
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  // One settings read covers every card, so a list of twenty categories costs the
+  // same as a list of two. Wave 0 D3 reads the entire map in a single pass.
+  const [limits, setLimits] = useState<Record<string, number>>({});
+
+  const appCurrency = resolveDisplayCurrency(settings.currency);
+
+  const loadLimits = useCallback(async () => {
+    try {
+      setLimits(await databaseService.getAllCategoryLimits());
+    } catch {
+      // A read failure means no cap is shown, which is honest: the list still loads.
+      setLimits({});
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
     try {
-      setCategories(await categoryService.list());
+      const [rows] = await Promise.all([categoryService.list(), loadLimits()]);
+      setCategories(rows);
     } catch {
       setLoadError('Categories could not load. Your data stays on this device.');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadLimits]);
 
   // Pull-to-refresh variant. Re-reads the same typed contract but never flips the
   // loading flag, so the loaded list does not flash back into the skeleton state.
@@ -190,13 +237,14 @@ export default function ManageCategoriesScreen() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      setCategories(await categoryService.list());
+      const [rows] = await Promise.all([categoryService.list(), loadLimits()]);
+      setCategories(rows);
     } catch {
       showToast('Categories could not refresh', 'error');
     } finally {
       setRefreshing(false);
     }
-  }, [showToast]);
+  }, [loadLimits, showToast]);
 
   useEffect(() => {
     // Deferred so the initial load does not setState synchronously inside the
@@ -216,11 +264,13 @@ export default function ManageCategoriesScreen() {
       color: CATEGORY_COLOR_PALETTE[0],
       iconName: DEFAULT_CATEGORY_ICON,
       isDefault: false,
+      limit: '',
     });
   }, []);
 
   const openEdit = useCallback((category: CategoryRecord) => {
     setFormError(null);
+    const stored = limits[category.id];
     setEditor({
       mode: 'edit',
       id: category.id,
@@ -228,8 +278,9 @@ export default function ManageCategoriesScreen() {
       color: category.color,
       iconName: category.iconName,
       isDefault: category.isDefault,
+      limit: typeof stored === 'number' && stored > 0 ? String(stored) : '',
     });
-  }, []);
+  }, [limits]);
 
   const closeEditor = useCallback(() => {
     setEditor(null);
@@ -241,6 +292,14 @@ export default function ManageCategoriesScreen() {
     const title = editor.name.trim();
     if (!title) {
       setFormError('Category name is required.');
+      return;
+    }
+    // The limit is validated before anything is written, so a bad amount cannot
+    // leave a half saved category behind.
+    const limitText = editor.limit.trim();
+    const limitValue = limitText === '' ? null : Number(limitText);
+    if (limitValue !== null && (!Number.isFinite(limitValue) || limitValue < 0)) {
+      setFormError('Enter a monthly limit of zero or more, or leave it empty.');
       return;
     }
     setSaving(true);
@@ -266,6 +325,24 @@ export default function ManageCategoriesScreen() {
         setFormError(resultMessage(result));
         return;
       }
+
+      // The category is saved at this point, so a limit failure is reported on its
+      // own and never re-runs the create, which would duplicate the category.
+      try {
+        if (limitValue === null) await databaseService.clearCategoryLimit(result.category.id);
+        else await databaseService.setCategoryLimit(result.category.id, limitValue);
+        await loadLimits();
+      } catch {
+        setCategories((previous) => (
+          editor.mode === 'add'
+            ? [...previous, result.category]
+            : previous.map((category) => (category.id === result.category.id ? result.category : category))
+        ));
+        closeEditor();
+        showToast('Category saved, but the monthly limit was not saved.', 'error');
+        return;
+      }
+
       setCategories((previous) => (
         editor.mode === 'add'
           ? [...previous, result.category]
@@ -278,7 +355,7 @@ export default function ManageCategoriesScreen() {
     } finally {
       setSaving(false);
     }
-  }, [editor, closeEditor, showToast]);
+  }, [editor, closeEditor, loadLimits, showToast]);
 
   const goBack = useCallback(() => {
     if (router.canGoBack()) router.back();
@@ -287,6 +364,13 @@ export default function ManageCategoriesScreen() {
 
   const editing = editor?.mode === 'edit';
   const sheetMaxHeight = Math.min(height * 0.92, SHEET_MAX_HEIGHT);
+
+  // B4-4: a preset is only offered when its name is free, so tapping one can never
+  // create a category the contract would reject as a duplicate.
+  const presetOptions = useMemo(() => {
+    const taken = new Set(categories.map((category) => category.title.trim().toLowerCase()));
+    return CATEGORY_PRESETS.filter((preset) => !taken.has(preset.name.toLowerCase()));
+  }, [categories]);
 
   return (
     <SafeAreaView style={{ backgroundColor: ts.bg.screen, flex: 1 }} edges={['top']}>
@@ -350,10 +434,10 @@ export default function ManageCategoriesScreen() {
             </View>
             <View style={styles.bannerText}>
               <Text style={[Typography.captionBold, { color: ts.isDark ? ts.raw.primary : ts.raw.onSurface }]}>
-                Category Authority Hub
+                Your categories keep your reports readable
               </Text>
               <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant, lineHeight: 17 }]}>
-                Transactions reference categories without schema locks. {CATEGORY_DELETION_SUPPORT.message}
+                Every transaction points at a category that stays on this device, so a past report always has a label. Rename or restyle any of them whenever you like.
               </Text>
             </View>
           </LuminousCard>
@@ -375,7 +459,9 @@ export default function ManageCategoriesScreen() {
             </View>
           ) : (
             <View style={styles.list}>
-              {categories.map((category) => (
+              {categories.map((category) => {
+                const categoryLimit = limits[category.id];
+                return (
                 <LuminousCard
                   key={category.id}
                   variant="low"
@@ -397,6 +483,11 @@ export default function ManageCategoriesScreen() {
                             </View>
                           ) : null}
                         </View>
+                        {typeof categoryLimit === 'number' && categoryLimit > 0 ? (
+                          <Text numberOfLines={1} style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>
+                            Monthly limit {formatCurrency(categoryLimit, appCurrency)}
+                          </Text>
+                        ) : null}
                       </View>
                     </View>
                     <PeachButton
@@ -409,7 +500,8 @@ export default function ManageCategoriesScreen() {
                     />
                   </View>
                 </LuminousCard>
-              ))}
+                );
+              })}
             </View>
           )}
 
@@ -425,7 +517,7 @@ export default function ManageCategoriesScreen() {
           <View style={[styles.policyBox, { backgroundColor: ts.bg.low, borderColor: ts.raw.outline }]}>
             <Info size={13} color={ts.raw.onSurfaceVariant} />
             <Text style={[Typography.micro, styles.policyText, { color: ts.raw.onSurfaceVariant }]}>
-              {CATEGORY_DELETION_SUPPORT.message}
+              {DELETION_POLICY_NOTE}
             </Text>
           </View>
         </ScrollView>
@@ -437,7 +529,7 @@ export default function ManageCategoriesScreen() {
         animationType={reduceMotion ? 'none' : 'slide'}
         onRequestClose={closeEditor}
       >
-        <Animated.View style={[styles.modalRoot, isIOS ? keyboardPaddingStyle : null]}>
+        <Animated.View style={[styles.modalRoot, keyboardPaddingStyle]}>
           <Pressable
             onPress={closeEditor}
             accessibilityRole="button"
@@ -483,10 +575,9 @@ export default function ManageCategoriesScreen() {
                 onPress={closeEditor}
                 accessibilityRole="button"
                 accessibilityLabel="Close editor"
-                hitSlop={CLOSE_HIT_SLOP}
                 style={[styles.closeCircle, { backgroundColor: ts.bg.low, borderColor: ts.raw.outline }]}
               >
-                <X size={15} color={ts.raw.onSurfaceVariant} />
+                <X size={18} color={ts.raw.onSurfaceVariant} />
               </ScalePressable>
             </View>
 
@@ -514,6 +605,35 @@ export default function ManageCategoriesScreen() {
                       </Text>
                     </View>
                   </View>
+
+                  {!editing && presetOptions.length > 0 ? (
+                    <View>
+                      <Text style={[Typography.captionBold, styles.fieldLabel, { color: ts.raw.onSurface }]}>
+                        Start from a preset
+                      </Text>
+                      <View style={styles.presetRow}>
+                        {presetOptions.map((preset) => (
+                          <ScalePressable
+                            key={preset.name}
+                            accessibilityRole="button"
+                            accessibilityLabel={`Start a ${preset.name} category`}
+                            onPress={() => {
+                              setEditor((current) => (current
+                                ? { ...current, name: preset.name, iconName: preset.iconName, color: preset.color }
+                                : current));
+                              if (formError) setFormError(null);
+                            }}
+                            style={[styles.presetChip, { backgroundColor: tintBackground(preset.color), borderColor: ts.raw.outline }]}
+                          >
+                            <CategoryGlyph iconName={preset.iconName} size={14} color={preset.color} />
+                            <Text numberOfLines={1} style={[Typography.micro, { color: ts.raw.onSurface }]}>
+                              {preset.name}
+                            </Text>
+                          </ScalePressable>
+                        ))}
+                      </View>
+                    </View>
+                  ) : null}
 
                   <View>
                     <Text style={[Typography.captionBold, styles.fieldLabel, { color: ts.raw.onSurface }]}>
@@ -547,6 +667,33 @@ export default function ManageCategoriesScreen() {
                         {formError}
                       </Text>
                     ) : null}
+                  </View>
+
+                  <View>
+                    <Text style={[Typography.captionBold, styles.fieldLabel, { color: ts.raw.onSurface }]}>
+                      Monthly Spending Limit
+                    </Text>
+                    <View style={[styles.limitWrap, { backgroundColor: ts.bg.low, borderColor: ts.raw.outline }]}>
+                      <Text style={[Typography.labelBold, { color: ts.raw.onSurfaceVariant }]}>
+                        {getCurrencySymbol(appCurrency)}
+                      </Text>
+                      <TextInput
+                        value={editor.limit}
+                        onChangeText={(value) => {
+                          setEditor((current) => (current ? { ...current, limit: value } : current));
+                          if (formError) setFormError(null);
+                        }}
+                        keyboardType="decimal-pad"
+                        accessibilityLabel="Monthly spending limit"
+                        placeholder="No limit"
+                        placeholderTextColor={ts.raw.onSurfaceVariant}
+                        selectionColor={ts.raw.primary}
+                        style={[styles.limitInput, Typography.labelBold, { color: ts.raw.onSurface }]}
+                      />
+                    </View>
+                    <Text style={[Typography.micro, styles.validation, { color: ts.raw.onSurfaceVariant }]}>
+                      Optional. Shown on this category card. Left empty means no limit.
+                    </Text>
                   </View>
 
                   <View>
@@ -827,8 +974,8 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   sheetModeChip: {
-    width: CLOSE_SIZE,
-    height: CLOSE_SIZE,
+    width: MODE_CHIP,
+    height: MODE_CHIP,
     borderRadius: Radii.sm,
     alignItems: 'center',
     justifyContent: 'center',
@@ -897,8 +1044,8 @@ const styles = StyleSheet.create({
   swatch: {
     flexBasis: '13%',
     flexGrow: 1,
-    minWidth: 40,
-    maxWidth: 60,
+    minWidth: 48,
+    maxWidth: 64,
     aspectRatio: 1,
     borderRadius: Radii.sm,
     alignItems: 'center',
@@ -912,13 +1059,42 @@ const styles = StyleSheet.create({
   iconCell: {
     flexBasis: '13%',
     flexGrow: 1,
-    minWidth: 40,
-    maxWidth: 56,
+    minWidth: 48,
+    maxWidth: 64,
     aspectRatio: 1,
     borderRadius: Radii.sm,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  presetRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.s2,
+  },
+  presetChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s1,
+    minHeight: 44,
+    paddingHorizontal: Spacing.s3,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+  },
+  limitWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s1,
+    minHeight: 44,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    paddingHorizontal: Spacing.s4,
+  },
+  limitInput: {
+    flex: 1,
+    minWidth: 60,
+    minHeight: 44,
+    paddingVertical: Spacing.s2,
   },
   sheetFooter: {
     flexDirection: 'row',

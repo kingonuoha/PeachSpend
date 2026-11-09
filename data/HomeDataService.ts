@@ -7,6 +7,10 @@ import type {
   HomeCategorySnapshot, HomeComparativeInsight, HomeDataSource, HomePeriod, HomeSnapshot,
 } from './HomeContracts';
 
+// The Home recent card shows five rows. Named because two paths have to agree on it:
+// the bounded SQL read and the in-memory slice of a full list.
+const RECENT_LIMIT = 5;
+
 function getPeriod(now: number): HomePeriod {
   const date = new Date(now);
   const start = new Date(date.getFullYear(), date.getMonth(), 1).getTime();
@@ -59,19 +63,51 @@ export function buildCategories(expenses: Expense[], displayCurrency: string, ra
 }
 
 export class HomeDataService {
+  private inFlightSnapshot: Promise<HomeSnapshot> | null = null;
   constructor(private readonly source: HomeDataSource) {}
 
   async getSnapshot(now = Date.now()): Promise<HomeSnapshot> {
+    if (this.inFlightSnapshot) {
+      return this.inFlightSnapshot;
+    }
+    const fetchPromise = this.fetchSnapshot(now).finally(() => {
+      this.inFlightSnapshot = null;
+    });
+    this.inFlightSnapshot = fetchPromise;
+    return fetchPromise;
+  }
+
+  private async fetchSnapshot(now: number): Promise<HomeSnapshot> {
     const period = getPeriod(now);
     let userCurrency: string | null = null;
     try {
-      const [expenses, currency, amountsVisible, incomes, streak, unreadNotificationCount, rates] = await Promise.all([
-        this.source.getExpenses(), this.source.getSetting('currency'), this.source.getSetting('prices_visible'),
-        this.source.getIncomesForPeriod(period.start, period.end), this.source.getStreak(), this.source.getUnreadNotificationCount(),
+      const previousPeriod = getPreviousPeriod(period);
+      // F-09, F-10. Two reads with two jobs. The period read feeds the aggregates and
+      // is bounded to the current and previous period; the recent read is its own
+      // bounded query for the newest rows, so a record older than the previous period
+      // or newer than the current one still reaches the recent card instead of the
+      // card claiming nothing was recorded. A source without the bounded recent read
+      // falls back to the full ledger, which is the pre-row meaning; it never falls
+      // back to the period list, which is the defect this row fixes.
+      const periodExpenses = this.source.getExpensesForPeriod
+        ? this.source.getExpensesForPeriod(previousPeriod.start, period.end)
+        : this.source.getExpenses();
+      const recentExpenses = this.source.getRecentExpenses
+        ? this.source.getRecentExpenses(RECENT_LIMIT)
+        : this.source.getExpensesForPeriod
+          ? this.source.getExpenses()
+          : periodExpenses;
+      const [expenses, currency, amountsVisible, incomes, streak, unreadNotificationCount, rates, recent] = await Promise.all([
+        periodExpenses,
+        this.source.getSetting('currency'),
+        this.source.getSetting('prices_visible'),
+        this.source.getIncomesForPeriod(period.start, period.end),
+        this.source.getStreak(),
+        this.source.getUnreadNotificationCount(),
         this.source.getSetting('conversion_rates'),
+        recentExpenses,
       ]);
       userCurrency = currency;
-      const previousPeriod = getPreviousPeriod(period);
       const current = expenses.filter(expense => expense.date >= period.start && expense.date <= period.end);
       const previous = expenses.filter(expense => expense.date >= previousPeriod.start && expense.date <= previousPeriod.end);
       const displayCurrency = resolveDisplayCurrency(currency, current[0]?.currency);
@@ -83,7 +119,7 @@ export class HomeDataService {
         state: expenses.length === 0 ? 'empty' : 'ready', refreshedAt: now, period,
          hero: { totalSpent, incomeTotal: incomeTotal.total, transactionCount: current.length, currency: displayCurrency, visibility: amountsVisible === 'false' ? 'hidden' : 'visible' },
         comparativeInsight: buildComparativeInsight(totalSpent, sumExpenses(previous, displayCurrency, rates)),
-        recentTransactions: [...expenses].sort((a, b) => b.date - a.date).slice(0, 5),
+        recentTransactions: [...recent].sort((a, b) => b.date - a.date).slice(0, RECENT_LIMIT),
         categories: buildCategories(current, displayCurrency, rates), streak: { days: streak, hasActivity: streak > 0 }, unreadNotificationCount,
         refresh: { status: 'idle' },
         normalization: { complete: missingRates.length === 0, missingRates },

@@ -2,11 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Notification as StoredNotification } from '../types/database';
 import type { NotificationDataSource } from './NotificationContracts';
 import {
-  NotificationDataService, buildNotificationList, countUnread, mapNotificationKind,
-  parseNotificationData, resolveNotificationDestination, toNotificationRecord,
+  NotificationDataService, buildNotificationList, countUnread, getDraftNotificationLink, mapNotificationKind,
+  parseNotificationData, resolveNotificationDestination, selectMarkAllReadTargets, toNotificationRecord,
 } from './NotificationDataService';
 
-const notification = (overrides: Partial<StoredNotification> = {}): StoredNotification => ({
+const notification = (overrides: Partial<StoredNotification> & { accounted?: number } = {}): StoredNotification & { accounted?: number } => ({
   id: 'n1', title: 'Title', body: 'Body', type: 'expense', data: null, read: 0, created_at: 10, ...overrides,
 });
 
@@ -80,7 +80,57 @@ describe('notification delete boundaries', () => {
     await service.markRead('n1');
     await service.markAllRead();
     expect(port.markNotificationRead).toHaveBeenCalledWith('n1');
-    expect(port.markAllNotificationsRead).toHaveBeenCalledOnce();
+    expect(port.markNotificationRead).toHaveBeenCalledTimes(2);
+    expect(port.markAllNotificationsRead).not.toHaveBeenCalled();
     await expect(service.unreadCount()).resolves.toBe(1);
+  });
+});
+
+describe('draft linked unread until accounted for (Phase 14 D1)', () => {
+  const draftRow = (id: string, accounted?: number) => notification({ id, data: JSON.stringify({ draftId: 'draft-1' }), accounted });
+
+  it('exposes the draft link and the accounted flag on the record', () => {
+    expect(toNotificationRecord(notification())).toMatchObject({ draftId: null, accounted: true });
+    expect(toNotificationRecord(draftRow('n2'))).toMatchObject({ draftId: 'draft-1', accounted: false });
+    expect(toNotificationRecord(draftRow('n3', 1))).toMatchObject({ draftId: 'draft-1', accounted: true });
+  });
+
+  it('reads the draft link from data without inventing one', () => {
+    expect(getDraftNotificationLink({})).toBeNull();
+    expect(getDraftNotificationLink({ draftId: null })).toBeNull();
+    expect(getDraftNotificationLink({ draftId: '' })).toBeNull();
+    expect(getDraftNotificationLink({ draftId: 'draft-9' })).toBe('draft-9');
+  });
+
+  it('selects only accounted rows for mark all read', () => {
+    const records = [notification(), draftRow('n2'), draftRow('n3', 1)].map(toNotificationRecord);
+    expect(selectMarkAllReadTargets(records)).toEqual(['n1', 'n3']);
+  });
+
+  it('skips unaccounted draft rows on mark all read and on mark read', async () => {
+    const port = source([notification(), draftRow('n2'), draftRow('n3', 1)]);
+    const service = new NotificationDataService(port);
+
+    await service.markAllRead();
+
+    expect(port.markNotificationRead).toHaveBeenCalledWith('n1');
+    expect(port.markNotificationRead).toHaveBeenCalledWith('n3');
+    expect(port.markNotificationRead).not.toHaveBeenCalledWith('n2');
+    expect(port.markNotificationRead).toHaveBeenCalledTimes(2);
+
+    await service.markRead('n2');
+    expect(port.markNotificationRead).toHaveBeenCalledTimes(2);
+    await service.markRead('n3');
+    expect(port.markNotificationRead).toHaveBeenCalledTimes(3);
+    expect(port.markNotificationRead).toHaveBeenLastCalledWith('n3');
+  });
+
+  it('leaves a missing row unread rather than writing blindly', async () => {
+    const port = source([notification()]);
+    const service = new NotificationDataService(port);
+
+    await service.markRead('gone');
+
+    expect(port.markNotificationRead).not.toHaveBeenCalled();
   });
 });

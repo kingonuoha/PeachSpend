@@ -3,7 +3,7 @@ import type { Expense } from '../types/database';
 import {
   buildBulkConversionPlan, buildConversionOptions, buildCurrencyConversionPreview, buildExportPreview,
   buildSettingsSnapshot, CLEAR_ALL_DATA_SCOPE, executeBulkCurrencyConversion, executeDataStewardship, executeExport, isExportableExpense,
-  parseBudgetInput, updateBudget, type CurrencyConversionWriter, type DataStewardshipPort, type ExportWriter,
+  parseBudgetInput, parseStoredBudget, toStoredBudget, updateBudget, type CurrencyConversionWriter, type DataStewardshipPort, type ExportWriter,
 } from './SettingsContracts';
 
 const RATES = JSON.stringify({ USD: 1, EUR: 2, GBP: 4 });
@@ -41,6 +41,45 @@ describe('budget update boundary', () => {
     const updateSetting = vi.fn().mockResolvedValue(undefined);
     await expect(updateBudget({ getSetting: async () => null, updateSetting }, '-1', 'USD')).resolves.toEqual({ status: 'invalid', reason: 'not_a_number' });
     expect(updateSetting).not.toHaveBeenCalled();
+  });
+
+  it('keeps the S-06 empty entry a cleared zero rather than a refused write', async () => {
+    const updateSetting = vi.fn().mockResolvedValue(undefined);
+    await expect(updateBudget({ getSetting: async () => null, updateSetting }, '', 'NGN')).resolves.toEqual({ status: 'saved', budget: 0, currency: 'NGN' });
+    expect(updateSetting).toHaveBeenNthCalledWith(1, 'monthly_budget', '0');
+  });
+});
+
+// BUG-09-04a: one canonical budget read and write. Home shouted "Exceeded" about a
+// budget Settings called unset because parseFloat('66,000') is 66 while
+// Number('66,000') is NaN, so two readers disagreed about one stored string.
+describe('one canonical budget parse (BUG-09-04a)', () => {
+  const cases: { input: string; written: string | null; read: number; note: string }[] = [
+    { input: '4500', written: '4500', read: 4500, note: 'a plain amount is stored and read unchanged' },
+    { input: ' 4500 ', written: '4500', read: 4500, note: 'whitespace is trimmed before storing' },
+    { input: '66,000', written: null, read: 0, note: 'grouped thousands is refused, never truncated to 66' },
+    { input: '66,000.5', written: null, read: 0, note: 'grouped thousands with decimals is refused' },
+    { input: 'NGN 66,000', written: null, read: 0, note: 'a currency prefixed value is refused' },
+    { input: '', written: null, read: 0, note: 'a cleared budget is a real zero and writes no row' },
+    { input: '-4500', written: null, read: 0, note: 'a negative value is refused' },
+  ];
+
+  it('resolves every input the same way through the write rule and the read rule', () => {
+    for (const item of cases) {
+      expect(toStoredBudget(item.input), `${item.note} (write)`).toBe(item.written);
+      expect(parseStoredBudget(item.input), `${item.note} (read of the raw stored value)`).toBe(item.read);
+      expect(parseStoredBudget(item.written), `${item.note} (read of what was written)`).toBe(item.read);
+    }
+  });
+
+  it('never reads a grouped value as its first group', () => {
+    expect(Number.parseFloat('66,000')).toBe(66);
+    expect(parseStoredBudget('66,000')).toBe(0);
+  });
+
+  it('reports a stored value a strict parse refuses as no limit in the S-06 snapshot', () => {
+    expect(buildSettingsSnapshot({ currency: 'NGN', monthly_budget: '66,000' }).budget).toBe(0);
+    expect(buildSettingsSnapshot({ currency: 'NGN', monthly_budget: '4500' }).budget).toBe(4500);
   });
 });
 

@@ -1,5 +1,5 @@
 import {
-  CATEGORY_COLOR_PALETTE, CATEGORY_DELETION_SUPPORT, DEFAULT_CATEGORY_ICON,
+  CATEGORY_COLOR_PALETTE, DEFAULT_CATEGORY_ICON,
 } from './CategoryContracts';
 import type {
   CategoryCreateInput, CategoryMutationResult, CategoryPort, CategoryRecord, CategoryUpdateInput,
@@ -79,5 +79,3 @@ export class CategoryService {
     return created;
   }
 }
-
-export { CATEGORY_DELETION_SUPPORT };

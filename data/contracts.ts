@@ -68,8 +68,20 @@ export class IncomeValidationError extends Error {
   }
 }
 
+// Sources where the merchant is extracted from something the user did not type,
+// so an absent merchant is a true absence rather than an omission. A product
+// photograph normally carries no store name at all, and refusing that capture
+// would block a save the user can see is correct (BUG-09-17a).
+//
+// Every other source keeps the merchant required. A manual entry is the case
+// where the requirement is real: the user left blank a name that was asked for.
+// A chat action and an imported row keep it too, and both already enforce it at
+// their own boundary before a candidate is built, so this restates that rule
+// rather than relaxing it.
+const MERCHANT_OPTIONAL_SOURCES: readonly CaptureSource[] = ['ocr', 'share', 'auto_capture'];
+
 export function assertValidCaptureCandidate(candidate: CaptureCandidate): void {
-  if (!candidate.merchant.trim()) throw new CaptureValidationError('merchant');
+  if (!MERCHANT_OPTIONAL_SOURCES.includes(candidate.source) && !candidate.merchant.trim()) throw new CaptureValidationError('merchant');
   if (!Number.isFinite(candidate.amount) || candidate.amount <= 0) throw new CaptureValidationError('amount');
   if (!candidate.currency.trim()) throw new CaptureValidationError('currency');
   if (!candidate.category.trim()) throw new CaptureValidationError('category');
@@ -204,6 +216,10 @@ export interface AutoCaptureSourceDescriptor {
 export interface NativeAutoCaptureNotification {
   id: string;
   packageName: string;
+  // Forwarded from the Android notification extras (title plus android.text or
+  // bigText). Optional because older native builds send text only; the TS
+  // parser treats a missing title as an empty prefix and combines both fields,
+  // so Mobile must forward the title once available but text alone still parses.
   title?: string;
   text: string;
   receivedAt: number;
@@ -217,6 +233,72 @@ export interface NativeAutoCaptureSourceAdapter {
   subscribe(listener: (notification: NativeAutoCaptureNotification) => void): () => void;
   setLifecycle?(enabled: boolean, permission: AutoCapturePermission): void;
   openSystemSettings(): Promise<void>;
+  // Phase 14 M1 setup guide state for S-22 (M3). Battery exemption is directly
+  // detectable via PowerManager; the guard flags report the foreground service.
+  // Autostart state has no detection API on Android, so it ships as static
+  // brand instructions (AUTOSTART_GUIDE in AutoCaptureSource), never as a sensed
+  // value. All three are optional so older native builds without the new async
+  // functions keep compiling and fall back honestly.
+  getBatteryExemption?(): Promise<BatteryExemptionState>;
+  getGuardState?(): Promise<GuardServiceState>;
+  openBatterySettings?(): Promise<void>;
+  // Phase 14 M2 rich detection alert. Posts the expanded custom notification
+  // for one queued draft and cancels it after the draft resolves. The Confirm
+  // and Remind later actions land in the native receiver, which records the
+  // intent durably; subscribeAlertActions delivers the live copy when the
+  // runtime is up and consumePendingAlertAction drains the durable queue one
+  // record at a time (null when empty). All three are optional so older
+  // native builds and non Android platforms degrade to inbox only.
+  showDetectionAlert?(input: DetectionAlertContent): Promise<DetectionAlertPostResult>;
+  cancelDetectionAlert?(draftId: string): Promise<void>;
+  subscribeAlertActions?(listener: (action: PendingAlertAction) => void): () => void;
+  consumePendingAlertAction?(): Promise<PendingAlertAction | null>;
+}
+
+// Preformatted alert strings, derived from parsed detection fields only. The
+// native builder applies length caps; nothing raw and no key travels here.
+export interface DetectionAlertContent {
+  draftId: string;
+  merchant: string;
+  amountText: string;
+  sourceLabel: string;
+  timeText: string;
+}
+
+export interface DetectionAlertPostResult {
+  posted: boolean;
+}
+
+// One receiver action intent: the draft it targets, the action the user tapped,
+// and the epoch millisecond the receiver recorded it.
+export interface PendingAlertAction {
+  draftId: string;
+  action: 'confirm' | 'snooze';
+  receivedAt: number;
+}
+
+// Directly detectable battery exemption state. Exempt true means the OS skips
+// most power saving for this app; exempt false means Doze can pause the
+// listener, so the setup guide points at the exemption settings screen.
+export interface BatteryExemptionState {
+  exempt: boolean;
+}
+
+// Foreground guard service state. Running tracks the guard process only and
+// never claims autostart status, which has no detection API.
+export interface GuardServiceState {
+  running: boolean;
+  captureEnabled: boolean;
+  listenerGranted: boolean;
+}
+
+// One brand row of the autostart setup instructions. Steps are static guidance
+// written from public OS settings paths, never a sensed on or off state,
+// because Android exposes no API that reports autostart manager status.
+export interface AutostartGuideEntry {
+  brand: string;
+  systemPath: string;
+  steps: string[];
 }
 
 export interface AutoCaptureHostState {

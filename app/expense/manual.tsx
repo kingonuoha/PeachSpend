@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -15,11 +17,12 @@ import Animated, {
   withSequence,
   withTiming,
 } from 'react-native-reanimated';
-import { LinearGradient } from 'expo-linear-gradient';
+import { Image } from 'expo-image';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Briefcase, Calendar, ChevronLeft, ChevronRight, Repeat, Tag, X } from 'lucide-react-native';
+import { Briefcase, Calendar, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Repeat, Tag, X } from 'lucide-react-native';
 import { format, isToday } from 'date-fns';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import * as Haptics from 'expo-haptics';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
@@ -28,7 +31,9 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
-import { VirtualNumpad } from '../../components/capture/VirtualNumpad';
+import { DockedNumpad } from '../../components/capture/DockedNumpad';
+import { DateTimeFieldSheet } from '../../components/capture/DateTimeFieldSheet';
+import { useDateTimeFieldControl } from '../../components/capture/useDateTimeFieldControl';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
 import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
@@ -36,7 +41,7 @@ import { databaseService } from '../../services/DatabaseService';
 import { notificationService } from '../../services/NotificationService';
 import { logger } from '../../utils/logger';
 import { useAchievements } from '../../components/ui/AchievementProvider';
-import { formatCurrency } from '../../utils/currency';
+import { formatAmountInput, formatCurrency } from '../../utils/currency';
 import { resolveExpenseSave, runCaptureSideEffects, type DuplicateMatch } from '../../data';
 
 const SWITCH_TRACK_WIDTH = 44;
@@ -54,6 +59,15 @@ const RECURRENCE_OPTIONS = [
   { value: 'monthly', label: 'Monthly' },
   { value: 'weekly', label: 'Weekly' },
 ] as const;
+
+// How long the merchant field has to settle before the persisted category
+// suggestion for it is read, so typing a name does not issue a read per keystroke.
+const MERCHANT_SUGGESTION_DELAY_MS = 400;
+
+// The category default is derived only from signals the app really stores: the
+// per-merchant memory the capture pipeline already writes, the newest expense row,
+// and the category table itself. When none of them speaks, the field stays empty.
+type CategoryDefaultSource = 'merchant-memory' | 'recent-expense' | 'first-category' | 'none';
 
 function ToggleSwitch({
   value,
@@ -97,7 +111,7 @@ function ToggleSwitch({
 
 export default function ManualEntryScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ origin?: string }>();
+  const params = useLocalSearchParams<{ origin?: string; imageUri?: string }>();
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
   const reduceMotion = useReduceMotion();
@@ -105,11 +119,11 @@ export default function ManualEntryScreen() {
   const { showToast } = useToast();
   const { checkForNewAchievements } = useAchievements();
 
-  const [enteredAt] = useState(() => Date.now());
   const [amount, setAmount] = useState('0.00');
   const [merchant, setMerchant] = useState('');
   const [note, setNote] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<CaptureCategory | null>(null);
+  const [categoryDefaultSource, setCategoryDefaultSource] = useState<CategoryDefaultSource>('none');
   const [categories, setCategories] = useState<CaptureCategory[]>([]);
   const [categoryLoadFailed, setCategoryLoadFailed] = useState(false);
   const [isCategoryPickerVisible, setCategoryPickerVisible] = useState(false);
@@ -119,7 +133,30 @@ export default function ManualEntryScreen() {
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateMatch | null>(null);
   const [saving, setSaving] = useState<'idle' | 'checking' | 'saving'>('idle');
   const [saveFailed, setSaveFailed] = useState(false);
-  const [keypadOpen, setKeypadOpen] = useState(false);
+  const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
+  // DEC-11-01. The amount card opens with the docked numpad in place and the native
+  // keyboard dismissed; focusing any text field hands the bottom back to the native
+  // keyboard and removes the numpad from the layout entirely.
+  const [isAmountActive, setAmountActive] = useState(true);
+  const [isReceiptExpanded, setReceiptExpanded] = useState(false);
+  // The date and time control is one shared implementation with the income form.
+  const {
+    platform: dateTimePlatform,
+    value: enteredDate,
+    field: dateTimeField,
+    open: openDateTimeField,
+    dismiss: dismissDateTimeField,
+    done: doneDateTimeField,
+    switchMode: selectDateTimeMode,
+    handleChange: handleDateChange,
+  } = useDateTimeFieldControl();
+  const merchantInputRef = useRef<TextInput>(null);
+  const noteInputRef = useRef<TextInput>(null);
+  // Set once the user picks a category themselves, so a late merchant suggestion can
+  // never overwrite a choice they made.
+  const categoryChosenByUser = useRef(false);
+
+  const receiptImageUri = typeof params.imageUri === 'string' && params.imageUri.trim() ? params.imageUri.trim() : null;
 
   const enterOpacity = useSharedValue(reduceMotion ? 1 : 0);
   const enterOffset = useSharedValue(reduceMotion ? 0 : 16);
@@ -150,15 +187,65 @@ export default function ManualEntryScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reduceMotion]);
 
+  const applyCategoryDefault = useCallback((items: CaptureCategory[], recentCategoryId: string | null) => {
+    if (categoryChosenByUser.current || items.length === 0) return;
+    const remembered = recentCategoryId ? items.find(category => category.id === recentCategoryId) ?? null : null;
+    if (remembered) {
+      setSelectedCategory(remembered);
+      setCategoryDefaultSource('recent-expense');
+      return;
+    }
+    setSelectedCategory(items[0]);
+    setCategoryDefaultSource('first-category');
+  }, []);
+
   const loadCategories = useCallback(async () => {
     try {
       const items = await databaseService.getCategories();
       setCategories(items);
       setCategoryLoadFailed(false);
+      // The most recent real expense is the only "what did I use last" signal the app
+      // stores, so the default comes from that row rather than from a guess.
+      let recentCategoryId: string | null = null;
+      try {
+        const recent = await databaseService.getRecentExpenses(1);
+        recentCategoryId = recent[0]?.category ?? null;
+      } catch {
+        recentCategoryId = null;
+      }
+      applyCategoryDefault(items, recentCategoryId);
     } catch {
       setCategoryLoadFailed(true);
     }
-  }, []);
+  }, [applyCategoryDefault]);
+
+  // A typed merchant can suggest the category the user settled on for that merchant
+  // last time. The read is deferred so typing does not issue one per keystroke, and it
+  // never overrides a category the user picked in this form.
+  useEffect(() => {
+    const trimmed = merchant.trim();
+    if (!trimmed || categoryChosenByUser.current) return;
+    let active = true;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const repository = await databaseService.getCaptureRepository();
+          const remembered = await repository.getRememberedCategory(trimmed);
+          if (!active || categoryChosenByUser.current || !remembered) return;
+          const match = categories.find(category => category.id === remembered) ?? null;
+          if (!match) return;
+          setSelectedCategory(match);
+          setCategoryDefaultSource('merchant-memory');
+        } catch {
+          // A memory read failure leaves whatever default is already shown.
+        }
+      })();
+    }, MERCHANT_SUGGESTION_DELAY_MS);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [categories, merchant]);
 
   useEffect(() => {
     const timer = setTimeout(() => { void loadCategories(); }, 0);
@@ -181,7 +268,10 @@ export default function ManualEntryScreen() {
 
   const symbol = getCurrencySymbol(currency);
   const originLabel = typeof params.origin === 'string' && params.origin.trim() ? params.origin.trim() : null;
-  const dateLabel = `${isToday(enteredAt) ? 'Today' : format(enteredAt, 'EEE, MMM d')} · ${format(enteredAt, 'h:mm a')}`;
+  const dateLabel = `${isToday(enteredDate) ? 'Today' : format(enteredDate, 'EEE, MMM d')} · ${format(enteredDate, 'h:mm a')}`;
+  const merchantNeedsAttention = hasAttemptedSave && !merchantValid;
+  const amountNeedsAttention = hasAttemptedSave && !amountValid;
+  const categoryNeedsAttention = hasAttemptedSave && !categoryValid;
 
   const tint = selectedCategory
     ? (CategoryTints[selectedCategory.id as keyof typeof CategoryTints] ?? CategoryTints.other)
@@ -191,13 +281,33 @@ export default function ManualEntryScreen() {
   // blue-400 in dark, so it follows the theme like every other tint.
   const reimburseTint = ts.isDark ? CategoryTints.transport.dark : CategoryTints.transport.light;
 
-  const saveLabel = !amountValid
-    ? 'Enter an Amount'
-    : !merchantValid
-      ? 'Enter Merchant Name'
-      : !categoryValid
-        ? 'Select a Category'
-        : `Save Expense (${formatCurrency(parsedAmount, currency)})`;
+  // The primary action never changes job. It states what it will save, or just what it
+  // does, and every missing field is explained next to that field instead.
+  const saveLabel = amountValid
+    ? `Save Expense (${formatCurrency(parsedAmount, currency)})`
+    : 'Save Expense';
+
+  // DEC-11-01. Activating the amount card owns the bottom of the screen: the native
+  // keyboard is dismissed and the docked numpad takes its place.
+  const activateAmount = useCallback(() => {
+    Keyboard.dismiss();
+    merchantInputRef.current?.blur();
+    noteInputRef.current?.blur();
+    setAmountActive(true);
+  }, []);
+
+  // Any text field taking focus removes the numpad from the layout before the native
+  // keyboard opens, so the two can never compete for the same space.
+  const deactivateAmount = useCallback(() => {
+    setAmountActive(false);
+  }, []);
+
+  const handleSelectCategory = useCallback((category: CaptureCategory) => {
+    categoryChosenByUser.current = true;
+    setSelectedCategory(category);
+    setCategoryDefaultSource('none');
+    setCategoryPickerVisible(false);
+  }, []);
 
   const handleKeyPress = useCallback((key: string) => {
     setAmount(prev => {
@@ -221,7 +331,8 @@ export default function ManualEntryScreen() {
   }, []);
 
   const doSave = useCallback(async (allowDuplicate = false) => {
-    if (!selectedCategory) return;
+    setHasAttemptedSave(true);
+    if (!selectedCategory || !merchant.trim() || parsedAmount <= 0) return;
     setSaveFailed(false);
     setSaving(allowDuplicate ? 'saving' : 'checking');
     const candidate = {
@@ -232,7 +343,7 @@ export default function ManualEntryScreen() {
       note: note.trim() || undefined,
       source: 'manual' as const,
       origin: 'manual_expense' as const,
-      date: enteredAt,
+      date: enteredDate.getTime(),
       isRecurring,
       recurrenceInterval: isRecurring ? recurrenceInterval : undefined,
       isReimbursable,
@@ -268,7 +379,7 @@ export default function ManualEntryScreen() {
       setSaveFailed(true);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [merchant, parsedAmount, currency, selectedCategory, note, enteredAt, isRecurring, recurrenceInterval, isReimbursable, checkForNewAchievements, showToast, router]);
+  }, [merchant, parsedAmount, currency, selectedCategory, note, enteredDate, isRecurring, recurrenceInterval, isReimbursable, checkForNewAchievements, showToast, router]);
 
   const handleSave = useCallback(() => {
     if (!canSave || busy) return;
@@ -338,46 +449,83 @@ export default function ManualEntryScreen() {
               </View>
             ) : null}
 
-            <ScalePressable
-              haptic={false}
+            {receiptImageUri ? (
+              <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+                <Pressable
+                  onPress={() => { void Haptics.selectionAsync(); setReceiptExpanded(value => !value); }}
+                  accessibilityRole="button"
+                  accessibilityLabel={isReceiptExpanded ? 'Hide the captured receipt' : 'Show the captured receipt'}
+                  accessibilityState={{ expanded: isReceiptExpanded }}
+                  style={styles.receiptHeader}
+                >
+                  <View style={[styles.dateIcon, { backgroundColor: ts.raw.purple100 }]}>
+                    <Tag size={16} color={ts.text.primary} />
+                  </View>
+                  <View style={styles.flex}>
+                    <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Captured receipt</Text>
+                    <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+                      {isReceiptExpanded ? 'Tap to hide' : 'Tap to read it while you type'}
+                    </Text>
+                  </View>
+                  {isReceiptExpanded ? <ChevronUp size={18} color={ts.icon.muted} /> : <ChevronDown size={18} color={ts.icon.muted} />}
+                </Pressable>
+                {isReceiptExpanded ? (
+                  <View style={styles.receiptImageWrap}>
+                    <Image
+                      source={{ uri: receiptImageUri }}
+                      style={styles.receiptImage}
+                      contentFit="contain"
+                      accessibilityLabel="Captured receipt photo"
+                    />
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+
+            <Pressable
+              onPress={activateAmount}
               accessibilityRole="button"
-              accessibilityLabel="Amount spent"
-              accessibilityState={{ expanded: keypadOpen }}
-              onPress={() => setKeypadOpen(v => !v)}
-              style={[styles.card, styles.heroCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+              accessibilityLabel={`Amount spent ${formatAmountInput(amount) || '0.00'} ${currency}. Tap to type with the keypad`}
+              accessibilityState={{ selected: isAmountActive }}
+              style={[
+                styles.card,
+                styles.heroCard,
+                { backgroundColor: ts.bg.surface, borderColor: isAmountActive ? ts.border.primary20 : ts.border.card },
+              ]}
             >
               <View style={styles.rowBetween}>
                 <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Amount Spent</Text>
-                {!amountValid ? (
-                  <Text style={[Typography.micro, { color: ts.raw.warning }]}>Required</Text>
+                {amountNeedsAttention ? (
+                  <Text style={[Typography.micro, { color: ts.text.error }]}>Add the amount you spent</Text>
                 ) : null}
               </View>
               <View style={styles.amountRow}>
                 <Text style={[Typography.headlineSm, { color: ts.text.primary }]}>{symbol}</Text>
                 <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.displayLg, styles.amountValue, { color: ts.text.onSurface }]}>
-                  {amount}
+                  {formatAmountInput(amount) || '0.00'}
                 </Text>
-                <Animated.View style={[styles.cursor, { backgroundColor: ts.text.primary }, cursorStyle]} />
+                {isAmountActive ? <Animated.View style={[styles.cursor, { backgroundColor: ts.text.primary }, cursorStyle]} /> : null}
               </View>
               <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
-                Tap to enter via virtual numpad below
+                {isAmountActive ? 'Typing with the keypad below' : 'Tap the amount to reopen the keypad'}
               </Text>
-            </ScalePressable>
+            </Pressable>
 
             <View style={styles.formGroup}>
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
               <View style={styles.rowBetween}>
                 <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>Merchant</Text>
-                {!merchantValid ? (
+                {merchantNeedsAttention ? (
                   <Text style={[Typography.micro, { color: ts.text.error }]}>Required to save</Text>
                 ) : null}
               </View>
-              <View style={[styles.inputRow, { backgroundColor: ts.bg.screen, borderColor: merchantValid ? 'transparent' : ts.border.error20 }]}>
+              <View style={[styles.inputRow, { backgroundColor: ts.bg.screen, borderColor: merchantNeedsAttention ? ts.border.error20 : 'transparent' }]}>
                 <Tag size={16} color={ts.icon.muted} />
                 <TextInput
+                  ref={merchantInputRef}
                   value={merchant}
-                  onChangeText={setMerchant}
-                  onFocus={() => setKeypadOpen(false)}
+                  onChangeText={(val) => { setMerchant(val); if (hasAttemptedSave && val.trim().length > 0) setHasAttemptedSave(false); }}
+                  onFocus={deactivateAmount}
                   placeholder="e.g. Whole Foods, Blue Bottle Coffee"
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -401,16 +549,18 @@ export default function ManualEntryScreen() {
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
               <View style={styles.rowBetween}>
                 <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>Category</Text>
-                <Text style={[Typography.micro, { color: categoryValid ? ts.text.primary : ts.raw.warning }]}>
-                  {categoryValid ? 'Selected' : 'Required'}
-                </Text>
+                {categoryNeedsAttention ? (
+                  <Text style={[Typography.micro, { color: ts.text.error }]}>Pick a category</Text>
+                ) : selectedCategory ? (
+                  <Text style={[Typography.micro, { color: ts.text.primary }]}>Selected</Text>
+                ) : null}
               </View>
               <ScalePressable
                 haptic={false}
                 accessibilityRole="button"
                 accessibilityLabel={selectedCategory ? `Category, ${selectedCategory.title}. Change category` : 'Select category'}
                 onPress={() => { void Haptics.selectionAsync(); setCategoryPickerVisible(true); }}
-                style={[styles.categoryChip, { backgroundColor: ts.bg.screen, borderColor: ts.border.card }]}
+                style={[styles.categoryChip, { backgroundColor: ts.bg.screen, borderColor: categoryNeedsAttention ? ts.border.error20 : ts.border.card }]}
               >
                 <View style={[styles.categoryIcon, { backgroundColor: tintColors[0] }]}>
                   <CategoryGlyph iconName={selectedCategory?.icon_name} size={20} color={tintColors[1]} />
@@ -425,6 +575,13 @@ export default function ManualEntryScreen() {
                   <ChevronRight size={16} color={ts.text.primary} />
                 </View>
               </ScalePressable>
+              {categoryDefaultSource === 'recent-expense' || categoryDefaultSource === 'first-category' ? (
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+                  {categoryDefaultSource === 'recent-expense'
+                    ? 'Suggested from your last expense. Change it if this one is different.'
+                    : 'Suggested from your category list. Change it if this one is different.'}
+                </Text>
+              ) : null}
               {categoryLoadFailed ? (
                 <View style={[styles.errorBox, { backgroundColor: ts.bg.error10, borderColor: ts.border.error20, marginTop: Spacing.s3 }]}>
                   <Text style={[Typography.labelMd, { color: ts.text.error }]}>
@@ -437,7 +594,16 @@ export default function ManualEntryScreen() {
               ) : null}
             </View>
 
-            <View style={[styles.card, styles.dateCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+            <ScalePressable
+              haptic={false}
+              accessibilityRole="button"
+              accessibilityLabel={`Date and time: ${dateLabel}. Tap to change`}
+              onPress={() => {
+                void Haptics.selectionAsync();
+                openDateTimeField();
+              }}
+              style={[styles.card, styles.dateCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+            >
               <View style={styles.dateLeft}>
                 <View style={[styles.dateIcon, { backgroundColor: ts.raw.purple100 }]}>
                   <Calendar size={16} color={ts.text.primary} />
@@ -447,10 +613,14 @@ export default function ManualEntryScreen() {
                   <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{dateLabel}</Text>
                 </View>
               </View>
-              <View style={[styles.autoPill, { backgroundColor: ts.bg.elevated }]}>
-                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>Auto</Text>
+              <View style={styles.changeRow}>
+                <Text style={[Typography.labelMd, { color: ts.text.primary }]}>Change</Text>
+                <ChevronRight size={16} color={ts.text.primary} />
               </View>
-            </View>
+            </ScalePressable>
+
+            {/* The iOS wheels live in a bottom sheet (below), so opening the picker never
+                pushes the form. Android keeps its own system dialogs. */}
 
             <View style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
               <View style={styles.rowBetween}>
@@ -459,9 +629,10 @@ export default function ManualEntryScreen() {
               </View>
               <View style={[styles.inputRow, { backgroundColor: ts.bg.screen }]}>
                 <TextInput
+                  ref={noteInputRef}
                   value={note}
                   onChangeText={setNote}
-                  onFocus={() => setKeypadOpen(false)}
+                  onFocus={deactivateAmount}
                   placeholder="Add receipt notes or memo..."
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -498,14 +669,7 @@ export default function ManualEntryScreen() {
                     <Repeat size={14} color={ts.text.primary} />
                   </View>
                   <View style={styles.flex}>
-                    <View style={styles.inline}>
-                      <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Repeats</Text>
-                      {isRecurring ? (
-                        <View style={[styles.badge, { backgroundColor: ts.raw.purple100 }]}>
-                          <Text style={[Typography.micro, { color: ts.text.primary }]}>S-15 Active</Text>
-                        </View>
-                      ) : null}
-                    </View>
+                    <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Repeats</Text>
                     <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{sectionTitle}</Text>
                   </View>
                 </View>
@@ -547,37 +711,18 @@ export default function ManualEntryScreen() {
               ) : null}
             </View>
             </View>
-
           </Animated.View>
         </ScrollView>
 
-        {keypadOpen ? (
-          <View style={[styles.keypadDock, { backgroundColor: ts.bg.screen, borderTopColor: ts.border.card }]}>
-            <View style={styles.keypadHeader}>
-              <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.onSurfaceVariant, textTransform: 'uppercase' }]}>
-                Quick Keypad
-              </Text>
-              <ScalePressable
-                accessibilityRole="button"
-                accessibilityLabel="Close keypad"
-                onPress={() => setKeypadOpen(false)}
-                style={styles.keypadDone}
-              >
-                <Text style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.primary }]}>Done</Text>
-              </ScalePressable>
-            </View>
-            <VirtualNumpad onKeyPress={handleKeyPress} />
-          </View>
-        ) : null}
+        {/* DEC-11-01. The bottom dock is part of the layout, not an overlay: the numpad
+            and the action bar take their own space, so neither can cover the merchant
+            field, the category card, the date card or each other at any scroll position.
+            When a text field has focus the numpad is removed from the tree entirely and
+            the native keyboard owns this space. */}
+        {isAmountActive ? <DockedNumpad onKeyPress={handleKeyPress} /> : null}
 
-        <View style={styles.footer} pointerEvents="box-none">
-          <LinearGradient
-            colors={[`${ts.bg.screen}00`, ts.bg.screen]}
-            locations={[0, 0.6]}
-            style={StyleSheet.absoluteFill}
-            pointerEvents="none"
-          />
-          <View style={[styles.footerContent, { paddingBottom: Math.max(Spacing.s5, insets.bottom) }]}>
+        <View style={[styles.footer, { backgroundColor: ts.bg.screen, borderTopColor: ts.border.subtle }]}>
+          <View style={[styles.footerContent, { paddingBottom: Math.max(Spacing.s4, insets.bottom) }]}>
             <View style={styles.actionRow}>
               <View style={styles.cancelSlot}>
                 <PeachButton
@@ -604,6 +749,17 @@ export default function ManualEntryScreen() {
             </View>
           </View>
         </View>
+
+        {dateTimePlatform === 'android' && dateTimeField.visible ? (
+          <DateTimePicker
+            value={enteredDate}
+            mode={dateTimeField.mode}
+            is24Hour={false}
+            display="default"
+            onValueChange={handleDateChange}
+            onDismiss={dismissDateTimeField}
+          />
+        ) : null}
       </KeyboardAvoidingView>
 
       <CategoryPickerSheet
@@ -613,8 +769,20 @@ export default function ManualEntryScreen() {
         flowType="expense"
         originLabel={merchant.trim() || undefined}
         originAmount={parsedAmount > 0 ? formatCurrency(parsedAmount, currency) : undefined}
-        onSelect={(category) => { setSelectedCategory(category); setCategoryPickerVisible(false); }}
+        onSelect={handleSelectCategory}
         onClose={() => setCategoryPickerVisible(false)}
+      />
+
+      {/* The iOS wheels moved here from the scroll body: opening the picker no longer
+          pushes the form, and the sheet cannot be confused with a form card. */}
+      <DateTimeFieldSheet
+        visible={dateTimePlatform === 'ios' && dateTimeField.visible}
+        value={enteredDate}
+        mode={dateTimeField.mode}
+        onValueChange={handleDateChange}
+        onDismiss={dismissDateTimeField}
+        onSwitchMode={selectDateTimeMode}
+        onDone={doneDateTimeField}
       />
 
       {duplicateWarning ? (
@@ -627,7 +795,7 @@ export default function ManualEntryScreen() {
             currency,
             category: selectedCategory?.id ?? '',
             type: 'expense',
-            date: enteredAt,
+            date: enteredDate.getTime(),
           }}
           onSaveAnyway={() => { setDuplicateWarning(null); void doSave(true); }}
           onDiscard={() => { setDuplicateWarning(null); showToast('Duplicate discarded', 'info'); }}
@@ -668,7 +836,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     flexShrink: 0,
   },
-  body: { paddingHorizontal: Spacing.s5, paddingBottom: 168, gap: Spacing.s4 },
+  body: { paddingHorizontal: Spacing.s5, paddingBottom: Spacing.s6, gap: Spacing.s4 },
   stack: { gap: Spacing.s4 },
   card: { borderWidth: 1, borderRadius: Radii.lg, padding: Spacing.s4, gap: Spacing.s2 },
   heroCard: { borderRadius: Radii.lg },
@@ -707,12 +875,9 @@ const styles = StyleSheet.create({
   dateCard: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   dateLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
   dateIcon: { width: 32, height: 32, borderRadius: Radii.full, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  autoPill: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s1, borderRadius: Radii.full },
   toggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3 },
   toggleLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
   toggleIcon: { width: 28, height: 28, borderRadius: 8, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  inline: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, flexWrap: 'wrap' },
-  badge: { paddingHorizontal: Spacing.s2, paddingVertical: 1, borderRadius: Radii.full },
   divider: { height: 1, marginVertical: 0 },
   switchTrack: {
     width: SWITCH_TRACK_WIDTH,
@@ -741,13 +906,15 @@ const styles = StyleSheet.create({
   },
   frequencyOptions: { flexDirection: 'row', gap: Spacing.s2 },
   frequencyButton: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, borderRadius: Radii.sm, minHeight: 44, justifyContent: 'center' },
-  keypadDock: { paddingHorizontal: Spacing.s5, paddingTop: Spacing.s3, paddingBottom: 120, borderTopWidth: 1 },
-  keypadDone: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, minHeight: 44, justifyContent: 'center' },
-  keypadHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: Spacing.s1 },
+  // The docked keypad and the action bar are layout siblings under the scroll body, so
+  // the pad can never float over a field. The pad keeps its own fixed key height.
+  receiptHeader: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, minHeight: 44 },
+  receiptImageWrap: { borderRadius: Radii.sm, overflow: 'hidden', backgroundColor: '#000000' },
+  receiptImage: { width: '100%', aspectRatio: 3 / 4, maxHeight: 320 },
   errorBox: { borderWidth: 1, borderRadius: Radii.md, padding: Spacing.s3, gap: Spacing.s2 },
   retry: { minHeight: 44, justifyContent: 'center' },
-  footer: { position: 'absolute', left: 0, right: 0, bottom: 0 },
-  footerContent: { paddingHorizontal: Spacing.s4, paddingTop: Spacing.s6 },
+  footer: { borderTopWidth: 1 },
+  footerContent: { paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 },
   actionRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3 },
   cancelSlot: { width: '32%' },
   saveSlot: { flex: 1 },

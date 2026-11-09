@@ -2,14 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
-  Platform,
   Pressable,
   Text,
   TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -33,12 +32,16 @@ import {
 import Animated, {
   FadeIn,
   FadeInUp,
+  KeyboardState,
   useAnimatedKeyboard,
+  useAnimatedReaction,
   useAnimatedStyle,
 } from 'react-native-reanimated';
+import { scheduleOnRN } from 'react-native-worklets';
 import { Colors, Radii, Spacing, Typography, Gradients } from '../constants/tokens';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
+import { useBottomClearance } from '../components/navigation/useBottomClearance';
 import { useSettings } from '../components/ui/SettingsProvider';
 import { useToast } from '../components/ui/ToastProvider';
 import { LuminousCard } from '../components/ui/LuminousCard';
@@ -64,6 +67,7 @@ import {
   type ChatDeepLink,
   type ChatTier2Approval,
 } from '../ai/chatActions';
+import type { LocalAnswer } from '../ai/localAnswers';
 import type { ProviderKeyState } from '../data/ProviderSettings';
 import type { ChatAction } from '../types/chat';
 import type { ChatMessage, Expense } from '../types/database';
@@ -87,9 +91,14 @@ type EntryKind =
   | 'unauthorized_action'
   | 'blocked'
   | 'chart'
+  | 'local_answer'
   | 'search'
   | 'import_approval'
   | 'error';
+
+// The answered half of the local resolver result. The unresolved half carries only a
+// reason code, which the screen turns into one plain sentence.
+type AnsweredLocalAnswer = Extract<LocalAnswer, { status: 'answered' }>;
 
 interface ConfirmationPayload {
   expenseId: string;
@@ -141,6 +150,7 @@ interface ChatEntry {
   unauthorizedAction?: UnauthorizedActionPayload;
   deepLink?: ChatDeepLink;
   chart?: ChatChartSpec;
+  localAnswer?: AnsweredLocalAnswer;
   search?: ChatSearchResponse;
   errorCode?: AiErrorCode;
   retryable?: boolean;
@@ -164,12 +174,33 @@ const TIER2_UNSUPPORTED_TEXT =
   'That change does not have a supported action boundary from chat yet, so nothing was changed.';
 const IMPORT_EMPTY_TEXT =
   'I could not find any transactions to import. Paste one transaction per line with a merchant and an amount, or attach a receipt image.';
-const SUGGESTED_PROMPTS = [
-  'How much did I spend this month?',
-  'Am I on track with my budget?',
-  'Log an expense at a merchant for a category',
-  'Show my recent expenses',
+
+// Every prompt except the last one is answerable from the local ledger with no key and
+// no connection, so tapping one is never a dead end. A budget judgement is not one of
+// the local analytics, so that prompt says out loud that it needs the assistant instead
+// of looking locally answerable and then failing.
+interface SuggestedPrompt {
+  text: string;
+  needsAssistant: boolean;
+}
+
+const SUGGESTED_PROMPTS: SuggestedPrompt[] = [
+  { text: 'How much did I spend this month?', needsAssistant: false },
+  { text: 'Show my spending by category', needsAssistant: false },
+  { text: 'Compare this week with last week', needsAssistant: false },
+  { text: 'Show my recent expenses', needsAssistant: false },
+  { text: 'Am I on track with my budget?', needsAssistant: true },
 ];
+
+const ASSISTANT_REQUIRED_LABEL = 'Needs the assistant';
+const ASSISTANT_REQUIRED_NOTE =
+  `Answers marked ${ASSISTANT_REQUIRED_LABEL} need a connection and a provider key. The rest are read from your own ledger.`;
+// The local resolver reports an unsupported question and an empty ledger separately, so
+// the screen can say which one happened instead of one vague failure for both.
+const LOCAL_ANSWER_UNSUPPORTED_TEXT =
+  'That question needs the assistant, which needs a connection and a provider key. Without them I can still answer your week or month total, your spending by category, your recent expenses, and a comparison with the previous week or month.';
+const LOCAL_ANSWER_NO_DATA_TEXT =
+  'Nothing is recorded for that yet, so there is no answer to show. Log an expense and ask again.';
 
 function localId(): string {
   return Math.random().toString(36).substring(2, 11);
@@ -180,6 +211,19 @@ function humanizeCategory(id: string): string {
     .replace(/[-_]+/g, ' ')
     .trim()
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+// What is actually known about a model beyond its name, taken only from the cached provider
+// list. The cached shape is an id, a display name, a free tier flag and a context length,
+// and the free tier flag is already drawn as its own pill, so this line adds the context
+// window when the provider returned one. Nothing in the cache or in the specs supports a
+// ranking, a speed claim, or an accuracy claim, so none is written here. A model with no
+// extra metadata says so rather than borrowing a description from somewhere else.
+function describeCachedModel(model: { contextLength?: number }): string {
+  if (typeof model.contextLength === 'number' && model.contextLength > 0) {
+    return `Context window ${model.contextLength.toLocaleString()} tokens`;
+  }
+  return 'No extra provider details cached';
 }
 
 // FR-12.6: the batch is gated by the existing Tier 2 `log_expenses_bulk`
@@ -321,7 +365,7 @@ function buildSearchSummary(response: ChatSearchResponse): string {
   const total = response.exact.length + response.semantic.length;
   if (total === 0) {
     if (response.semanticAvailability === 'offline') return 'No keyword matches found. Semantic search needs a connection, so it was skipped.';
-    if (response.semanticAvailability === 'missing_key') return 'No keyword matches found. Add a provider key in S-17 to search by meaning.';
+    if (response.semanticAvailability === 'missing_key') return 'No keyword matches found. Add a provider key in AI settings to search by meaning.';
     if (response.semanticAvailability === 'provider_failed') return 'No keyword matches found. Semantic search is unavailable right now.';
     return 'No matching transactions found.';
   }
@@ -331,7 +375,7 @@ function buildSearchSummary(response: ChatSearchResponse): string {
   ].filter((value): value is string => value !== null).join(', ');
   let summary = `Found ${total} transaction${total === 1 ? '' : 's'}${scope ? ` (${scope})` : ''}. Tap a result to open it.`;
   if (response.semanticAvailability === 'offline') summary += ' Semantic matches were skipped offline.';
-  if (response.semanticAvailability === 'missing_key') summary += ' Add a provider key in S-17 to search by meaning.';
+  if (response.semanticAvailability === 'missing_key') summary += ' Add a provider key in AI settings to search by meaning.';
   if (response.semanticAvailability === 'provider_failed') summary += ' Semantic matching is unavailable right now.';
   return summary;
 }
@@ -452,7 +496,7 @@ function ConfirmationCard({ payload }: { payload: ConfirmationPayload }) {
           onPress={() => router.push(`/expense/${payload.expenseId}`)}
           style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, minHeight: 44, paddingHorizontal: Spacing.s2 }}
         >
-          <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Inspect S-08</Text>
+          <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>View Details</Text>
           <ArrowRight size={12} color={ts.text.primary} />
         </ScalePressable>
       </View>
@@ -582,8 +626,20 @@ function UnauthorizedActionCard({ payload, incomingCurrency, busy, onConfirm, on
   );
 }
 
-function BlockedCard({ deepLink, onOpenStewardship }: { deepLink: ChatDeepLink; onOpenStewardship: () => void }) {
+function BlockedCard({ deepLink }: { deepLink?: ChatDeepLink }) {
   const ts = useThemeStyles();
+  const router = useRouter();
+  // The deep-link contract carries an internal screen and section id, and the ids are
+  // not user copy. This maps them to the route the app actually mounts plus plain
+  // words for the button. An unrecognised target returns null, so the card explains
+  // itself and withholds the button instead of routing the user somewhere unrelated.
+  const target = (() => {
+    if (!deepLink) return null;
+    if (deepLink.screen === 'S-06' && deepLink.section === 'data_stewardship') {
+      return { label: 'Manage Data in Settings', route: '/(tabs)/settings' as const };
+    }
+    return null;
+  })();
   return (
     <View style={{ gap: Spacing.s2 }}>
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 }}>
@@ -591,17 +647,20 @@ function BlockedCard({ deepLink, onOpenStewardship }: { deepLink: ChatDeepLink; 
         <Text style={[Typography.labelBold, { color: ts.raw.danger }]}>Destructive Action Guard</Text>
       </View>
       <Text style={[Typography.labelMd, { color: ts.text.onSurface }]}>{TIER3_REFUSAL_TEXT}</Text>
-      <PeachButton
-        title="Open S-06 Data Stewardship"
-        onPress={onOpenStewardship}
-        variant="destructive"
-        size="sm"
-        fullWidth
-        trailingIcon={<ArrowRight size={14} color={ts.raw.danger} />}
-      />
-      <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
-        Target: {deepLink.screen} {deepLink.section.replace(/_/g, ' ')}
-      </Text>
+      {target ? (
+        <PeachButton
+          title={target.label}
+          onPress={() => router.push(target.route)}
+          variant="destructive"
+          size="sm"
+          fullWidth
+          trailingIcon={<ArrowRight size={14} color={ts.raw.danger} />}
+        />
+      ) : (
+        <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+          Open Settings yourself and choose the data and privacy section to continue.
+        </Text>
+      )}
     </View>
   );
 }
@@ -628,9 +687,69 @@ function ChartCard({ chart, onOpenInsights }: { chart: ChatChartSpec; onOpenInsi
         onPress={onOpenInsights}
         style={{ minHeight: 44, justifyContent: 'center' }}
       >
-        <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Deep Dive in S-03 Insights</Text>
+        <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Explore in Analytics</Text>
       </ScalePressable>
     </View>
+  );
+}
+
+// One expense row, shared by the search results card and the local answer card so the
+// two never drift into two implementations of the same row. `badge` is what the caller
+// knows about why the row is here: a match type for a search hit, nothing for a row
+// that is simply one of the recent expenses.
+function ResultRow({ merchant, amount, currency, date, categoryLabel, badge, badgeMuted, accessibilityLabel, onPress }: {
+  merchant: string;
+  amount: number;
+  currency: string;
+  date: number;
+  categoryLabel: string;
+  badge?: string;
+  badgeMuted?: boolean;
+  accessibilityLabel: string;
+  onPress: () => void;
+}) {
+  const ts = useThemeStyles();
+  return (
+    <ScalePressable
+      haptic={false}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel}
+      onPress={onPress}
+      style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: Spacing.s2,
+        padding: Spacing.s2,
+        borderRadius: Radii.sm,
+        borderWidth: 1,
+        borderColor: ts.raw.outline,
+        backgroundColor: ts.bg.low,
+        minHeight: 48,
+      }}
+    >
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
+          <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.text.onSurface, flexShrink: 1 }]}>
+            {merchant}
+          </Text>
+          {badge ? (
+            <View style={{ borderRadius: Radii.sm, paddingHorizontal: Spacing.s1, paddingVertical: 1, backgroundColor: badgeMuted ? ts.bg.primary20 : ts.bg.primary10 }}>
+              <Text style={[Typography.micro, { color: ts.text.primary }]}>{badge}</Text>
+            </View>
+          ) : null}
+        </View>
+        <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+          {new Date(date).toLocaleDateString()} | {categoryLabel}
+        </Text>
+      </View>
+      <View style={{ alignItems: 'flex-end' }}>
+        <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.labelBold, { color: ts.text.onSurface }]}>
+          {formatCurrency(amount, currency)}
+        </Text>
+        <Text style={[Typography.micro, { color: ts.text.primary }]}>View Transaction</Text>
+      </View>
+    </ScalePressable>
   );
 }
 
@@ -640,54 +759,18 @@ function SearchCard({ response, onOpenResult }: { response: ChatSearchResponse; 
   return (
     <View style={{ gap: Spacing.s2 }}>
       {results.map((result) => (
-        <ScalePressable
+        <ResultRow
           key={result.expenseId}
-          haptic={false}
-          accessibilityRole="button"
+          merchant={result.merchant}
+          amount={result.amount}
+          currency={result.currency}
+          date={result.date}
+          categoryLabel={result.category}
+          badge={result.matchType === 'exact' ? 'Exact Match' : 'Semantic Match'}
+          badgeMuted={result.matchType !== 'exact'}
           accessibilityLabel={`Open ${result.merchant} expense detail`}
           onPress={() => onOpenResult(result.expenseId)}
-          style={{
-            flexDirection: 'row',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: Spacing.s2,
-            padding: Spacing.s2,
-            borderRadius: Radii.sm,
-            borderWidth: 1,
-            borderColor: ts.raw.outline,
-            backgroundColor: ts.bg.low,
-            minHeight: 48,
-          }}
-        >
-          <View style={{ flex: 1, minWidth: 0 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
-              <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.text.onSurface, flexShrink: 1 }]}>
-                {result.merchant}
-              </Text>
-              <View
-                style={{
-                  borderRadius: Radii.sm,
-                  paddingHorizontal: Spacing.s1,
-                  paddingVertical: 1,
-                  backgroundColor: result.matchType === 'exact' ? ts.bg.primary10 : ts.bg.primary20,
-                }}
-              >
-                <Text style={[Typography.micro, { color: ts.text.primary }]}>
-                  {result.matchType === 'exact' ? 'Exact Match' : 'Semantic Match'}
-                </Text>
-              </View>
-            </View>
-            <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
-              {new Date(result.date).toLocaleDateString()} | {result.category}
-            </Text>
-          </View>
-          <View style={{ alignItems: 'flex-end' }}>
-            <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.labelBold, { color: ts.text.onSurface }]}>
-              {formatCurrency(result.amount, result.currency)}
-            </Text>
-            <Text style={[Typography.micro, { color: ts.text.primary }]}>View S-08</Text>
-          </View>
-        </ScalePressable>
+        />
       ))}
       {(response.semanticAvailability === 'offline' ||
         response.semanticAvailability === 'missing_key' ||
@@ -696,9 +779,44 @@ function SearchCard({ response, onOpenResult }: { response: ChatSearchResponse; 
           {response.semanticAvailability === 'offline'
             ? 'Semantic matches need a connection.'
             : response.semanticAvailability === 'missing_key'
-              ? 'Add a provider key in S-17 to search by meaning.'
+              ? 'Add a provider key in AI settings to search by meaning.'
               : 'Semantic matching is unavailable right now.'}
         </Text>
+      ) : null}
+    </View>
+  );
+}
+
+// A local answer is rendered with the components a remote answer already uses: the same
+// chart view inside the same chart card, and the same expense row. The chart leads and the
+// sentence follows it, which is the order the pair draws (chart first, one to three
+// sentences under it). When the answer is only a list of expenses the sentence would just
+// repeat the rows, so the rows stand alone.
+function LocalAnswerCard({ answer, onOpenExpense, onOpenInsights }: {
+  answer: AnsweredLocalAnswer;
+  onOpenExpense: (expenseId: string) => void;
+  onOpenInsights: () => void;
+}) {
+  const showSentence = answer.chart !== null || answer.expenses.length === 0;
+  return (
+    <View style={{ gap: Spacing.s2 }}>
+      {answer.chart ? <ChartCard chart={answer.chart} onOpenInsights={onOpenInsights} /> : null}
+      {showSentence ? <ScopedMarkdown content={answer.text} /> : null}
+      {answer.expenses.length > 0 ? (
+        <View style={{ gap: Spacing.s2 }}>
+          {answer.expenses.map((expense) => (
+            <ResultRow
+              key={expense.expenseId}
+              merchant={expense.merchant}
+              amount={expense.amount}
+              currency={expense.currency}
+              date={expense.date}
+              categoryLabel={humanizeCategory(expense.category)}
+              accessibilityLabel={`Open ${expense.merchant} expense detail`}
+              onPress={() => onOpenExpense(expense.expenseId)}
+            />
+          ))}
+        </View>
       ) : null}
     </View>
   );
@@ -719,15 +837,15 @@ function ErrorCard({ text, retryable, code, onRetry, onOpenSettings }: {
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, padding: Spacing.s2, borderRadius: Radii.sm, backgroundColor: ts.raw.warningContainer, borderWidth: 1, borderColor: ts.raw.warningBorder }}>
           <Lock size={14} color={ts.raw.warning} />
           <Text style={[Typography.micro, { color: ts.raw.warningContainerText, flex: 1 }]}>
-            Keys live in S-17. Chat never collects a key inline.
+            Keys live in AI settings. Chat never collects a key inline.
           </Text>
           <ScalePressable
             accessibilityRole="button"
-            accessibilityLabel="Configure key in S-17"
+            accessibilityLabel="Open AI settings to configure a key"
             onPress={onOpenSettings}
             style={{ minHeight: 44, justifyContent: 'center', paddingHorizontal: Spacing.s2 }}
           >
-            <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Open S-17</Text>
+            <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Open AI Settings</Text>
           </ScalePressable>
         </View>
       ) : null}
@@ -749,26 +867,46 @@ function ErrorCard({ text, retryable, code, onRetry, onOpenSettings }: {
 export default function ChatScreen() {
   const router = useRouter();
   const ts = useThemeStyles();
-  const insets = useSafeAreaInsets();
   const reduceMotion = useReduceMotion();
   const { height: windowHeight } = useWindowDimensions();
   // Surface 6 keyboard avoidance. Replaces KeyboardAvoidingView with the same padding
   // math, but measured and applied on the UI thread so the message list tracks the
-  // keyboard without waiting on a JS bridge frame. iOS only: Android's default
-  // soft-input resize already shrinks the window, so adding this padding there would
-  // double-count the keyboard and overlap the input bar. Hooks run unconditionally;
-  // only the style is gated at render time.
-  const isIOS = Platform.OS === 'ios';
+  // keyboard without waiting on a JS bridge frame. Applies on both platforms: per the
+  // Reanimated docs, while useAnimatedKeyboard is mounted it disables Android's default
+  // window resize for the whole app, so Android gets no system resize and this padding
+  // is the only keyboard handling. With the keyboard closed the height is 0, so the
+  // resting layout is unchanged. Hooks run unconditionally.
   const keyboard = useAnimatedKeyboard();
   const keyboardPaddingStyle = useAnimatedStyle(() => ({
     paddingBottom: keyboard.height.get(),
   }));
+  // DEC-B58: while the keyboard is open the bar sits behind it and cannot be seen, so
+  // the composer must not also reserve the bar's height. React state rather than a
+  // shared value, because this flips twice per keyboard session and not once per frame,
+  // so it adds no per-frame layout work. A floating iPad keyboard reports CLOSED and
+  // keeps the bar clearance, which is right because it does not cover the bar.
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  useAnimatedReaction(
+    () => keyboard.state.get() === KeyboardState.OPENING || keyboard.state.get() === KeyboardState.OPEN,
+    (open) => {
+      scheduleOnRN(setKeyboardOpen, open);
+    },
+  );
+  // The chat screen renders in two hosts: as the chat tab, where the floating
+  // bar is mounted over it, and as a stack route pushed from elsewhere, where it
+  // is not. The hook resolves which one this is, so the composer and the provider
+  // sheet clear the bar in the tab host and gain no dead space when pushed.
+  const bottomClearance = useBottomClearance();
+  // The composer's own clearance, which is the safe area alone while the keyboard is
+  // open. The provider sheet below keeps the host clearance: it is anchored to the
+  // screen's bottom edge, so its bottom padding raises the sheet's own top edge and
+  // shows more of the model list above the keyboard instead of reserving dead space.
+  const composerClearance = useBottomClearance(keyboardOpen);
   const { settings, updateSetting } = useSettings();
   const toast = useToast();
   const { checkForNewAchievements } = useAchievements();
-
-  // FR-12.1: S-12 routes here with `intent=import`. The flag switches S-07 into
-  // the import-context producer without changing the normal chat behaviour.
+  // FR-12.1: the import screen routes here with `intent=import`. The flag switches this
+  // screen into the import-context producer without changing the normal chat behaviour.
   const params = useLocalSearchParams<{ intent?: string }>();
   const importMode = params.intent === 'import';
 
@@ -785,7 +923,7 @@ export default function ChatScreen() {
   const [activeModelLabel, setActiveModelLabel] = useState('');
   const [keyState, setKeyState] = useState<ProviderKeyState | null>(null);
   const [geminiModels, setGeminiModels] = useState<{ name: string; displayName: string }[]>([]);
-  const [orModels, setOrModels] = useState<{ id: string; displayName: string; isFree: boolean }[]>([]);
+  const [orModels, setOrModels] = useState<{ id: string; displayName: string; isFree: boolean; contextLength: number }[]>([]);
   const [showProviderSheet, setShowProviderSheet] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
   const [isOffline, setIsOffline] = useState(false);
@@ -795,42 +933,54 @@ export default function ChatScreen() {
 
   const pricesVisible = settings.prices_visible !== 'false';
 
+  // True when the selected provider has no stored key. It decides whether an analytical
+  // question goes to the local resolver instead of a call that cannot succeed, so it has
+  // to be known before the send handler is created.
+  const missingActiveKey = keyState ? keyState[provider].status === 'absent' : false;
+  // No key or no connection: the local ledger is the only answer path that can work, so
+  // the screen says so rather than letting a prompt fail.
+  const usesLocalAnswers = isOffline || missingActiveKey;
+
   useEffect(() => {
     let active = true;
     const bootstrap = async () => {
+      // Best effort maintenance first: the expiry sweep can remove retained
+      // messages, so it runs before the history read rather than beside it.
       try {
         await aiChatService.checkAutoExpiry();
-        const history = await aiChatService.getHistory();
-        if (active) setEntries(entriesFromHistory(history));
       } catch {
-        if (active) setEntries([]);
-      } finally {
-        if (active) setLoadingHistory(false);
+        // A failed sweep must not stop the history from loading.
       }
 
-      try {
-        const stored = (await databaseService.getSetting('chat_provider')) === 'openrouter' ? 'openrouter' : 'gemini';
-        const model = stored === 'openrouter'
-          ? (await databaseService.getSetting('chat_openrouter_model')) || ''
-          : (await databaseService.getSetting('chat_gemini_model')) || '';
-        const display = stored === 'openrouter'
-          ? (await databaseService.getSetting('chat_openrouter_model_display')) || model
-          : (await databaseService.getSetting('chat_gemini_model_display')) || model;
-        if (active) {
-          setProvider(stored);
-          setActiveModelId(model);
-          setActiveModelLabel(display || model);
-        }
-      } catch {
-        // Provider defaults remain; the sheet shows the honest empty state.
+      // BUG-09-11b. These reads are independent, so they are issued together
+      // instead of one after another. The stored provider decides which model
+      // setting to read, so that pair stays a second wave; the statement count is
+      // unchanged, the number of round trip waves drops from five to three.
+      const [history, storedProvider] = await Promise.all([
+        aiChatService.getHistory().catch(() => []),
+        databaseService.getSetting('chat_provider').catch(() => null),
+      ]);
+      if (active) {
+        setEntries(entriesFromHistory(history));
+        setLoadingHistory(false);
       }
 
-      try {
-        const nextKeyState = await aiChatService.getProviderKeyState();
-        if (active) setKeyState(nextKeyState);
-      } catch {
-        if (active) setKeyState(null);
-      }
+      const stored = storedProvider === 'openrouter' ? 'openrouter' : 'gemini';
+      if (active) setProvider(stored);
+
+      const [model, display, nextKeyState] = await Promise.all([
+        databaseService.getSetting(stored === 'openrouter' ? 'chat_openrouter_model' : 'chat_gemini_model').catch(() => null),
+        databaseService
+          .getSetting(stored === 'openrouter' ? 'chat_openrouter_model_display' : 'chat_gemini_model_display')
+          .catch(() => null),
+        aiChatService.getProviderKeyState().catch(() => null),
+      ]);
+      if (!active) return;
+
+      const resolvedModel = model || '';
+      setActiveModelId(resolvedModel);
+      setActiveModelLabel(display || resolvedModel);
+      setKeyState(nextKeyState);
     };
     void bootstrap();
     return () => {
@@ -889,7 +1039,7 @@ export default function ChatScreen() {
       onIncomeSaved: async () => undefined,
       scheduleNotification: (candidate) => {
         if ('merchant' in candidate) {
-          notificationService.scheduleExpenseNotification(candidate.merchant, `${candidate.currency} ${candidate.amount.toFixed(2)}`);
+          notificationService.scheduleExpenseNotification(candidate.merchant, formatCurrency(candidate.amount, candidate.currency));
         }
       },
     };
@@ -1060,6 +1210,27 @@ export default function ChatScreen() {
         return;
       }
 
+      // Phase 11 B4-1, on the D7 resolver. With no provider key or no connection the
+      // remote call cannot succeed, so an analytical question is answered from the local
+      // ledger instead of failing. The resolver owns what is answerable; this screen only
+      // decides when to ask it. An attached image is excluded because reading one needs
+      // the provider, and that path keeps its existing honest error.
+      if (usesLocalAnswers && !image) {
+        const answer = await aiChatService.answerLocally(text);
+        const message = answer.status === 'answered'
+          ? answer.text
+          : answer.reason === 'no_data'
+            ? LOCAL_ANSWER_NO_DATA_TEXT
+            : LOCAL_ANSWER_UNSUPPORTED_TEXT;
+        await persistExchange(userMessage, message, undefined);
+        appendEntries([
+          answer.status === 'answered'
+            ? { id: localId(), role: 'assistant', createdAt: Date.now(), kind: 'local_answer', text: answer.text, localAnswer: answer }
+            : { id: localId(), role: 'assistant', createdAt: Date.now(), kind: 'assistant_text', text: message },
+        ]);
+        return;
+      }
+
       const reply = await aiChatService.sendMessage(userMessage, image?.uri);
 
       // S-05R-03: only execute a model-emitted action when sendMessage marked it
@@ -1122,7 +1293,7 @@ export default function ChatScreen() {
       setIsProcessing(false);
       setProcessingImage(false);
     }
-  }, [appendEntries, buildChartForQuery, categoryTitles, importMode, isOffline, provider, runSideEffects, settings.currency, toast]);
+  }, [appendEntries, buildChartForQuery, categoryTitles, importMode, isOffline, provider, runSideEffects, settings.currency, toast, usesLocalAnswers]);
 
   const handleSend = useCallback(() => {
     if (isProcessing) return;
@@ -1356,14 +1527,12 @@ export default function ChatScreen() {
     toast.showToast(`Active model set to ${display}`, 'success');
   }, [provider, toast]);
 
-  const missingActiveKey = keyState ? keyState[provider].status === 'absent' : false;
-
-  const filteredModels = useMemo<{ id: string; displayName: string; isFree?: boolean }[]>(() => {
+  const filteredModels = useMemo<{ id: string; displayName: string; isFree?: boolean; contextLength?: number }[]>(() => {
     const query = modelSearch.trim().toLowerCase();
     if (provider === 'openrouter') {
       return orModels
         .filter((model) => !query || model.displayName.toLowerCase().includes(query) || model.id.toLowerCase().includes(query))
-        .map((model) => ({ id: model.id, displayName: model.displayName, isFree: model.isFree }));
+        .map((model) => ({ id: model.id, displayName: model.displayName, isFree: model.isFree, contextLength: model.contextLength }));
     }
     return geminiModels
       .filter((model) => !query || model.displayName.toLowerCase().includes(query) || model.name.toLowerCase().includes(query))
@@ -1427,8 +1596,19 @@ export default function ChatScreen() {
         </AssistantBubble>
       );
     }
-    if (entry.kind === 'blocked' && entry.deepLink) {
-      return <AssistantBubble><BlockedCard deepLink={entry.deepLink} onOpenStewardship={() => router.push('/(tabs)/settings')} /></AssistantBubble>;
+    if (entry.kind === 'local_answer' && entry.localAnswer) {
+      return (
+        <AssistantBubble>
+          <LocalAnswerCard
+            answer={entry.localAnswer}
+            onOpenExpense={(expenseId) => router.push(`/expense/${expenseId}`)}
+            onOpenInsights={() => router.push('/(tabs)/analytics')}
+          />
+        </AssistantBubble>
+      );
+    }
+    if (entry.kind === 'blocked') {
+      return <AssistantBubble><BlockedCard deepLink={entry.deepLink} /></AssistantBubble>;
     }
     if (entry.kind === 'chart' && entry.chart) {
       return (
@@ -1555,10 +1735,10 @@ export default function ChatScreen() {
               </Text>
               {SUGGESTED_PROMPTS.map((prompt) => (
                 <ScalePressable
-                  key={prompt}
+                  key={prompt.text}
                   accessibilityRole="button"
-                  accessibilityLabel={prompt}
-                  onPress={() => handleSuggestion(prompt)}
+                  accessibilityLabel={prompt.needsAssistant ? `${prompt.text}. ${ASSISTANT_REQUIRED_LABEL}.` : prompt.text}
+                  onPress={() => handleSuggestion(prompt.text)}
                   style={{
                     flexDirection: 'row',
                     alignItems: 'center',
@@ -1573,16 +1753,31 @@ export default function ChatScreen() {
                     backgroundColor: ts.bg.low,
                   }}
                 >
-                  <Text style={[Typography.labelMd, { color: ts.text.onSurface, flexShrink: 1 }]}>{prompt}</Text>
+                  <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                    <Text numberOfLines={2} style={[Typography.labelMd, { color: ts.text.onSurface }]}>
+                      {prompt.text}
+                    </Text>
+                    {prompt.needsAssistant ? (
+                      /* Under the label, not beside it: inside a bubble that is at most
+                         85% wide, a badge next to the text would squeeze the question
+                         to a few characters at 320px. */
+                      <View style={{ alignSelf: 'flex-start', borderRadius: Radii.sm, paddingHorizontal: Spacing.s1, paddingVertical: 1, backgroundColor: ts.raw.purple100 }}>
+                        <Text style={[Typography.micro, { color: ts.text.primary }]}>{ASSISTANT_REQUIRED_LABEL}</Text>
+                      </View>
+                    ) : null}
+                  </View>
                   <ArrowRight size={14} color={ts.text.primary} />
                 </ScalePressable>
               ))}
+              {usesLocalAnswers ? (
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{ASSISTANT_REQUIRED_NOTE}</Text>
+              ) : null}
             </View>
           </View>
         </AssistantBubble>
       </View>
     );
-  }, [handleSuggestion, importMode, loadingHistory, router, settings.profile_name, ts]);
+  }, [handleSuggestion, importMode, loadingHistory, router, settings.profile_name, ts, usesLocalAnswers]);
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: ts.bg.screen }} edges={['top']}>
@@ -1628,7 +1823,16 @@ export default function ChatScreen() {
               accessibilityLabel="Select AI model provider"
               hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
               onPress={() => { void openProviderSheet(); }}
-              style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, minHeight: 32 }}
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                gap: Spacing.s1,
+                alignSelf: 'flex-start',
+                minHeight: 44,
+                paddingHorizontal: Spacing.s2,
+                borderRadius: Radii.full,
+                backgroundColor: ts.bg.low,
+              }}
             >
               <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.primary, flexShrink: 1 }]}>
                 {activeModelLabel || 'Choose a model'}
@@ -1659,7 +1863,7 @@ export default function ChatScreen() {
         </View>
       </View>
 
-      <Animated.View style={[{ flex: 1 }, isIOS ? keyboardPaddingStyle : null]}>
+      <Animated.View style={[{ flex: 1 }, keyboardPaddingStyle]}>
         {importMode ? (
           <View style={{ paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 }}>
             <View style={{ alignSelf: 'center', width: '100%', maxWidth: MAX_CONTENT_WIDTH, flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2, padding: Spacing.s3, borderRadius: Radii.md, backgroundColor: ts.raw.purple100, borderWidth: 1, borderColor: ts.border.primary20 }}>
@@ -1756,7 +1960,7 @@ export default function ChatScreen() {
           style={{
             paddingHorizontal: Spacing.s3,
             paddingTop: Spacing.s2,
-            paddingBottom: Math.max(Spacing.s2, insets.bottom),
+            paddingBottom: Math.max(Spacing.s2, composerClearance),
             borderTopWidth: 1,
             borderTopColor: ts.border.subtle,
             backgroundColor: ts.raw.surface,
@@ -1865,7 +2069,7 @@ export default function ChatScreen() {
                 borderTopWidth: 1,
                 borderColor: ts.raw.outline,
                 padding: Spacing.s5,
-                paddingBottom: Math.max(Spacing.s5, insets.bottom),
+                paddingBottom: Math.max(Spacing.s5, bottomClearance),
                 gap: Spacing.s3,
               }}
             >
@@ -1874,7 +2078,7 @@ export default function ChatScreen() {
                 <View style={{ flexShrink: 1 }}>
                   <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Select AI Model Provider</Text>
                   <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
-                    Pure model selection. API keys are strictly managed in S-17.
+                    Model selection only. Provider keys are managed in AI settings.
                   </Text>
                 </View>
                 <ScalePressable
@@ -1923,11 +2127,11 @@ export default function ChatScreen() {
                   </Text>
                   <ScalePressable
                     accessibilityRole="button"
-                    accessibilityLabel="Add API key in S-17"
+                    accessibilityLabel="Add a provider key in AI settings"
                     onPress={() => { setShowProviderSheet(false); router.push('/settings/chat'); }}
                     style={{ minHeight: 44, justifyContent: 'center', paddingHorizontal: Spacing.s2 }}
                   >
-                    <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Open S-17</Text>
+                    <Text style={[Typography.micro, { color: ts.text.primary, fontFamily: 'Manrope_700Bold' }]}>Open AI Settings</Text>
                   </ScalePressable>
                 </View>
               ) : null}
@@ -1951,8 +2155,8 @@ export default function ChatScreen() {
                   <View style={{ paddingVertical: Spacing.s5, alignItems: 'center' }}>
                     <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
                       {missingActiveKey
-                        ? 'Add a provider key in S-17 to load models.'
-                        : 'No models cached yet. Open S-17 to load the model list.'}
+                        ? 'Add a provider key in AI settings to load models.'
+                        : 'No models cached yet. Open AI settings to load the model list.'}
                     </Text>
                   </View>
                 }
@@ -1984,7 +2188,12 @@ export default function ChatScreen() {
                         opacity: missingActiveKey ? 0.6 : 1,
                       }}
                     >
-                      <Text numberOfLines={1} style={[Typography.labelMd, { color: ts.text.onSurface, flexShrink: 1 }]}>{display}</Text>
+                      <View style={{ flex: 1, minWidth: 0 }}>
+                        <Text numberOfLines={1} style={[Typography.labelMd, { color: ts.text.onSurface }]}>{display}</Text>
+                        <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+                          {describeCachedModel(model)}
+                        </Text>
+                      </View>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: Spacing.s1 }}>
                         {isFree === true ? (
                           <View style={{ borderRadius: Radii.sm, paddingHorizontal: Spacing.s1, paddingVertical: 1, backgroundColor: ts.raw.successContainer }}>
@@ -2000,11 +2209,11 @@ export default function ChatScreen() {
 
               <ScalePressable
                 accessibilityRole="button"
-                accessibilityLabel="Open S-17 settings"
+                accessibilityLabel="Open AI settings"
                 onPress={() => { setShowProviderSheet(false); router.push('/settings/chat'); }}
                 style={{ minHeight: 44, justifyContent: 'center', alignItems: 'center' }}
               >
-                <Text style={[Typography.labelMd, { color: ts.text.primary }]}>Need to add, revoke, or test your API keys? Open S-17 Settings</Text>
+                <Text style={[Typography.labelMd, { color: ts.text.primary }]}>Need to add, revoke, or test your API keys? Open AI Settings</Text>
               </ScalePressable>
             </View>
           </Pressable>

@@ -19,7 +19,11 @@ import { Colors, Radii, Spacing, Typography } from '../constants/tokens';
 
 const MAX_CONTENT_WIDTH = 640;
 const BACK_SIZE = 40;
-const CONTROL_HIT_SLOP = { top: 2, bottom: 2, left: 2, right: 2 };
+// The pair annotates a 48x48px bounding target for these controls
+// (code.html line 476) and POLISH Section 7 asks for 48dp on Android. The
+// 40pt visual circle is frozen by Section 0, so the bounding is carried in
+// hitSlop only: 40 + 2*4 = 48, no layout or visual change.
+const CONTROL_HIT_SLOP = { top: 4, bottom: 4, left: 4, right: 4 };
 const HERO_ICON_SIZE = 44;
 const CLAUSE_NUMBER_SIZE = 20;
 const GLOW_SIZE = 144;
@@ -91,8 +95,15 @@ export default function PrivacyPolicyScreen() {
     else router.replace('/(tabs)/settings');
   }, [router]);
 
-  const sharePolicy = useCallback(() => {
-    void Share.share({ message: buildShareMessage() });
+  // The OS share sheet is the success feedback. If the platform cannot present
+  // it, the promise rejects: swallow it so no unhandled rejection reaches the
+  // runtime, matching the guarded pattern in expense/[id] and BadgeDetailModal.
+  const sharePolicy = useCallback(async () => {
+    try {
+      await Share.share({ message: buildShareMessage() });
+    } catch {
+      // The OS share sheet can be dismissed or unavailable. No write, no retry.
+    }
   }, []);
 
   const cardVariant = ts.isDark ? 'low' : 'high';

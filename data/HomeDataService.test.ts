@@ -104,6 +104,155 @@ describe('HomeDataService', () => {
   });
 });
 
+// F-06. Home used to scan the whole expenses table to compute two monthly totals.
+// The period read is bounded to the current and previous month. These cases pin
+// both halves: the range the snapshot asks for when the source can serve it, and
+// the totals that must not move because of the narrowing.
+describe('HomeDataService period range query (F-06)', () => {
+  const now = new Date(2026, 8, 19, 12).getTime();
+  const monthStart = new Date(2026, 8, 1).getTime();
+  const monthEnd = new Date(2026, 8, 30, 23, 59, 59, 999).getTime();
+  const previousStart = new Date(2026, 7, 1).getTime();
+
+  const current = expense('current', 20, new Date(2026, 8, 5).getTime(), 'dining');
+  const previous = expense('previous', 30, new Date(2026, 7, 10).getTime(), 'transport');
+  const older = expense('older', 999, new Date(2026, 4, 10).getTime(), 'dining');
+  const future = expense('future', 888, new Date(2026, 9, 10).getTime(), 'dining');
+  const all = [current, previous, older, future];
+
+  const inRange = (start: number, end: number) => all.filter(item => item.date >= start && item.date <= end);
+
+  it('asks for the current and previous period in one bounded range', async () => {
+    const getExpenses = vi.fn(async () => all);
+    const getExpensesForPeriod = vi.fn(async (start: number, end: number) => inRange(start, end));
+    const service = new HomeDataService({ ...source(all), getExpenses, getExpensesForPeriod });
+
+    const snapshot = await service.getSnapshot(now);
+
+    expect(getExpensesForPeriod).toHaveBeenCalledTimes(1);
+    expect(getExpensesForPeriod).toHaveBeenCalledWith(previousStart, monthEnd);
+    // One period read only. This source has no bounded recent read, so the recent
+    // fallback reads the full ledger once rather than reusing the period list, which
+    // is the pre-row meaning and the F-09 fix.
+    expect(getExpenses).toHaveBeenCalledTimes(1);
+    expect(snapshot.period).toEqual({ start: monthStart, end: monthEnd });
+  });
+
+  it('falls back to the whole ledger when the source has no period read', async () => {
+    const getExpenses = vi.fn(async () => all);
+    const service = new HomeDataService({ ...source(all), getExpenses });
+
+    const snapshot = await service.getSnapshot(now);
+
+    expect(getExpenses).toHaveBeenCalledTimes(1);
+    expect(snapshot.hero.totalSpent).toBe(20);
+  });
+
+  it('keeps the current and previous period totals identical to the unranged read', async () => {
+    const ranged = await new HomeDataService({
+      ...source(all),
+      getExpensesForPeriod: vi.fn(async (start: number, end: number) => inRange(start, end)),
+    }).getSnapshot(now);
+    const unranged = await new HomeDataService(source(all)).getSnapshot(now);
+
+    expect(ranged.hero).toEqual(unranged.hero);
+    expect(ranged.comparativeInsight).toEqual(unranged.comparativeInsight);
+    expect(ranged.categories).toEqual(unranged.categories);
+    expect(ranged.normalization).toEqual(unranged.normalization);
+
+    // 999 and 888 sit outside both periods and must not reach either total.
+    expect(ranged.hero.totalSpent).toBe(20);
+    expect(ranged.comparativeInsight.previousTotal).toBe(30);
+    expect(ranged.comparativeInsight.direction).toBe('down');
+    // The recent list is not part of the period narrowing. This source has no bounded
+    // recent read, so it falls back to the full ledger, which is the pre-row meaning
+    // and keeps the out-of-period rows the card is meant to show.
+    expect(ranged.recentTransactions.map(item => item.id)).toEqual(['future', 'current', 'previous', 'older']);
+  });
+});
+
+// F-09, F-10. The recent list is its own bounded read, so it must not be a slice of
+// the period range: a record older than the previous period or newer than the current
+// one still belongs in it, and the card must not report an empty ledger for a user
+// whose newest records sit outside both periods.
+describe('HomeDataService recent list independent of the period range (F-09, F-10)', () => {
+  const now = new Date(2026, 8, 19, 12).getTime();
+  const monthEnd = new Date(2026, 8, 30, 23, 59, 59, 999).getTime();
+
+  const current = expense('current', 20, new Date(2026, 8, 5).getTime(), 'dining');
+  const previous = expense('previous', 30, new Date(2026, 7, 10).getTime(), 'transport');
+  const older = expense('older', 999, new Date(2026, 4, 10).getTime(), 'dining');
+  const future = expense('future', 888, new Date(2026, 9, 10).getTime(), 'dining');
+  const all = [current, previous, older, future];
+
+  const inRange = (start: number, end: number) => all.filter(item => item.date >= start && item.date <= end);
+  const newest = (rows: Expense[], limit: number) => [...rows].sort((a, b) => b.date - a.date).slice(0, limit);
+
+  const rangedSource = (recent: Expense[] = all) => ({
+    ...source(all),
+    getExpensesForPeriod: vi.fn(async (start: number, end: number) => inRange(start, end)),
+    getRecentExpenses: vi.fn(async (limit: number) => newest(recent, limit)),
+  });
+
+  it('keeps records outside the period range in the recent list', async () => {
+    const getRecentExpenses = vi.fn(async (limit: number) => newest(all, limit));
+    const snapshot = await new HomeDataService({ ...rangedSource(), getRecentExpenses }).getSnapshot(now);
+
+    expect(getRecentExpenses).toHaveBeenCalledTimes(1);
+    // Five is the card's limit, asked for in SQL rather than sliced from the ledger.
+    expect(getRecentExpenses).toHaveBeenCalledWith(5);
+    // `future` is newer than the period end, `older` is older than the previous
+    // period start, and both are still real recent records.
+    expect(snapshot.recentTransactions.map(item => item.id)).toEqual(['future', 'current', 'previous', 'older']);
+    expect(snapshot.period.end).toBe(monthEnd);
+  });
+
+  it('orders the recent list date descending and holds it to the limit', async () => {
+    const many = [
+      ...all,
+      expense('e1', 1, new Date(2026, 3, 1).getTime()),
+      expense('e2', 2, new Date(2026, 2, 1).getTime()),
+      expense('e3', 3, new Date(2026, 1, 1).getTime()),
+    ];
+    const snapshot = await new HomeDataService({
+      ...rangedSource(),
+      // A source that ignores the limit must not make the card render more rows.
+      getRecentExpenses: vi.fn(async () => many),
+    }).getSnapshot(now);
+
+    const dates = snapshot.recentTransactions.map(item => item.date);
+    expect(dates).toEqual([...dates].sort((left, right) => right - left));
+    expect(snapshot.recentTransactions).toHaveLength(5);
+  });
+
+  it('keeps the period aggregates on the narrowed range', async () => {
+    const snapshot = await new HomeDataService(rangedSource()).getSnapshot(now);
+
+    // 999 and 888 sit outside both periods and must not reach either total, even
+    // though both are in the recent list.
+    expect(snapshot.hero.totalSpent).toBe(20);
+    expect(snapshot.hero.transactionCount).toBe(1);
+    expect(snapshot.comparativeInsight.previousTotal).toBe(30);
+    expect(snapshot.categories.map(category => category.category)).toEqual(['dining']);
+    expect(snapshot.categories[0]?.total).toBe(20);
+  });
+
+  it('preserves the pre-row meaning for a source without the bounded recent read', async () => {
+    const getExpenses = vi.fn(async () => all);
+    const fallback = await new HomeDataService({
+      ...source(all),
+      getExpenses,
+      getExpensesForPeriod: vi.fn(async (start: number, end: number) => inRange(start, end)),
+    }).getSnapshot(now);
+    const bounded = await new HomeDataService(rangedSource()).getSnapshot(now);
+
+    expect(getExpenses).toHaveBeenCalledTimes(1);
+    expect(fallback.recentTransactions).toEqual(bounded.recentTransactions);
+    expect(fallback.hero).toEqual(bounded.hero);
+    expect(fallback.comparativeInsight).toEqual(bounded.comparativeInsight);
+  });
+});
+
 describe('buildComparativeInsight', () => {
   it('supports refresh-safe comparison states', () => {
     expect(buildComparativeInsight(120, 100)).toMatchObject({ changeAmount: 20, changePercent: 20, direction: 'up' });

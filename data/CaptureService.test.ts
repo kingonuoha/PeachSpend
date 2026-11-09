@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { resolveExpenseBatchSave, resolveExpenseSave, resolveIncomeSave, resolveIncomeSaveWithRecurring, runCaptureSideEffects } from './CaptureService';
+import { SqliteCaptureRepository } from './CaptureRepository';
 import type { CaptureCandidate, CaptureRepository, IncomeCandidate } from './contracts';
+import type { Expense } from '../types/database';
 
 const expense: CaptureCandidate = {
   merchant: 'Cafe', amount: 12.5, currency: 'USD', category: 'dining', date: 1_700_000_000_000, source: 'manual', origin: 'manual_expense',
@@ -126,5 +128,97 @@ describe('shared capture save boundary', () => {
     await resolveExpenseBatchSave(repo, [expense, second]);
     expect(repo.recordEvent).toHaveBeenCalledOnce();
     expect(repo.recordEvent).toHaveBeenCalledWith(expect.objectContaining({ status: 'duplicate_skipped', merchant: 'Market' }));
+  });
+});
+
+// BUG-09-17a. A product photograph has no store name, so a product capture
+// legitimately carries an empty merchant. Before this row the shared validator
+// refused every merchantless candidate, so such a capture could be confirmed in
+// the sheet and then never saved.
+describe('BUG-09-17a, a merchantless capture at the save boundary', () => {
+  const product: CaptureCandidate = {
+    merchant: '', amount: 12.5, currency: 'USD', category: 'shopping', date: 1_700_000_000_000, source: 'ocr', origin: 'scan',
+  };
+  const receipt: CaptureCandidate = {
+    merchant: 'Cafe', amount: 12.5, currency: 'USD', category: 'dining', date: 1_700_000_000_000, source: 'ocr', origin: 'scan',
+  };
+
+  it('saves a scanned product that has no merchant, storing the empty merchant', async () => {
+    const save = vi.fn(async (candidate: CaptureCandidate): Promise<Expense> => ({
+      id: 'saved', merchant: candidate.merchant, amount: candidate.amount, currency: candidate.currency,
+      category: candidate.category, note: candidate.note, scanned: 0, date: candidate.date, created_at: candidate.date,
+    }));
+    const repo = repository({ save });
+
+    const result = await resolveExpenseSave(repo, product);
+
+    expect(result.status).toBe('saved');
+    expect(save).toHaveBeenCalledWith(product, true);
+    // The stored merchant is the candidate's own empty value, never an invented name.
+    expect(save.mock.calls[0][0].merchant).toBe('');
+  });
+
+  it('still refuses a manual entry that has no merchant', async () => {
+    const repo = repository();
+
+    await expect(resolveExpenseSave(repo, { ...expense, merchant: '' })).rejects.toMatchObject({ name: 'CaptureValidationError', field: 'merchant' });
+
+    expect(repo.save).not.toHaveBeenCalled();
+    expect(repo.findDuplicate).not.toHaveBeenCalled();
+  });
+
+  it('still requires a merchant for a chat action and an imported row', async () => {
+    const repo = repository();
+
+    await expect(resolveExpenseSave(repo, { ...product, source: 'chat' })).rejects.toMatchObject({ field: 'merchant' });
+    await expect(resolveExpenseSave(repo, { ...product, source: 'import' })).rejects.toMatchObject({ field: 'merchant' });
+
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  it('leaves a receipt with a merchant unaffected', async () => {
+    const repo = repository();
+
+    const result = await resolveExpenseSave(repo, receipt);
+
+    expect(result.status).toBe('saved');
+    expect(repo.findDuplicate).toHaveBeenCalledWith(receipt);
+    expect(repo.save).toHaveBeenCalledWith(receipt, true);
+  });
+
+  it('keeps the amount, currency and category rules for a merchantless product', async () => {
+    const repo = repository();
+
+    await expect(resolveExpenseSave(repo, { ...product, amount: 0 })).rejects.toMatchObject({ field: 'amount' });
+    await expect(resolveExpenseSave(repo, { ...product, currency: '  ' })).rejects.toMatchObject({ field: 'currency' });
+    await expect(resolveExpenseSave(repo, { ...product, category: '' })).rejects.toMatchObject({ field: 'category' });
+
+    expect(repo.save).not.toHaveBeenCalled();
+  });
+
+  // The hazard this row exists to avoid (DEC-B65): with duplicate identity keyed
+  // on the merchant, two unrelated merchantless products of the same amount on
+  // the same day would match each other and the second would never be saved.
+  // This runs the real service against the real repository, so the duplicate
+  // rule under test is the shipped one.
+  it('saves both of two unrelated merchantless products of the same amount on the same day', async () => {
+    const getAllAsync = vi.fn().mockResolvedValue([]);
+    const getFirstAsync = vi.fn().mockResolvedValue(null);
+    const runAsync = vi.fn().mockResolvedValue(undefined);
+    const execAsync = vi.fn().mockResolvedValue(undefined);
+    const sqliteRepository = new SqliteCaptureRepository({ getAllAsync, getFirstAsync, runAsync, execAsync } as never);
+    const first: CaptureCandidate = { ...product, amount: 4.5, note: 'Sparkling water' };
+    const second: CaptureCandidate = { ...product, amount: 4.5, note: 'Hand soap' };
+
+    const result = await resolveExpenseBatchSave(sqliteRepository, [first, second]);
+
+    if (result.status !== 'saved') throw new Error(`expected a saved batch, received ${result.status}`);
+    expect(result.records).toHaveLength(2);
+    expect(result.records.map(record => record.merchant)).toEqual(['', '']);
+    const inserts = runAsync.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('INSERT INTO expenses'));
+    expect(inserts).toHaveLength(2);
+    // No merchantless candidate was compared against stored rows or against its
+    // batch neighbour, so neither can be skipped as a duplicate of the other.
+    expect(getAllAsync).not.toHaveBeenCalled();
   });
 });

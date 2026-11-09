@@ -90,7 +90,7 @@ function DonutChart({ spec }: { spec: ChatChartSpec }) {
         size={DONUT_SIZE}
         total={total}
         pricesVisible
-        currencySymbol=""
+        currency={spec.currency}
         centerTopLabel="Total"
         centerLabel={spec.title}
         centerValue={formatCurrency(total, spec.currency)}

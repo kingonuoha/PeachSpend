@@ -1,4 +1,5 @@
 import { normalizeAiError } from '../ai/contracts';
+import type { Expense } from '../types/database';
 import { formatCurrency, resolveDisplayCurrency } from '../utils/currency';
 import { normalizeCurrencyTotal } from './currencyNormalization';
 import { buildCategories, buildComparativeInsight } from './HomeDataService';
@@ -105,11 +106,11 @@ function emptyInsight(): InsightComparativeNarrative {
 export class InsightDataService {
   constructor(private readonly source: InsightDataSource) {}
 
-  async getSnapshot(query: InsightTimeframeQuery, now = Date.now()): Promise<InsightsSnapshot> {
+  async getSnapshot(query: InsightTimeframeQuery, now = Date.now(), cachedExpenses?: Expense[]): Promise<InsightsSnapshot> {
     let userCurrency: string | null = null;
     try {
       const [expenses, currency, rates] = await Promise.all([
-        this.source.getExpenses(),
+        cachedExpenses ? Promise.resolve(cachedExpenses) : this.source.getExpenses(),
         this.source.getSetting('currency'),
         this.source.getSetting('conversion_rates'),
       ]);

@@ -23,10 +23,9 @@ export interface SettingsSnapshot {
 // Builds the S-06 read model from stored settings. Keys never appear in the
 // returned shape: the AI provider key home is S-17, not this contract (FR-06.2).
 export function buildSettingsSnapshot(settings: Record<string, string>): SettingsSnapshot {
-  const budget = Number(settings.monthly_budget);
   return {
     currency: normalizeCurrency(settings.currency) ?? 'NGN',
-    budget: Number.isFinite(budget) && budget > 0 ? budget : 0,
+    budget: parseStoredBudget(settings.monthly_budget),
     budgetCurrency: normalizeCurrency(settings.budget_currency) ?? normalizeCurrency(settings.currency) ?? 'NGN',
     theme: settings.theme === 'light' ? 'light' : 'dark',
     pricesVisible: settings.prices_visible !== 'false',
@@ -44,6 +43,29 @@ export function parseBudgetInput(raw: string): BudgetParse {
   const value = Number(trimmed);
   if (!Number.isFinite(value) || value < 0) return { valid: false };
   return { valid: true, value };
+}
+
+// The one budget read rule (BUG-09-04a). Every data-layer and service reader of
+// the stored key goes through this, so no caller re-implements the parse and no
+// reader can partially parse a stored string. `parseFloat('66,000')` is 66, which
+// is how Home came to shout "Exceeded" about a budget that Settings honestly
+// called unset, so partial parsing is gone rather than corrected. A value that
+// cannot be honoured as a spend limit (non-numeric, negative, absent) means no
+// limit is set, which reads as zero, the same meaning an empty budget already has.
+export function parseStoredBudget(raw: string | null | undefined): number {
+  const parsed = parseBudgetInput(raw ?? '');
+  return parsed.valid ? parsed.value : 0;
+}
+
+// The one budget write rule (BUG-09-04a). Returns the exact string to persist, or
+// null when nothing should be stored. A blank entry keeps its existing meaning of
+// no budget row at all, and an entry that cannot be parsed is refused instead of
+// being persisted raw, so a separator, a currency symbol, or letters can no longer
+// reach the database from any writer.
+export function toStoredBudget(raw: string | null | undefined): string | null {
+  if (!raw || !raw.trim()) return null;
+  const parsed = parseBudgetInput(raw);
+  return parsed.valid ? String(parsed.value) : null;
 }
 
 export type BudgetUpdateResult =

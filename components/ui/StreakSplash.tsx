@@ -13,13 +13,16 @@ import { ArrowRight, CalendarCheck, Check, Flame, X } from 'lucide-react-native'
 import Animated, {
   cancelAnimation,
   Easing,
-  runOnJS,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
   withSequence,
   withTiming,
 } from 'react-native-reanimated';
+// runOnJS is deprecated in worklets 0.10 and scheduled for removal in the next
+// major, so the exit callback crosses to the RN thread with scheduleOnRN, the
+// form POLISH Section 2 mandates.
+import { scheduleOnRN } from 'react-native-worklets';
 
 import { BadgeGlyph } from './BadgeGlyph';
 import { LuminousCard } from './LuminousCard';
@@ -62,7 +65,12 @@ const EMBLEM_SIZE = 80;
 const EMBLEM_GLYPH_SIZE = 42;
 const AURA_SIZE = 96;
 const TRACK_HEIGHT = 6;
-const EXIT_DURATION = 200;
+// Pair dismisses with transition-all duration-300 on the overlay (code.html 155).
+const EXIT_DURATION = 300;
+// Pair flame glyph runs Tailwind animate-pulse (code.html 167): a 2s cycle that
+// dips to half opacity at the midpoint, so each leg is 1s.
+const PULSE_DURATION = 1000;
+const PULSE_MIN_OPACITY = 0.5;
 // Locked pair emblem gradient (purple-950, purple-600, warning), code.html 166.
 const EMBLEM_COLORS = ['#1E0B3D', '#7C3AED', '#F59E0B'] as const;
 // Fixed purple-950 for the overline chip (code.html 170), matching the emblem.
@@ -159,8 +167,8 @@ export default function StreakSplash({
     cardScale.value = withTiming(1, { duration: 300, easing: Easing.out(Easing.cubic) });
     pulseOpacity.value = withRepeat(
       withSequence(
-        withTiming(0.55, { duration: 900, easing: Easing.inOut(Easing.ease) }),
-        withTiming(1, { duration: 900, easing: Easing.inOut(Easing.ease) }),
+        withTiming(PULSE_MIN_OPACITY, { duration: PULSE_DURATION, easing: Easing.inOut(Easing.ease) }),
+        withTiming(1, { duration: PULSE_DURATION, easing: Easing.inOut(Easing.ease) }),
       ),
       -1,
       false,
@@ -174,7 +182,7 @@ export default function StreakSplash({
   useEffect(() => {
     if (!dismissing) return;
     exitProgress.value = withTiming(0, { duration: EXIT_DURATION, easing: Easing.out(Easing.quad) }, (finished) => {
-      if (finished) runOnJS(onDismiss)();
+      if (finished) scheduleOnRN(onDismiss);
     });
     return () => cancelAnimation(exitProgress);
   }, [dismissing, exitProgress, onDismiss]);
@@ -312,7 +320,15 @@ export default function StreakSplash({
                       {`${nextBadge.progress.current} / ${nextBadge.progress.target} Days`}
                     </Text>
                   </View>
-                  <View style={[styles.track, { backgroundColor: trackColor }]}>
+                  <View
+                    accessibilityRole="progressbar"
+                    accessibilityValue={{
+                      min: 0,
+                      max: nextBadge.progress.target,
+                      now: nextBadge.progress.current,
+                    }}
+                    style={[styles.track, { backgroundColor: trackColor }]}
+                  >
                     <View
                       style={[
                         styles.trackFill,

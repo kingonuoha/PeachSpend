@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity } from 'react-native';
 import { Expense } from '../../types/database';
 import { LuminousCard } from '../ui/LuminousCard';
 import { formatRelativeDate } from '../../utils/dateFormat';
+import { formatMoneyNumber } from '../../utils/currency';
 import { useSettings } from '../ui/SettingsProvider';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useRouter } from 'expo-router';
@@ -101,7 +102,7 @@ const ExpenseItemComponent = ({ expense, searchQuery, detailOrigin, detailOrderI
           <View className="flex-row items-baseline">
             <Text className="text-primary font-noto-serif-bold text-xs mr-0.5">{pricesVisible ? displayValue.symbol : ''}</Text>
             <Text style={{ color: styles.text.onSurface }} className="font-noto-serif-bold text-xl tracking-tighter">
-              {pricesVisible ? displayValue.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '••••'}
+              {pricesVisible ? formatMoneyNumber(displayValue.amount) : '••••'}
             </Text>
           </View>
           <Text style={{ color: styles.text.onSurfaceVariant60 }} className="font-manrope-medium text-[10px] mt-0.5">

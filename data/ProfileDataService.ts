@@ -8,6 +8,7 @@ import type {
   ProfileEditResult, ProfileSnapshot, ProfileStats,
 } from './ProfileContracts';
 import type { SettingsPort } from './SettingsContracts';
+import { dataToken } from '../hooks/useDataFreshness';
 
 export function buildAchievementState(row: BadgeProgressRow): AchievementState {
   const target = Number.isFinite(row.target) && row.target > 0 ? row.target : 1;
@@ -26,9 +27,10 @@ export function buildAchievementState(row: BadgeProgressRow): AchievementState {
 // Join date prefers the onboarding-written setting, then falls back to the
 // earliest real record so existing installs still show a truthful date instead
 // of a synthesized one.
-export function resolveJoinDate(rawJoinDate: string | null, expenses: Expense[]): number | null {
+export function resolveJoinDate(rawJoinDate: string | null, expenses: Expense[] | number | null): number | null {
   const parsed = rawJoinDate ? Number(rawJoinDate) : NaN;
   if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  if (typeof expenses === 'number' || expenses === null) return expenses;
   const earliest = expenses.reduce<number | null>(
     (min, expense) => (min === null || expense.created_at < min ? expense.created_at : min),
     null,
@@ -70,31 +72,122 @@ export async function saveProfileEdit(port: SettingsPort, draft: ProfileEditDraf
 }
 
 export class ProfileDataService {
+  private inFlightSnapshot: Promise<ProfileSnapshot> | null = null;
+  private cachedSnapshot: ProfileSnapshot | null = null;
+  private cachedToken: string | null = null;
+
   constructor(private readonly source: ProfileDataSource) {}
 
-  async getSnapshot(now = Date.now()): Promise<ProfileSnapshot> {
+  getCachedSnapshot(): ProfileSnapshot | null {
+    return this.cachedSnapshot;
+  }
+
+  updateCachedSnapshot(updater: (prev: ProfileSnapshot) => ProfileSnapshot): void {
+    if (this.cachedSnapshot) {
+      this.cachedSnapshot = updater(this.cachedSnapshot);
+    }
+  }
+
+  clearCache(): void {
+    this.cachedSnapshot = null;
+    this.cachedToken = null;
+  }
+
+  async getSnapshot(now = Date.now(), force = false): Promise<ProfileSnapshot> {
+    const currentToken = dataToken(['ledger', 'settings']);
+    if (!force && this.cachedSnapshot && this.cachedToken === currentToken) {
+      return this.cachedSnapshot;
+    }
+
+    if (this.inFlightSnapshot) {
+      return this.inFlightSnapshot;
+    }
+
+    const fetchPromise = (async () => {
+      try {
+        const snapshot = await this.fetchSnapshot(now);
+        if (snapshot.state !== 'failure') {
+          this.cachedSnapshot = snapshot;
+          this.cachedToken = currentToken;
+        }
+        return snapshot;
+      } finally {
+        this.inFlightSnapshot = null;
+      }
+    })();
+
+    this.inFlightSnapshot = fetchPromise;
+    return fetchPromise;
+  }
+
+  private async fetchSnapshot(now: number): Promise<ProfileSnapshot> {
     try {
-      const [expenses, name, avatar, joinDateSetting, streak, pricesVisible, currency, rates, themePack, theme, badges, unreadNotificationCount] = await Promise.all([
-        this.source.getExpenses(),
-        this.source.getSetting('profile_name'),
-        this.source.getSetting('profile_picture'),
-        this.source.getSetting('profile_join_date'),
-        this.source.getStreak(),
-        this.source.getSetting('prices_visible'),
-        this.source.getSetting('currency'),
-        this.source.getSetting('conversion_rates'),
-        this.source.getSetting('theme_pack'),
-        this.source.getSetting('theme'),
-        this.source.getBadgeProgress(),
+      const allSettings = this.source.getAllSettings ? await this.source.getAllSettings() : null;
+      const summaryPromise = this.source.getProfileExpenseSummary
+        ? this.source.getProfileExpenseSummary()
+        : null;
+
+      const [summary, expenses, streak, badges, unreadNotificationCount, nameFallback, avatarFallback, joinDateFallback, pricesVisibleFallback, currencyFallback, ratesFallback, themePackFallback, themeFallback] = await Promise.all([
+        summaryPromise,
+        summaryPromise ? Promise.resolve<Expense[]>([]) : this.source.getExpenses(),
+        allSettings ? Number(allSettings.last_streak ?? 0) : this.source.getStreak(),
+        this.source.getBadgeProgress(allSettings ?? undefined),
         this.source.getUnreadNotificationCount(),
+        allSettings ? null : this.source.getSetting('profile_name'),
+        allSettings ? null : this.source.getSetting('profile_picture'),
+        allSettings ? null : this.source.getSetting('profile_join_date'),
+        allSettings ? null : this.source.getSetting('prices_visible'),
+        allSettings ? null : this.source.getSetting('currency'),
+        allSettings ? null : this.source.getSetting('conversion_rates'),
+        allSettings ? null : this.source.getSetting('theme_pack'),
+        allSettings ? null : this.source.getSetting('theme'),
       ]);
+
+      const name = allSettings ? (allSettings.profile_name ?? null) : nameFallback;
+      const avatar = allSettings ? (allSettings.profile_picture ?? null) : avatarFallback;
+      const joinDateSetting = allSettings ? (allSettings.profile_join_date ?? null) : joinDateFallback;
+      const pricesVisible = allSettings ? (allSettings.prices_visible ?? null) : pricesVisibleFallback;
+      const currency = allSettings ? (allSettings.currency ?? null) : currencyFallback;
+      const rates = allSettings ? (allSettings.conversion_rates ?? null) : ratesFallback;
+      const themePack = allSettings ? (allSettings.theme_pack ?? null) : themePackFallback;
+      const theme = allSettings ? (allSettings.theme ?? null) : themeFallback;
       const displayCurrency = resolveDisplayCurrency(currency);
+
+      let stats: ProfileStats;
+      let isEmpty = false;
+      let earliestDate: number | null = null;
+
+      if (summary) {
+        let total = summary.totalSpent;
+        if (summary.hasForeignCurrencies && summary.transactionCount > 0) {
+          const expenseRows = await this.source.getExpenses();
+          total = normalizeCurrencyTotal(
+            expenseRows.map(expense => ({ amount: expense.amount, currency: expense.currency })),
+            displayCurrency,
+            rates,
+          ).total;
+        }
+        stats = {
+          totalExpenses: total,
+          streak,
+          scansCount: summary.scansCount,
+          transactionCount: summary.transactionCount,
+          currency: displayCurrency,
+        };
+        isEmpty = summary.transactionCount === 0;
+        earliestDate = summary.earliestExpenseDate;
+      } else {
+        stats = buildProfileStats(expenses, streak, displayCurrency, rates);
+        isEmpty = expenses.length === 0;
+        earliestDate = resolveJoinDate(null, expenses);
+      }
+
       return {
-        state: expenses.length === 0 && badges.every(badge => badge.earned_at === null) ? 'empty' : 'ready',
+        state: isEmpty && badges.every(badge => badge.earned_at === null) ? 'empty' : 'ready',
         displayName: name?.trim() ?? '',
         avatarFile: avatar && avatar.trim() ? avatar : null,
-        joinDate: resolveJoinDate(joinDateSetting, expenses),
-        stats: buildProfileStats(expenses, streak, displayCurrency, rates),
+        joinDate: resolveJoinDate(joinDateSetting, earliestDate),
+        stats,
         achievements: badges.map(buildAchievementState),
         themePack: buildThemePackState(themePack, theme),
         pricesVisible: pricesVisible !== 'false',

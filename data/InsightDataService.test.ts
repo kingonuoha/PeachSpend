@@ -107,6 +107,37 @@ describe('InsightDataService snapshot', () => {
   });
 });
 
+// F-06. The screen loads the ledger once and hands the same list to the insight
+// snapshot, so the transaction rows the screen renders and the figures the snapshot
+// computes cannot come from two different reads of the table.
+describe('InsightDataService shared expense list (F-06)', () => {
+  it('uses the caller list without reading the ledger again', async () => {
+    const now = new Date(2026, 8, 16, 12).getTime();
+    const rows = [expense('a', 60, new Date(2026, 8, 15).getTime())];
+    const getExpenses = vi.fn(async () => rows);
+    const service = new InsightDataService({ ...source(rows, [], { currency: 'CAD' }), getExpenses });
+
+    const snapshot = await service.getSnapshot({ timeframe: 'week' }, now, rows);
+
+    expect(getExpenses).not.toHaveBeenCalled();
+    expect(snapshot.transactionCount).toBe(1);
+    expect(snapshot.totalSpent).toBe(60);
+    expect(snapshot.state).toBe('ready');
+  });
+
+  it('reads the ledger when the caller has no list', async () => {
+    const now = new Date(2026, 8, 16, 12).getTime();
+    const rows = [expense('a', 60, new Date(2026, 8, 15).getTime())];
+    const getExpenses = vi.fn(async () => rows);
+    const service = new InsightDataService({ ...source(rows, [], { currency: 'CAD' }), getExpenses });
+
+    const snapshot = await service.getSnapshot({ timeframe: 'week' }, now);
+
+    expect(getExpenses).toHaveBeenCalledTimes(1);
+    expect(snapshot.totalSpent).toBe(60);
+  });
+});
+
 describe('insight digest boundary', () => {
   const buildSnapshot = () => new InsightDataService(source([expense('a', 20, Date.now())], [], { currency: 'CAD' })).getSnapshot({ timeframe: 'week' }, Date.now());
 

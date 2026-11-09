@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
   Image,
@@ -13,12 +13,14 @@ import {
   TextInput,
   useWindowDimensions,
   View,
+  type GestureResponderEvent,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { format } from 'date-fns';
+import * as Haptics from 'expo-haptics';
 import {
   AlertTriangle,
   Briefcase,
@@ -50,13 +52,18 @@ import { Skeleton } from '../../components/ui/Skeleton';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
 import { useExpenseDetail, type ExpenseCategoryMeta } from '../../hooks/useExpenseDetail';
+import { databaseService } from '../../services/DatabaseService';
 import type { ExpenseRecordOrigin } from '../../data/ExpenseDetail';
 import type { Expense } from '../../types/database';
-import { formatCurrency } from '../../utils/currency';
+import { formatCurrency, getCurrencyPrefix } from '../../utils/currency';
 
 const MASK = '••••';
 const NOTE_MAX = 140;
 const MAX_CONTENT_WIDTH = 640;
+// Phase 11 B2-5. The horizontal paging gesture may not begin inside this band on
+// either edge, so the platform back gesture keeps the edges. This is the audit's
+// 20 points, applied to the touch start rather than to the layout.
+const EDGE_GESTURE_INSET = 20;
 // The canonical dot rail shows one dot per record. Real ledgers can hold many
 // more, so the rail is windowed to a fixed 5 dots that slide with the active
 // record instead of rendering an unbounded row.
@@ -167,6 +174,14 @@ export default function ExpenseDetailScreen() {
   const [deleteFailed, setDeleteFailed] = useState(false);
   const [learnedNotice, setLearnedNotice] = useState<{ id: string; title: string } | null>(null);
   const [actionFailedId, setActionFailedId] = useState<string | null>(null);
+  // Paging is only enabled when the gesture starts outside the two edge bands, so a
+  // system back swipe from the edge pages nothing.
+  const [pagingEnabled, setPagingEnabled] = useState(true);
+  // Rows the screen re-read from the database after an edit. Nothing is written here
+  // optimistically: a record only appears in this map after the stored row was read
+  // back, so the screen cannot show a value that did not persist.
+  const [confirmedRecords, setConfirmedRecords] = useState<Record<string, Expense>>({});
+  const [categoryLimits, setCategoryLimits] = useState<Record<string, number>>({});
 
   const maxIndex = Math.max(records.length - 1, 0);
   const currentIndex = scrolledIndex === null ? initialIndex : Math.min(scrolledIndex, maxIndex);
@@ -175,6 +190,41 @@ export default function ExpenseDetailScreen() {
     setScrolledIndex(null);
     retry();
   }, [retry]);
+
+  // Category limits are one settings read (D3), not a query per card, so the anchor
+  // is available for every record in the deck without extra database work.
+  useEffect(() => {
+    let active = true;
+    void databaseService.getAllCategoryLimits()
+      .then(limits => { if (active) setCategoryLimits(limits); })
+      .catch(() => { if (active) setCategoryLimits({}); });
+    return () => { active = false; };
+  }, []);
+
+  // Merge the card's record with the row the last write read back, so an edited value
+  // shows only once it is really stored.
+  const recordFor = useCallback(
+    (expense: Expense): Expense => confirmedRecords[expense.id] ?? expense,
+    [confirmedRecords],
+  );
+
+  const readBack = useCallback(async (id: string) => {
+    const stored = await databaseService.getExpenseById(id);
+    if (stored) setConfirmedRecords(current => ({ ...current, [id]: stored }));
+    return stored;
+  }, []);
+
+  const saveMerchant = useCallback(async (id: string, merchant: string) => {
+    await databaseService.updateExpenseMerchant(id, merchant);
+    const stored = await readBack(id);
+    if (!stored) throw new Error('merchant_read_back_failed');
+  }, [readBack]);
+
+  const saveAmount = useCallback(async (id: string, expense: Expense, amount: number) => {
+    await databaseService.updateExpenseCurrency(id, amount, expense.currency || currency);
+    const stored = await readBack(id);
+    if (!stored) throw new Error('amount_read_back_failed');
+  }, [currency, readBack]);
 
   const pricesVisible = settings.prices_visible !== 'false';
   const active = records[currentIndex];
@@ -477,12 +527,19 @@ export default function ExpenseDetailScreen() {
     <View style={[styles.root, { backgroundColor: ts.bg.screen }]}>
       {header}
 
-      <View style={styles.listWrap}>
+      <View
+        style={styles.listWrap}
+        onTouchStart={(event: GestureResponderEvent) => {
+          const x = event.nativeEvent.pageX;
+          setPagingEnabled(x > EDGE_GESTURE_INSET && x < width - EDGE_GESTURE_INSET);
+        }}
+      >
         <FlatList
           ref={listRef}
           data={records}
           horizontal
           pagingEnabled
+          scrollEnabled={pagingEnabled}
           showsHorizontalScrollIndicator={false}
           initialScrollIndex={initialIndex}
           getItemLayout={(_, index) => ({ length: contentWidth, offset: contentWidth * index, index })}
@@ -496,11 +553,12 @@ export default function ExpenseDetailScreen() {
           style={{ width: '100%' }}
           renderItem={({ item, index }) => (
             <DetailPage
-              expense={item}
+              expense={recordFor(item)}
               index={index}
               total={records.length}
               origin={index === currentIndex && activeOrigin ? activeOrigin : originOf(item)}
               categoryMeta={categoryMeta}
+              categoryLimits={categoryLimits}
               pricesVisible={pricesVisible}
               pricesText={pricesText}
               currency={currency}
@@ -515,6 +573,8 @@ export default function ExpenseDetailScreen() {
               onRequestDelete={() => { setDeleteFailed(false); setDeleteOpen(true); }}
               onSaveNote={saveNote}
               onToggleReimbursable={setReimbursable}
+              onSaveMerchant={saveMerchant}
+              onSaveAmount={saveAmount}
             />
           )}
         />
@@ -610,6 +670,7 @@ interface DetailPageProps {
   total: number;
   origin: ExpenseRecordOrigin;
   categoryMeta: Record<string, ExpenseCategoryMeta>;
+  categoryLimits: Record<string, number>;
   pricesVisible: boolean;
   pricesText: string | null;
   currency: string;
@@ -624,6 +685,8 @@ interface DetailPageProps {
   onRequestDelete: () => void;
   onSaveNote: (id: string, note: string) => Promise<void>;
   onToggleReimbursable: (id: string, value: boolean) => Promise<void>;
+  onSaveMerchant: (id: string, merchant: string) => Promise<void>;
+  onSaveAmount: (id: string, expense: Expense, amount: number) => Promise<void>;
 }
 
 function DetailPage({
@@ -632,6 +695,7 @@ function DetailPage({
   total,
   origin,
   categoryMeta,
+  categoryLimits,
   pricesVisible,
   pricesText,
   currency,
@@ -646,6 +710,8 @@ function DetailPage({
   onRequestDelete,
   onSaveNote,
   onToggleReimbursable,
+  onSaveMerchant,
+  onSaveAmount,
 }: DetailPageProps) {
   const ts = useThemeStyles();
   const insets = useSafeAreaInsets();
@@ -653,6 +719,14 @@ function DetailPage({
   const [noteStatus, setNoteStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [reimbursable, setReimbursable] = useState(expense.is_reimbursable === 1);
   const [reimbError, setReimbError] = useState(false);
+  const [merchantDraft, setMerchantDraft] = useState(expense.merchant);
+  const [merchantEditing, setMerchantEditing] = useState(false);
+  const [merchantError, setMerchantError] = useState<string | null>(null);
+  const [merchantSaving, setMerchantSaving] = useState(false);
+  const [amountDraft, setAmountDraft] = useState('');
+  const [amountEditing, setAmountEditing] = useState(false);
+  const [amountError, setAmountError] = useState<string | null>(null);
+  const [amountSaving, setAmountSaving] = useState(false);
 
   const meta = categoryMeta[expense.category];
   const categoryTitle = meta?.title ?? expense.category;
@@ -668,11 +742,82 @@ function DetailPage({
   const converted = convertAmount(expense.amount, expense.currency || currency);
   const amountText = formatCurrency(converted.amount, currency);
   const originalText = formatCurrency(expense.amount, expense.currency || currency);
+  const storedCurrency = expense.currency || currency;
   const dateLabel = format(new Date(expense.date), 'EEEE, MMMM d, yyyy');
   const timeLabel = format(new Date(expense.date), 'HH:mm');
   // Hero badge is the canonical 12-hour clock (HTML 230, PNG "2:14 PM"); the
   // metadata Recorded Time row keeps the canonical 24-hour clock (HTML 327).
   const timeBadgeLabel = format(new Date(expense.date), 'h:mm a');
+
+  // The one real anchor that exists for this record: the share of the category limit
+  // the user set for this category. Both numbers are already in the app currency, so
+  // the comparison is honest. No limit means no line, never a placeholder.
+  const categoryLimit = categoryLimits[expense.category] ?? null;
+  const limitShare = categoryLimit && categoryLimit > 0 ? (converted.amount / categoryLimit) * 100 : null;
+  const limitShareLabel = limitShare === null
+    ? null
+    : limitShare < 1
+      ? 'less than 1%'
+      : `${Math.round(limitShare)}%`;
+
+  const startMerchantEdit = useCallback(() => {
+    setMerchantDraft(expense.merchant);
+    setMerchantError(null);
+    setMerchantEditing(true);
+  }, [expense.merchant]);
+
+  const commitMerchant = useCallback(async () => {
+    const trimmed = merchantDraft.trim();
+    if (!trimmed) {
+      setMerchantError('Merchant name cannot be empty');
+      return;
+    }
+    if (trimmed === expense.merchant) {
+      setMerchantEditing(false);
+      return;
+    }
+    setMerchantSaving(true);
+    setMerchantError(null);
+    try {
+      await onSaveMerchant(expense.id, trimmed);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setMerchantEditing(false);
+    } catch {
+      setMerchantError('Could not save the merchant. Try again.');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setMerchantSaving(false);
+    }
+  }, [expense.id, expense.merchant, merchantDraft, onSaveMerchant]);
+
+  const startAmountEdit = useCallback(() => {
+    // The privacy eye exists to hide amounts, so it also hides the editor rather than
+    // printing the value the mask is covering.
+    if (!pricesVisible) return;
+    setAmountDraft(String(expense.amount));
+    setAmountError(null);
+    setAmountEditing(true);
+  }, [expense.amount, pricesVisible]);
+
+  const commitAmount = useCallback(async () => {
+    const parsed = Number(amountDraft.replace(/,/g, '.'));
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      setAmountError(`Enter an amount greater than ${getCurrencyPrefix(storedCurrency)}0.00`);
+      return;
+    }
+    setAmountSaving(true);
+    setAmountError(null);
+    try {
+      await onSaveAmount(expense.id, expense, parsed);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      setAmountEditing(false);
+    } catch {
+      setAmountError('Could not save the amount. Try again.');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setAmountSaving(false);
+    }
+  }, [amountDraft, expense, onSaveAmount, storedCurrency]);
 
   const commitNote = useCallback(async () => {
     if ((expense.note ?? '') === note) {
@@ -683,8 +828,10 @@ function DetailPage({
     try {
       await onSaveNote(expense.id, note);
       setNoteStatus('saved');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch {
       setNoteStatus('error');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
   }, [expense.note, expense.id, note, onSaveNote]);
 
@@ -692,7 +839,7 @@ function DetailPage({
     setNote('');
     setNoteStatus('saving');
     onSaveNote(expense.id, '')
-      .then(() => setNoteStatus('saved'))
+      .then(() => { setNoteStatus('saved'); void Haptics.selectionAsync(); })
       .catch(() => setNoteStatus('error'));
   }, [expense.id, onSaveNote]);
 
@@ -777,30 +924,153 @@ function DetailPage({
               <CategoryGlyph iconName={meta?.iconName} size={24} color={tintPair[1]} />
             </View>
             <View style={styles.flexShrink}>
-              <Text
-                accessibilityRole="header"
-                style={[Typography.headlineMd, { color: ts.raw.onSurface }]}
-                numberOfLines={1}
-              >
-                {expense.merchant}
-              </Text>
-              <Text style={[Typography.micro, styles.merchantSub, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
-                {categoryTitle}
-              </Text>
+              {merchantEditing ? (
+                <View style={styles.inlineEditor}>
+                  <TextInput
+                    value={merchantDraft}
+                    onChangeText={text => { setMerchantDraft(text); if (merchantError) setMerchantError(null); }}
+                    autoFocus
+                    returnKeyType="done"
+                    onSubmitEditing={commitMerchant}
+                    editable={!merchantSaving}
+                    placeholder="Merchant name"
+                    placeholderTextColor={ts.raw.onSurfaceVariant}
+                    selectionColor={ts.raw.primary}
+                    accessibilityLabel="Merchant name"
+                    style={[
+                      styles.inlineInput,
+                      Typography.bodyBold,
+                      {
+                        color: ts.raw.onSurface,
+                        backgroundColor: ts.bg.low,
+                        borderColor: merchantError ? ts.raw.danger : ts.raw.outline,
+                      },
+                    ]}
+                  />
+                  <View style={styles.inlineActions}>
+                    <Pressable
+                      onPress={commitMerchant}
+                      disabled={merchantSaving}
+                      accessibilityRole="button"
+                      accessibilityLabel="Save merchant name"
+                      hitSlop={8}
+                      style={styles.inlineAction}
+                    >
+                      <Check size={16} color={ts.raw.primary} strokeWidth={2.5} />
+                    </Pressable>
+                    <Pressable
+                      onPress={() => { setMerchantEditing(false); setMerchantError(null); }}
+                      disabled={merchantSaving}
+                      accessibilityRole="button"
+                      accessibilityLabel="Cancel merchant edit"
+                      hitSlop={8}
+                      style={styles.inlineAction}
+                    >
+                      <X size={16} color={ts.raw.onSurfaceVariant} strokeWidth={2.2} />
+                    </Pressable>
+                  </View>
+                </View>
+              ) : (
+                <Pressable
+                  onPress={startMerchantEdit}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Merchant ${expense.merchant}. Edit merchant`}
+                  style={styles.merchantTitleRow}
+                >
+                  <Text
+                    accessibilityRole="header"
+                    style={[Typography.headlineMd, styles.merchantTitle, { color: ts.raw.onSurface }]}
+                    numberOfLines={1}
+                  >
+                    {expense.merchant}
+                  </Text>
+                  <Pencil size={13} color={ts.raw.onSurfaceVariant} />
+                </Pressable>
+              )}
+              {merchantError ? (
+                <Text style={[Typography.micro, { color: ts.raw.danger, marginTop: 2 }]}>{merchantError}</Text>
+              ) : (
+                <Text style={[Typography.micro, styles.merchantSub, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+                  {categoryTitle}
+                </Text>
+              )}
             </View>
           </View>
 
           <View style={[styles.amountRow, { borderTopColor: ts.raw.outline, borderBottomColor: ts.raw.outline }]}>
             <View style={styles.flexShrink}>
               <Text style={[Typography.micro, styles.uppercase, { color: ts.raw.onSurfaceVariant }]}>Total Charged</Text>
-              <Text
-                style={[Typography.displayLg, styles.amount, { color: ts.raw.onSurface }]}
-                numberOfLines={1}
-                adjustsFontSizeToFit
-                minimumFontScale={0.7}
-              >
-                {pricesVisible ? `-${amountText}` : pricesText}
-              </Text>
+              {amountEditing ? (
+                <View style={styles.amountEditor}>
+                  <Text style={[Typography.labelBold, { color: ts.raw.onSurfaceVariant }]}>{getCurrencyPrefix(storedCurrency)}</Text>
+                  <TextInput
+                    value={amountDraft}
+                    onChangeText={text => { setAmountDraft(text); if (amountError) setAmountError(null); }}
+                    autoFocus
+                    keyboardType="decimal-pad"
+                    returnKeyType="done"
+                    onSubmitEditing={commitAmount}
+                    editable={!amountSaving}
+                    selectionColor={ts.raw.primary}
+                    accessibilityLabel={`Amount in ${storedCurrency}`}
+                    style={[
+                      Typography.displayLg,
+                      styles.amountInput,
+                      {
+                        color: ts.raw.onSurface,
+                        backgroundColor: ts.bg.low,
+                        borderColor: amountError ? ts.raw.danger : ts.raw.outline,
+                      },
+                    ]}
+                  />
+                  <Pressable
+                    onPress={commitAmount}
+                    disabled={amountSaving}
+                    accessibilityRole="button"
+                    accessibilityLabel="Save amount"
+                    hitSlop={8}
+                    style={styles.inlineAction}
+                  >
+                    <Check size={18} color={ts.raw.primary} strokeWidth={2.5} />
+                  </Pressable>
+                  <Pressable
+                    onPress={() => { setAmountEditing(false); setAmountError(null); }}
+                    disabled={amountSaving}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cancel amount edit"
+                    hitSlop={8}
+                    style={styles.inlineAction}
+                  >
+                    <X size={18} color={ts.raw.onSurfaceVariant} strokeWidth={2.2} />
+                  </Pressable>
+                </View>
+              ) : (
+                <Pressable
+                  onPress={startAmountEdit}
+                  disabled={!pricesVisible}
+                  accessibilityRole="button"
+                  accessibilityState={{ disabled: !pricesVisible }}
+                  accessibilityLabel={`Total charged ${pricesVisible ? amountText : 'hidden'}. Edit amount`}
+                  style={styles.amountPressable}
+                >
+                  <Text
+                    style={[Typography.displayLg, styles.amount, { color: ts.raw.onSurface }]}
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.7}
+                  >
+                    {pricesVisible ? `-${amountText}` : pricesText}
+                  </Text>
+                  {pricesVisible ? <Pencil size={13} color={ts.raw.onSurfaceVariant} /> : null}
+                </Pressable>
+              )}
+              {amountError ? (
+                <Text style={[Typography.micro, { color: ts.raw.danger, marginTop: 2 }]}>{amountError}</Text>
+              ) : limitShareLabel && pricesVisible ? (
+                <Text style={[Typography.micro, styles.anchor, { color: ts.raw.onSurfaceVariant }]}>
+                  This is {limitShareLabel} of your {categoryTitle} limit
+                </Text>
+              ) : null}
             </View>
             <View style={styles.originalBox}>
               <Text style={[Typography.micro, styles.uppercase, { color: ts.raw.onSurfaceVariant }]}>Parsed Raw</Text>
@@ -893,15 +1163,29 @@ function DetailPage({
               <Pencil size={15} color={ts.raw.onSurfaceVariant} />
               <Text style={[Typography.bodyBold, { color: ts.raw.onSurface }]}>Personal Note</Text>
             </View>
-            <Text style={[Typography.micro, styles.mono, { color: ts.raw.onSurfaceVariant }]}>
-              {note.length} / {NOTE_MAX}
-            </Text>
+            <View style={styles.noteHeaderRight}>
+              <Text style={[Typography.micro, styles.mono, { color: ts.raw.onSurfaceVariant }]}>
+                {note.length} / {NOTE_MAX}
+              </Text>
+              <Pressable
+                onPress={commitNote}
+                disabled={noteStatus === 'saving'}
+                accessibilityRole="button"
+                accessibilityLabel="Save note now"
+                hitSlop={8}
+                style={[styles.noteCommit, { borderColor: ts.raw.outline }]}
+              >
+                <Check size={15} color={noteStatus === 'error' ? ts.raw.danger : ts.raw.primary} strokeWidth={2.5} />
+              </Pressable>
+            </View>
           </View>
           <TextInput
             value={note}
             onChangeText={text => {
               setNote(text);
-              if (noteStatus === 'error') setNoteStatus('idle');
+              // Any edit after a commit makes the previous tick false, so the status
+              // returns to idle and the footer re-derives from the stored value.
+              if (noteStatus !== 'saving') setNoteStatus('idle');
             }}
             onBlur={commitNote}
             multiline
@@ -925,6 +1209,10 @@ function DetailPage({
                 <Check size={12} color={ts.raw.statusSuccessText} strokeWidth={2.5} />
                 <Text style={[Typography.micro, styles.bold, { color: ts.raw.statusSuccessText }]}>Autosaved to SQLite</Text>
               </View>
+            ) : note !== (expense.note ?? '') ? (
+              // The stored note and the field differ, so the honest state is unsaved,
+              // not a tick that would claim a write that has not happened.
+              <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]}>Unsaved changes</Text>
             ) : (
               <View style={styles.savedRow}>
                 <Check size={12} color={ts.raw.onSurfaceVariant} strokeWidth={2.5} />
@@ -1056,6 +1344,38 @@ const styles = StyleSheet.create({
   uppercase: { textTransform: 'uppercase', letterSpacing: 0.6 },
   bold: { fontFamily: 'Manrope_700Bold' },
   flexShrink: { flexShrink: 1, minWidth: 0 },
+  merchantTitleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, minHeight: 32 },
+  merchantTitle: { flexShrink: 1 },
+  inlineEditor: { gap: Spacing.s2 },
+  inlineInput: {
+    borderWidth: 1,
+    borderRadius: Radii.sm,
+    paddingHorizontal: Spacing.s2,
+    paddingVertical: Spacing.s1 + 2,
+    minHeight: 40,
+  },
+  inlineActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
+  inlineAction: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
+  amountPressable: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2, minHeight: 44 },
+  amountEditor: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s1, marginTop: 2 },
+  amountInput: {
+    flexShrink: 1,
+    minWidth: 96,
+    borderWidth: 1,
+    borderRadius: Radii.sm,
+    paddingHorizontal: Spacing.s2,
+    paddingVertical: Spacing.s1,
+  },
+  anchor: { marginTop: 2 },
+  noteHeaderRight: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
+  noteCommit: {
+    width: 44,
+    height: 44,
+    borderRadius: Radii.full,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   skeletonStack: { gap: Spacing.s2 },
   mono: { fontFamily: 'Manrope_500Medium', letterSpacing: 0.4 },
   dotsRow: {

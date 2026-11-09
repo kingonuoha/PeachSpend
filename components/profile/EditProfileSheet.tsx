@@ -1,16 +1,18 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   Image,
-  KeyboardAvoidingView,
   Modal,
-  Platform,
   Pressable,
   ScrollView,
+  StyleSheet,
   Text,
   TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
+import { GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as ImagePicker from 'expo-image-picker';
@@ -21,6 +23,8 @@ import { PeachButton } from '../ui/PeachButton';
 import { ScalePressable } from '../ui/ScalePressable';
 import { LuminousCard } from '../ui/LuminousCard';
 import { useToast } from '../ui/ToastProvider';
+import { useReduceMotion } from '../../hooks/useReduceMotion';
+import { useSheetDragToDismiss } from '../../hooks/useSheetDragToDismiss';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { Gradients, Radii, Spacing, Typography } from '../../constants/tokens';
 import { isOwnedAvatarFile, PROFILE_AVATAR_DIR } from '../../utils/profileAvatar';
@@ -86,6 +90,25 @@ export function EditProfileSheet({
   const { showToast } = useToast();
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
+  const reduceMotion = useReduceMotion();
+
+  // Surface 10 keyboard avoidance. Replaces KeyboardAvoidingView with the same
+  // padding math, but measured and applied on the UI thread so the name input
+  // tracks the keyboard without waiting on a JS bridge frame. Applies on both
+  // platforms: per the Reanimated docs, while useAnimatedKeyboard is mounted it
+  // disables Android's default window resize for the whole app, so Android gets no
+  // system resize and this padding is the only keyboard handling. With the keyboard
+  // closed the height is 0, so the resting layout is unchanged.
+  const keyboard = useAnimatedKeyboard();
+  const keyboardPaddingStyle = useAnimatedStyle(() => ({
+    paddingBottom: keyboard.height.get(),
+  }));
+
+  // POLISH Section 7: moving focus INTO the sheet when it opens. Best effort,
+  // same AccessibilityInfo approach as the import drawer (surface 9); returning
+  // focus to the opening control belongs to the host (pair 1 in profile.tsx).
+  // This only changes what a screen reader announces, never what renders.
+  const sheetRef = useRef<View>(null);
 
   // The parent mounts this sheet only while it is open, so the props are the
   // fresh draft for that opening. No resync effect is needed.
@@ -119,6 +142,31 @@ export function EditProfileSheet({
     if (avatarFile && avatarFile !== persistedAvatarFile) void deleteOwnedAvatar(avatarFile);
     onClose();
   };
+
+  // The sheet's own maximum vertical travel. One value caps the container and
+  // drives the drag hook, so the two can never diverge (CategoryPickerSheet pattern).
+  const sheetMaxHeight = Math.min(height * 0.9, 760);
+
+  // Shared drag-to-dismiss (POLISH Section 5): the handle and header track the
+  // finger, the backdrop opacity is derived from the same translate, and a flick
+  // or a long pull dismisses through handleClose so the saving guard and the
+  // avatar cleanup still run. dismissable stays false during an in-flight save:
+  // without it a drag would carry the sheet off-screen and handleClose's guard
+  // would refuse to unmount, leaving an invisible mounted sheet behind.
+  const { pan, sheetStyle, backdropStyle } = useSheetDragToDismiss({
+    height: sheetMaxHeight,
+    visible: true,
+    reduceMotion,
+    dismissable: !saving,
+    onDismiss: handleClose,
+  });
+
+  // The parent mounts this sheet only while it is open, so mount is the opening
+  // edge: move screen-reader focus into the modal content once it appears.
+  useEffect(() => {
+    if (sheetRef.current !== null) AccessibilityInfo.sendAccessibilityEvent(sheetRef.current, 'focus');
+  }, []);
+
   const initials = initialsOf(name);
   const memberSinceLabel = memberSince
     ? new Date(memberSince).toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
@@ -211,109 +259,126 @@ export function EditProfileSheet({
     <Modal
       visible
       transparent
-      animationType="slide"
+      animationType="none"
       statusBarTranslucent
       onRequestClose={() => {
         handleClose();
       }}
     >
-      <View style={{ flex: 1, justifyContent: 'flex-end' }}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Close edit profile"
-          onPress={() => {
-            handleClose();
-          }}
-          style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: ts.bg.overlay }}
-        />
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <View
-            accessibilityViewIsModal
-            style={{
-              width: '100%',
-              maxWidth: 640,
-              alignSelf: 'center',
-              maxHeight: Math.min(height * 0.9, 760),
-              backgroundColor: ts.raw.surface,
-              borderTopLeftRadius: Radii.xxl,
-              borderTopRightRadius: Radii.xxl,
-              borderTopWidth: 1,
-              borderColor: ts.raw.outline,
-              paddingTop: Spacing.s5,
-              paddingBottom: Math.max(insets.bottom, Spacing.s3) + Spacing.s5,
-              shadowColor: '#000000',
-              shadowOffset: { width: 0, height: -10 },
-              shadowOpacity: 0.5,
-              shadowRadius: 24,
-              elevation: 24,
-              overflow: 'hidden',
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <Animated.View
+          style={[{ flex: 1, justifyContent: 'flex-end' }, keyboardPaddingStyle]}
+        >
+          <Animated.View
+            pointerEvents="none"
+            style={[StyleSheet.absoluteFill, backdropStyle, { backgroundColor: ts.bg.overlay }]}
+          />
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Close edit profile"
+            onPress={() => {
+              handleClose();
             }}
+            style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}
+          />
+          <Animated.View
+            ref={sheetRef}
+            accessibilityViewIsModal
+            style={[
+              sheetStyle,
+              {
+                width: '100%',
+                maxWidth: 640,
+                alignSelf: 'center',
+                maxHeight: sheetMaxHeight,
+                backgroundColor: ts.raw.surface,
+                borderTopLeftRadius: Radii.xxl,
+                borderTopRightRadius: Radii.xxl,
+                borderTopWidth: 1,
+                borderColor: ts.raw.outline,
+                paddingTop: Spacing.s5,
+                paddingBottom: Math.max(insets.bottom, Spacing.s3) + Spacing.s5,
+                shadowColor: '#000000',
+                shadowOffset: { width: 0, height: -10 },
+                shadowOpacity: 0.5,
+                shadowRadius: 24,
+                elevation: 24,
+                overflow: 'hidden',
+              },
+            ]}
           >
+            {/* The drag is attached to the handle and header only, so a vertical
+                drag never fights the scrollable body or the name input below. */}
+            <GestureDetector gesture={pan}>
+              <View style={{ paddingHorizontal: Spacing.s5 }}>
+                <View
+                  accessible={false}
+                  importantForAccessibility="no-hide-descendants"
+                  style={{
+                    width: HANDLE_WIDTH,
+                    height: HANDLE_HEIGHT,
+                    borderRadius: Radii.full,
+                    backgroundColor: ts.raw.onSurfaceVariant + '66',
+                    alignSelf: 'center',
+                    marginBottom: Spacing.s4,
+                  }}
+                />
+
+                <View
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    paddingBottom: Spacing.s3,
+                    marginBottom: Spacing.s4,
+                    borderBottomWidth: 1,
+                    borderBottomColor: ts.raw.outline,
+                  }}
+                >
+                  <View style={{ flex: 1, minWidth: 0, paddingRight: Spacing.s3 }}>
+                    <Text
+                      accessibilityRole="header"
+                      numberOfLines={1}
+                      style={[Typography.headlineMd, { color: ts.raw.onSurface }]}
+                    >
+                      Edit Profile
+                    </Text>
+                    <Text
+                      numberOfLines={2}
+                      style={[Typography.labelMd, { color: ts.raw.onSurfaceVariant, marginTop: 2 }]}
+                    >
+                      Update your avatar and display name
+                    </Text>
+                  </View>
+                  <ScalePressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Close edit profile"
+                    haptic={false}
+                    disabled={saving}
+                    onPress={handleClose}
+                    hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                    style={{
+                      width: CLOSE_SIZE,
+                      height: CLOSE_SIZE,
+                      borderRadius: Radii.full,
+                      backgroundColor: ts.bg.card,
+                      borderWidth: 1,
+                      borderColor: ts.raw.outline,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <X size={16} color={ts.raw.onSurfaceVariant} />
+                  </ScalePressable>
+                </View>
+              </View>
+            </GestureDetector>
+
             <ScrollView
               keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator={false}
               contentContainerStyle={{ paddingHorizontal: Spacing.s5, paddingBottom: Spacing.s2 }}
             >
-              <View
-                accessible={false}
-                importantForAccessibility="no-hide-descendants"
-                style={{
-                  width: HANDLE_WIDTH,
-                  height: HANDLE_HEIGHT,
-                  borderRadius: Radii.full,
-                  backgroundColor: ts.raw.onSurfaceVariant + '66',
-                  alignSelf: 'center',
-                  marginBottom: Spacing.s4,
-                }}
-              />
-
-              <View
-                style={{
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  paddingBottom: Spacing.s3,
-                  marginBottom: Spacing.s4,
-                  borderBottomWidth: 1,
-                  borderBottomColor: ts.raw.outline,
-                }}
-              >
-                <View style={{ flex: 1, minWidth: 0, paddingRight: Spacing.s3 }}>
-                  <Text
-                    accessibilityRole="header"
-                    numberOfLines={1}
-                    style={[Typography.headlineMd, { color: ts.raw.onSurface }]}
-                  >
-                    Edit Profile
-                  </Text>
-                  <Text
-                    numberOfLines={2}
-                    style={[Typography.labelMd, { color: ts.raw.onSurfaceVariant, marginTop: 2 }]}
-                  >
-                    Update your avatar and display name
-                  </Text>
-                </View>
-                <ScalePressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Close edit profile"
-                  haptic={false}
-                  disabled={saving}
-                  onPress={handleClose}
-                  hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-                  style={{
-                    width: CLOSE_SIZE,
-                    height: CLOSE_SIZE,
-                    borderRadius: Radii.full,
-                    backgroundColor: ts.bg.card,
-                    borderWidth: 1,
-                    borderColor: ts.raw.outline,
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                  }}
-                >
-                  <X size={16} color={ts.raw.onSurfaceVariant} />
-                </ScalePressable>
-              </View>
 
               {/* Avatar: photo, monogram fallback, or empty-identity icon */}
               <View style={{ alignItems: 'center' }}>
@@ -564,9 +629,9 @@ export function EditProfileSheet({
                 </View>
               </View>
             </ScrollView>
-          </View>
-        </KeyboardAvoidingView>
-      </View>
+          </Animated.View>
+        </Animated.View>
+      </GestureHandlerRootView>
     </Modal>
   );
 }

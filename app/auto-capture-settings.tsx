@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { AppState, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { AppState, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import {
   ArrowLeft,
+  BatteryCharging,
+  BatteryWarning,
   Bell,
   BellOff,
   Check,
@@ -13,13 +15,16 @@ import {
   ExternalLink,
   PauseCircle,
   Search,
+  Smartphone,
   Zap,
 } from 'lucide-react-native';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { CategoryTints, Radii, Spacing, Typography } from '../constants/tokens';
 import { createNativeAutoCaptureAdapter } from '../data/NativeAutoCaptureAdapter';
-import { buildDiagnosticActivity, type AutoCapturePermissionState, type AutoCaptureSourceDescriptor, type CaptureEventStatus, type DiagnosticActivityState } from '../data/contracts';
+import { getAutostartGuide } from '../data/AutoCaptureSource';
+import { buildDiagnosticActivity, type AutoCapturePermissionState, type AutoCaptureSourceDescriptor, type BatteryExemptionState, type CaptureEventStatus, type DiagnosticActivityState, type GuardServiceState } from '../data/contracts';
 import { databaseService } from '../services/DatabaseService';
+import { notificationService, type DeviceAlertPermissionState } from '../services/NotificationService';
 import { PeachButton } from '../components/ui/PeachButton';
 import { Skeleton } from '../components/ui/Skeleton';
 import { useSettings } from '../components/ui/SettingsProvider';
@@ -94,19 +99,35 @@ export default function AutoCaptureSettingsScreen() {
   const [permission, setPermission] = useState<AutoCapturePermissionState | null>(null);
   const [sources, setSources] = useState<AutoCaptureSourceDescriptor[]>([]);
   const [activity, setActivity] = useState<DiagnosticActivityState | null>(null);
+  const [battery, setBattery] = useState<BatteryExemptionState | null>(null);
+  const [guard, setGuard] = useState<GuardServiceState | null>(null);
+  // Phase 16 M1 device ping grant. Live POST_NOTIFICATIONS state on Android
+  // 13 plus, read beside the listener state so the setup screen reports the
+  // popup path honestly instead of assuming it. Null until the first read.
+  const [devicePing, setDevicePing] = useState<DeviceAlertPermissionState | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [toggleError, setToggleError] = useState(false);
   const adapter = useMemo(() => createNativeAutoCaptureAdapter(), []);
 
   const refresh = useCallback(async () => {
+    // Battery exemption and guard state only exist on Android builds with the
+    // native module. Other platforms keep null so fallback values never render
+    // as sensed claims.
+    const isNative = adapter.capability === 'available';
     try {
-      const [nextPermission, nextSources] = await Promise.all([
+      const [nextPermission, nextSources, nextBattery, nextGuard, nextDevicePing] = await Promise.all([
         adapter.getPermissionState(),
         adapter.getSupportedSources(),
+        isNative ? (adapter.getBatteryExemption?.() ?? Promise.resolve(null)) : Promise.resolve(null),
+        isNative ? (adapter.getGuardState?.() ?? Promise.resolve(null)) : Promise.resolve(null),
+        isNative ? notificationService.getDeviceAlertPermission() : Promise.resolve(null),
       ]);
       setPermission(nextPermission);
       setSources(nextSources);
+      setBattery(nextBattery);
+      setGuard(nextGuard);
+      setDevicePing(nextDevicePing);
       setLoadError(false);
     } catch {
       setLoadError(true);
@@ -155,6 +176,12 @@ export default function AutoCaptureSettingsScreen() {
   const successTint = ts.isDark ? CategoryTints.groceries.dark : CategoryTints.groceries.light;
   const neutralTint = ts.isDark ? CategoryTints.other.dark : CategoryTints.other.light;
 
+  const activityGlyph = (status: CaptureEventStatus): string => {
+    if (status === 'discarded') return '✕';
+    if (status === 'duplicate_skipped') return '⟲';
+    return '✓';
+  };
+
   const activityTag = (status: CaptureEventStatus): { label: string; background: string; color: string } => {
     switch (status) {
       case 'confirmed':
@@ -162,7 +189,7 @@ export default function AutoCaptureSettingsScreen() {
       case 'discarded':
         return { label: 'Discarded', background: ts.raw.dangerSoft, color: ts.raw.dangerContainerText };
       case 'duplicate_skipped':
-        return { label: 'Duplicate', background: ts.raw.warningContainer, color: ts.raw.warningContainerText };
+        return { label: 'Duplicate Skip', background: ts.raw.warningContainer, color: ts.raw.warningContainerText };
       default:
         return { label: humanizeStatus(status), background: neutralTint[0], color: neutralTint[1] };
     }
@@ -194,25 +221,111 @@ export default function AutoCaptureSettingsScreen() {
       ? 'Available on Android only.'
       : 'Not available in this build.'
     : listenerActive
-      ? 'Background parser enabled. Drafts queue for review.'
+      ? guard && !guard.running
+        ? 'Background service paused. Reopening the app restarts it.'
+        : 'Background parser enabled. Drafts queue for review.'
       : masterEnabled
         ? 'Waiting for notification access before drafts can queue.'
         : 'Listener suspended. Notification drafts paused.';
+
+  const batteryRestricted = isAvailable && battery !== null && !battery.exempt;
+  // Prototype scenario 10 copy (code.html lines 1216-1218). Shown only from the
+  // real PowerManager read, never as a fixture.
+  const showStalledBanner = Boolean(isAvailable && masterEnabled && isGranted && batteryRestricted);
+
+  const batteryBadge = !isAvailable
+    ? null
+    : battery === null
+      ? null
+      : battery.exempt
+        ? { label: 'Unrestricted', background: ts.raw.statusSuccessContainer, color: ts.raw.statusSuccessText }
+        : { label: 'Restricted', background: ts.raw.dangerSoft, color: ts.raw.dangerContainerText };
+
+  const batteryIcon = !isAvailable || battery === null
+    ? { background: ts.bg.card, color: ts.text.onSurfaceVariant, glyph: <BatteryWarning color={ts.text.onSurfaceVariant} size={18} /> }
+    : battery.exempt
+      ? { background: successTint[0], color: successTint[1], glyph: <BatteryCharging color={successTint[1]} size={18} /> }
+      : { background: ts.raw.dangerSoft, color: ts.raw.danger, glyph: <BatteryWarning color={ts.raw.danger} size={18} /> };
+
+  const batterySub = !isAvailable
+    ? ''
+    : battery === null
+      ? ''
+      : battery.exempt
+        ? 'Unrestricted. The listener can run in the background.'
+        : 'Restricted. Android can pause the listener.';
+
+  const autostartGuide = isAvailable ? getAutostartGuide() : [];
+
+  // Phase 16 M1 device ping copy. Every state names what works without the
+  // popup (drafts plus inbox rows), so a refusal never reads as broken setup.
+  const deviceBadge =
+    devicePing === 'granted'
+      ? { label: 'Allowed', background: ts.raw.statusSuccessContainer, color: ts.raw.statusSuccessText }
+      : devicePing === 'denied'
+        ? { label: 'Blocked', background: ts.raw.dangerSoft, color: ts.raw.dangerContainerText }
+        : { label: devicePing === 'unavailable' || devicePing === 'unsupported' ? 'Unavailable' : 'Not asked', background: ts.bg.card, color: ts.text.onSurfaceVariant };
+
+  const deviceIcon =
+    devicePing === 'granted'
+      ? { background: successTint[0], color: successTint[1], glyph: <Bell color={successTint[1]} size={18} /> }
+      : devicePing === 'denied'
+        ? { background: ts.raw.dangerSoft, color: ts.raw.danger, glyph: <BellOff color={ts.raw.danger} size={18} /> }
+        : { background: ts.bg.card, color: ts.text.onSurfaceVariant, glyph: <BellOff color={ts.text.onSurfaceVariant} size={18} /> };
+
+  const deviceSub =
+    devicePing === 'granted'
+      ? 'Allowed. New detections pop up on this device as well as the inbox.'
+      : devicePing === 'denied'
+        ? 'Blocked in Android settings. Drafts and inbox rows still work. Allow popups in settings to see detections outside the app.'
+        : devicePing === 'unavailable'
+          ? 'The alert permission could not be read. Drafts and inbox rows still work. Retry to check again.'
+          : devicePing === 'unsupported'
+            ? 'Device popups are not available in this build. Drafts and inbox rows still work.'
+            : 'Not asked yet. Allow popups so new detections surface outside the app. Drafts and inbox rows work either way.';
 
   const toggleMaster = async () => {
     if (!isAvailable) return;
     void Haptics.selectionAsync();
     setToggleError(false);
+    const next = !masterEnabled;
     try {
-      await updateSetting('auto_capture_enabled', masterEnabled ? 'false' : 'true');
+      await updateSetting('auto_capture_enabled', next ? 'true' : 'false');
     } catch {
       setToggleError(true);
+      return;
+    }
+    // Switching on with no OS grant would leave a switch that reads on but can never
+    // work. The existing adapter opens the one screen that can grant it, so the user
+    // does not have to hunt for a second control.
+    if (next && !isGranted) {
+      void adapter.openSystemSettings();
     }
   };
 
   const openSystemSettings = () => {
     void Haptics.selectionAsync();
     void adapter.openSystemSettings();
+  };
+
+  const openBatterySettings = () => {
+    void Haptics.selectionAsync();
+    void adapter.openBatterySettings?.();
+  };
+
+  // Phase 16 M1 device ping request. Asks Android 13 plus for the popup
+  // grant, then re reads the live state so the card reports the OS answer
+  // instead of the tap. A refusal changes nothing else.
+  const requestDeviceAlerts = () => {
+    void Haptics.selectionAsync();
+    void notificationService.requestDeviceAlertPermission().then(() => { void refresh(); });
+  };
+
+  // Permanent refusal path. Android stops showing the system prompt after a
+  // hard deny, so the only honest control left is the app settings screen.
+  const openAppSettings = () => {
+    void Haptics.selectionAsync();
+    void Linking.openSettings().catch(() => undefined);
   };
 
   return (
@@ -283,16 +396,17 @@ export default function AutoCaptureSettingsScreen() {
             <View style={styles.masterInfo}>
               <View style={styles.masterTitleRow}>
                 <Text style={[Typography.bodyBold, { color: ts.text.onSurface, flexShrink: 1 }]}>Auto-Capture Master</Text>
+                {/* One pill for the switch state, matching the pair: Active
+                    when the master is on, Paused when it is off. Permission
+                    access has its own card below, so no second pill is needed. */}
                 <View
                   style={[
                     styles.pill,
-                    {
-                      backgroundColor: listenerActive ? ts.raw.statusSuccessContainer : ts.raw.dangerSoft,
-                    },
+                    { backgroundColor: masterEnabled ? ts.raw.statusSuccessContainer : ts.raw.dangerSoft },
                   ]}
                 >
-                  <Text style={[Typography.micro, { color: listenerActive ? ts.raw.statusSuccessText : ts.raw.dangerContainerText, fontFamily: 'Manrope_700Bold' }]}>
-                    {listenerActive ? 'Active' : 'Paused'}
+                  <Text style={[Typography.micro, { color: masterEnabled ? ts.raw.statusSuccessText : ts.raw.danger, fontFamily: 'Manrope_700Bold' }]}>
+                    {masterEnabled ? 'Active' : 'Paused'}
                   </Text>
                 </View>
               </View>
@@ -356,6 +470,27 @@ export default function AutoCaptureSettingsScreen() {
             </View>
           )}
 
+          {showStalledBanner && (
+            <View
+              accessibilityRole="alert"
+              accessibilityLabel="Background listener stalled"
+              style={[styles.errorBanner, { backgroundColor: ts.bg.error10, borderColor: ts.border.error20 }]}
+            >
+              <CircleAlert color={ts.icon.error} size={20} />
+              <Text style={[Typography.labelMd, { color: ts.text.error, flex: 1 }]}>
+                Background Listener Stalled: Android battery optimization paused the service. Please disable battery restrictions in system settings.
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Open battery settings"
+                onPress={openBatterySettings}
+                style={styles.retryHit}
+              >
+                <Text style={[Typography.labelLg, { color: ts.text.error }]}>Open Settings</Text>
+              </Pressable>
+            </View>
+          )}
+
           <View
             accessibilityLabel="Notification access status"
             style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
@@ -399,14 +534,187 @@ export default function AutoCaptureSettingsScreen() {
                     <PauseCircle color={ts.icon.muted} size={18} />
                     <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, flex: 1 }]}>
                       {isUnsupported
-                        ? 'Notification-listener auto-capture runs on Android only and stays safely inactive here.'
-                        : 'This build has no native listener. Expo Go stays safely inactive; nothing is read.'}
+                        ? 'Notification listener auto-capture runs on Android only and stays safely inactive here.'
+                        : 'This device cannot read financial notifications, so auto-capture stays inactive and nothing is read.'}
                     </Text>
                   </View>
                 )}
               </>
             )}
           </View>
+
+          {isAvailable && (
+            <View
+              accessibilityLabel="Device alert permission status"
+              style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+            >
+              {loading && devicePing === null ? (
+                <CardLoadingSkeleton chipSize={34} tail="pill" label="Checking device alerts" />
+              ) : (
+                <>
+                  <View style={styles.permissionTop}>
+                    <View style={styles.permissionLabelGroup}>
+                      <View style={[styles.permissionIcon, { backgroundColor: deviceIcon.background }]}>
+                        {deviceIcon.glyph}
+                      </View>
+                      <View style={styles.flex}>
+                        <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Device alerts</Text>
+                        <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, marginTop: Spacing.s1 }]}>
+                          {deviceSub}
+                        </Text>
+                      </View>
+                    </View>
+                    <View
+                      accessibilityLabel={`Device alert status: ${deviceBadge.label}`}
+                      style={[styles.pill, { backgroundColor: deviceBadge.background }]}
+                    >
+                      <Text style={[Typography.micro, { color: deviceBadge.color, fontFamily: 'Manrope_700Bold' }]}>
+                        {deviceBadge.label}
+                      </Text>
+                    </View>
+                  </View>
+                  {devicePing === 'granted' || devicePing === 'unsupported' ? null : devicePing === 'denied' ? (
+                    <PeachButton
+                      title="Open Android settings"
+                      onPress={openAppSettings}
+                      variant="secondary"
+                      size="lg"
+                      fullWidth
+                      icon={<ExternalLink color={ts.text.primary} size={18} />}
+                    />
+                  ) : devicePing === 'unavailable' ? (
+                    <PeachButton
+                      title="Retry"
+                      onPress={() => { void refresh(); }}
+                      variant="secondary"
+                      size="lg"
+                      fullWidth
+                    />
+                  ) : (
+                    <PeachButton
+                      title="Allow device alerts"
+                      onPress={requestDeviceAlerts}
+                      variant="secondary"
+                      size="lg"
+                      fullWidth
+                      icon={<Bell color={ts.text.primary} size={18} />}
+                    />
+                  )}
+                </>
+              )}
+            </View>
+          )}
+
+          <View
+            accessibilityLabel="Battery exemption status"
+            style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+          >
+            {loading && battery === null && isAvailable ? (
+              <CardLoadingSkeleton chipSize={34} tail="pill" label="Checking battery exemption" />
+            ) : (
+              <>
+                <View style={styles.permissionTop}>
+                  <View style={styles.permissionLabelGroup}>
+                    <View style={[styles.permissionIcon, { backgroundColor: batteryIcon.background }]}>
+                      {batteryIcon.glyph}
+                    </View>
+                    <View style={styles.flex}>
+                      <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Battery Optimization</Text>
+                      <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, marginTop: Spacing.s1 }]}>
+                        {isAvailable ? batterySub : 'Battery exemption checks run on Android only.'}
+                      </Text>
+                    </View>
+                  </View>
+                  {batteryBadge && (
+                    <View
+                      accessibilityLabel={`Battery status: ${batteryBadge.label}`}
+                      style={[styles.pill, { backgroundColor: batteryBadge.background }]}
+                    >
+                      <Text style={[Typography.micro, { color: batteryBadge.color, fontFamily: 'Manrope_700Bold' }]}>
+                        {batteryBadge.label}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                {isAvailable && battery !== null ? (
+                  <PeachButton
+                    title={battery.exempt ? 'Manage Battery Settings' : 'Remove Battery Restrictions'}
+                    onPress={openBatterySettings}
+                    variant="secondary"
+                    size="lg"
+                    fullWidth
+                    icon={<ExternalLink color={ts.text.primary} size={18} />}
+                  />
+                ) : (
+                  <View style={styles.unavailableRow}>
+                    <PauseCircle color={ts.icon.muted} size={18} />
+                    <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, flex: 1 }]}>
+                      {isUnsupported
+                        ? 'Battery exemption runs on Android only and stays safely inactive here.'
+                        : 'This device cannot report battery exemption, so this step stays inactive.'}
+                    </Text>
+                  </View>
+                )}
+              </>
+            )}
+          </View>
+
+          {isAvailable && (
+            <>
+              <View style={styles.sectionTitleBar}>
+                <Text style={[Typography.labelBold, { color: ts.text.onSurface, flex: 1 }]}>Autostart Steps</Text>
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+                  {`${autostartGuide.length} brands`}
+                </Text>
+              </View>
+
+              <View
+                accessibilityLabel="Autostart setup instructions"
+                style={[styles.card, styles.listCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+              >
+                {autostartGuide.map((entry, index) => (
+                  <View
+                    key={entry.brand}
+                    accessible
+                    accessibilityLabel={`${entry.brand}. ${entry.systemPath}`}
+                    style={[
+                      styles.guideRow,
+                      index > 0 && { borderTopWidth: 1, borderTopColor: ts.border.subtle },
+                    ]}
+                  >
+                    <View style={styles.guideHeader}>
+                      <View style={[styles.sourceChip, { backgroundColor: neutralTint[0] }]}>
+                        <Smartphone color={neutralTint[1]} size={16} />
+                      </View>
+                      <View style={styles.flex}>
+                        <Text style={[Typography.captionBold, { color: ts.text.onSurface }]} numberOfLines={1}>
+                          {entry.brand}
+                        </Text>
+                        <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]} numberOfLines={2}>
+                          {entry.systemPath}
+                        </Text>
+                      </View>
+                    </View>
+                    <View style={{ gap: Spacing.s1 }}>
+                      {entry.steps.map((step, stepIndex) => (
+                        <View key={step} style={styles.guideStepRow}>
+                          <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>
+                            {`${stepIndex + 1}.`}
+                          </Text>
+                          <Text style={[Typography.labelMd, { color: ts.text.onSurface, flex: 1 }]}>
+                            {step}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                ))}
+              </View>
+              <Text style={[Typography.micro, styles.fallbackNote, { color: ts.text.onSurfaceVariant }]}>
+                Android shows no autostart status to apps, so these steps are instructions only and never a detected state.
+              </Text>
+            </>
+          )}
 
           {isAvailable && (
             <>
@@ -467,6 +775,9 @@ export default function AutoCaptureSettingsScreen() {
                   })
                 )}
               </View>
+              <Text style={[Typography.micro, styles.fallbackNote, { color: ts.text.onSurfaceVariant }]}>
+                Other apps on this device are covered too. Alerts shaped like a bank transaction still draft for review.
+              </Text>
             </>
           )}
 
@@ -489,33 +800,37 @@ export default function AutoCaptureSettingsScreen() {
                       index > 0 && { borderTopWidth: 1, borderTopColor: ts.border.subtle },
                     ]}
                   >
-                    <View style={[styles.activityChip, { backgroundColor: ts.bg.primary10 }]}>
-                      <ClipboardList color={ts.icon.primary} size={16} />
+                    <View accessible={false} style={[styles.activityChip, { backgroundColor: ts.raw.purple100 }]}>
+                      <Text style={[Typography.labelBold, { color: ts.text.primary }]}>
+                        {activityGlyph(entry.status)}
+                      </Text>
                     </View>
                     <View style={styles.flex}>
                       <Text style={[Typography.captionBold, { color: ts.text.onSurface }]} numberOfLines={1}>
                         {entry.merchant ?? 'Notification event'}
                       </Text>
                       <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]} numberOfLines={1}>
-                        {`${describeSource(entry.source)} · ${formatRelativeDateWithTime(entry.createdAt)}`}
+                        {`${describeSource(entry.source)} • ${formatRelativeDateWithTime(entry.createdAt)}`}
                       </Text>
                     </View>
-                    {entry.amount !== null ? (
-                      <Text
-                        numberOfLines={1}
-                        adjustsFontSizeToFit
-                        style={[Typography.captionBold, styles.activityAmount, { color: ts.text.onSurface }]}
+                    <View style={styles.actRight}>
+                      {entry.amount !== null ? (
+                        <Text
+                          numberOfLines={1}
+                          adjustsFontSizeToFit
+                          style={[Typography.captionBold, styles.activityAmount, { color: ts.text.onSurface }]}
+                        >
+                          {formatCurrency(entry.amount, settings.currency)}
+                        </Text>
+                      ) : null}
+                      <View
+                        accessibilityLabel={`Outcome: ${tag.label}`}
+                        style={[styles.pill, { backgroundColor: tag.background }]}
                       >
-                        {formatCurrency(entry.amount, settings.currency)}
-                      </Text>
-                    ) : null}
-                    <View
-                      accessibilityLabel={`Outcome: ${tag.label}`}
-                      style={[styles.pill, { backgroundColor: tag.background }]}
-                    >
-                      <Text style={[Typography.micro, { color: tag.color, fontFamily: 'Manrope_700Bold' }]}>
-                        {tag.label}
-                      </Text>
+                        <Text style={[Typography.micro, { color: tag.color, fontFamily: 'Manrope_700Bold' }]}>
+                          {tag.label}
+                        </Text>
+                      </View>
                     </View>
                   </View>
                 );
@@ -532,9 +847,9 @@ export default function AutoCaptureSettingsScreen() {
                   {activity === null
                     ? (isUnsupported
                       ? 'Notification parsing runs on Android only. No activity is read here.'
-                      : 'This build has no native listener, so no parsed notification activity exists.')
+                      : 'This device cannot read financial notifications, so there is no parsed activity to show.')
                     : activity.status === 'empty'
-                      ? 'Parsed push notifications from the last 30 days will display here with their outcome.'
+                      ? 'Parsed push notifications from the last 30 days will display here with diagnostic outcomes.'
                       : 'Parsed notification outcomes could not be read. Retry to try again.'}
                 </Text>
                 {activity && activity.status === 'unavailable' ? (
@@ -621,6 +936,7 @@ const styles = StyleSheet.create({
   permissionIcon: { width: 34, height: 34, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },
   unavailableRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s2 },
   sectionTitleBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: Spacing.s1 },
+  fallbackNote: { textAlign: 'center', paddingHorizontal: Spacing.s4 },
   listCard: { padding: 0, overflow: 'hidden' },
   sourceRow: {
     flexDirection: 'row',
@@ -633,7 +949,16 @@ const styles = StyleSheet.create({
   sourceChip: { width: 36, height: 36, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },
   activityChip: { width: 32, height: 32, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center' },
   activityAmount: { flexShrink: 0 },
+  actRight: { flexDirection: 'column', alignItems: 'flex-end', gap: Spacing.s1 },
   statusDot: { width: 5, height: 5, borderRadius: Radii.full },
+  guideRow: {
+    gap: Spacing.s3,
+    minHeight: 56,
+    paddingHorizontal: Spacing.s4,
+    paddingVertical: Spacing.s3,
+  },
+  guideHeader: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3 },
+  guideStepRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2 },
   emptyState: { alignItems: 'center', paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s8, gap: Spacing.s2 },
   emptyIcon: {
     width: 44,
@@ -643,5 +968,5 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: Spacing.s1,
   },
-  emptySub: { maxWidth: 240, textAlign: 'center' },
+  emptySub: { maxWidth: 280, textAlign: 'center' },
 });

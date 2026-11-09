@@ -15,14 +15,15 @@ const recapDataService = new RecapDataService(databaseService);
 export function useSpendingRecap(cadence: SpendingRecapCadence) {
   const [read, setRead] = useState<SpendingRecapRead | null>(null);
   const [categoryMeta, setCategoryMeta] = useState<Record<string, RecapCategoryMeta>>({});
-  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  // The cadence the last landed read belongs to. `loading` is derived from it, so
+  // the mount read does not have to set state synchronously from inside its own
+  // effect (which would render twice before the fetch even starts).
+  const [loadedCadence, setLoadedCadence] = useState<SpendingRecapCadence | null>(null);
   const requestId = useRef(0);
 
-  const load = useCallback(async (mode: 'initial' | 'refresh') => {
+  const load = useCallback(async () => {
     const id = ++requestId.current;
-    if (mode === 'refresh') setRefreshing(true);
-    else setLoading(true);
     // getRecap resolves its own offline/failure read instead of throwing, so no
     // catch is needed here; a resolved state is always rendered honestly.
     const [nextRead, categories] = await Promise.all([
@@ -36,17 +37,20 @@ export function useSpendingRecap(cadence: SpendingRecapCadence) {
     }
     setRead(nextRead);
     setCategoryMeta(meta);
-    setLoading(false);
+    setLoadedCadence(cadence);
     setRefreshing(false);
   }, [cadence]);
 
   useEffect(() => {
-    void load('initial');
+    void load();
   }, [load]);
 
+  // A retry re-reads without hiding the recap already on screen, so it only moves
+  // the refresh flag; `loading` stays settled because the cadence did not change.
   const retry = useCallback(() => {
-    void load('refresh');
+    setRefreshing(true);
+    void load();
   }, [load]);
 
-  return { read, categoryMeta, loading, refreshing, retry };
+  return { read, categoryMeta, loading: loadedCadence !== cadence, refreshing, retry };
 }

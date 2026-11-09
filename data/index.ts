@@ -32,4 +32,5 @@ export * from './ImportContracts';
 export * from './ImportDataService';
 export * from './NotificationContracts';
 export * from './NotificationDataService';
+export * from './DetectionDrafts';
 export * from './MediaErasure';

@@ -21,6 +21,21 @@ export const DESIGN_PAIR_CENTER = 52;
 // below account for.
 export const TAB_TARGET = 48;
 
+// Occupied height of the floating bar: the container the bar draws into,
+// excluding the device safe-area inset it is anchored above. PeachTabBar renders
+// to exactly this value and screens inside the tabs group ask for their bottom
+// clearance through bottomClearance.ts, so the bar and the space left for it can
+// never drift. The 90 is the spec_8 container height the bar was already drawn
+// to; it is exported here so it stops being restated per screen.
+export const TAB_BAR_HEIGHT = 90;
+
+// The height the bar occupies measured from the screen's bottom edge: its own
+// height plus the safe-area inset it sits above. This is what a bottom-docked
+// control inside the tabs group has to clear.
+export function tabBarOccupiedHeight(bottomInset: number): number {
+  return TAB_BAR_HEIGHT + bottomInset;
+}
+
 // The scale is clamped so the outer gutter never collapses on a narrow screen
 // and the pair never drifts to the far corners on a tablet.
 export const LAYOUT_SCALE_MIN = 0.85;

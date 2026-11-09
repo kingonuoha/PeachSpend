@@ -2,12 +2,112 @@ import { ScannedReceipt } from '../types/gemini';
 import { databaseService } from './DatabaseService';
 import { logger } from '../utils/logger';
 import { geminiClient } from '../ai/providerClients';
-import { AiError, normalizeAiError } from '../ai/contracts';
-import { parseReceiptResponse } from '../ai/parsing';
+import { AiError, normalizeAiError, type AiProvider } from '../ai/contracts';
+import { extractJsonObject, parseReceiptResponse } from '../ai/parsing';
 import { formatCurrency, resolveDisplayCurrency } from '../utils/currency';
+import type { CaptureCandidate } from '../data/contracts';
+
+// Product mode has its own parse contract rather than borrowing the receipt one.
+// A prompt is advisory, so it cannot be trusted to force the shape the receipt
+// parser requires, and the product scenario genuinely differs from a receipt in
+// two ways the receipt parser treats as fatal: the image normally shows no store
+// name, and a price is often absent. So the parser here accepts what the model
+// actually returns and never turns a missing merchant or price into a failure.
+
+interface RawProductItem { merchant?: unknown; item_name?: unknown; amount?: unknown; unit_price?: unknown; units?: unknown; category?: unknown; currency?: unknown; confidence?: unknown; }
+
+// A price the model returned, which may be a number or a string. Only an
+// unambiguous value is accepted: digits with optional thousands grouping and an
+// optional decimal part, with any surrounding currency symbol or code ignored.
+// Anything ambiguous is refused rather than guessed, so a price is never
+// misread, matching the one money rule the rest of the app uses (DEC-B09).
+function coerceMoney(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
+  if (typeof value !== 'string') return null;
+  const digits = value.trim().replace(/[^\d.,]/g, '');
+  const grouped = /^\d{1,3}(,\d{3})+(\.\d+)?$/.test(digits);
+  const normalized = grouped ? digits.replace(/,/g, '') : digits;
+  if (!/^\d+(\.\d+)?$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+// A quantity is a whole number of at least one. Anything else, including a
+// missing key, resolves to one rather than propagating NaN into the total.
+function coerceUnits(value: unknown): number {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : Number.NaN;
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : 1;
+}
+
+// The barcode the device decoded in product mode. It is device data rather than
+// model output, but it is still interpolated into a prompt, so only a plausible
+// retail code survives: digits with optional grouping separators, bounded in
+// length. Anything else is dropped rather than passed through (DEC-B41).
+function normalizeBarcode(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const digits = value.replace(/[\s-]/g, '');
+  return /^\d{4,18}$/.test(digits) ? digits : '';
+}
+
+// Product parse. Returns the same CaptureCandidate shape the receipt parse
+// returns, so the caller maps both through one code path, but with the product
+// scenario's own tolerances: merchant and price are optional, a text price is
+// coerced, and a quantity is only honoured when the provider's own arithmetic
+// agrees with it.
+function parseProductResponse(text: string, provider: AiProvider = 'gemini'): { legibility: 'good' | 'poor'; items: CaptureCandidate[] } {
+  const value = extractJsonObject(text, provider) as { legibility?: unknown; items?: unknown };
+  if (!Array.isArray(value.items)) throw new AiError('invalid_response', provider, 'AI response did not match the product contract');
+  const rawItems: unknown[] = value.items;
+  const items = rawItems.flatMap((raw, index) => {
+    if (raw === null || typeof raw !== 'object') throw new AiError('invalid_response', provider, `Product item ${index + 1} is invalid`);
+    const item = raw as RawProductItem;
+    const amount = coerceMoney(item.amount) ?? 0;
+    const name = typeof item.item_name === 'string' ? item.item_name.trim() : '';
+    // Neither a name nor a price means the item carries no information, so it is
+    // dropped instead of being returned as a blank row.
+    if (!name && amount <= 0) return [];
+    // An absent merchant is normal for a product photo, so it stays empty. The
+    // confirmation sheet already asks the user for it, exactly as it does for a
+    // manual entry, rather than the scan being reported as a failure.
+    const merchant = typeof item.merchant === 'string' ? item.merchant.trim() : '';
+    const units = coerceUnits(item.units);
+    const reportedUnitPrice = coerceMoney(item.unit_price);
+    const keepQuantity = units > 1 && reportedUnitPrice !== null && Math.abs(reportedUnitPrice * units - amount) <= 0.01;
+    const currency = typeof item.currency === 'string' ? item.currency.trim().toUpperCase() : '';
+    const category = typeof item.category === 'string' ? item.category.trim() : '';
+    // Confidence comes only from the provider and only as a real fraction in
+    // (0, 1]. Anything else stays undefined, so the sheet never renders a
+    // fabricated certainty.
+    const reportedConfidence = item.confidence === undefined ? undefined : Number(item.confidence);
+    const confidence = reportedConfidence !== undefined && Number.isFinite(reportedConfidence) && reportedConfidence > 0 && reportedConfidence <= 1 ? reportedConfidence : undefined;
+    return [{
+      merchant,
+      amount,
+      currency,
+      category,
+      date: Date.now(),
+      note: name || undefined,
+      source: 'ocr' as const,
+      unitPrice: keepQuantity ? reportedUnitPrice : amount,
+      units: keepQuantity ? units : 1,
+      ...(confidence !== undefined ? { confidence } : {}),
+    }];
+  });
+  if (!items.length) {
+    // No usable item. An explicit poor verdict is the provider saying the image
+    // itself could not be read, which stays a distinct outcome from a response
+    // that simply did not match the contract.
+    if (value.legibility === 'poor') return { legibility: 'poor', items: [] };
+    throw new AiError('invalid_response', provider, 'AI response contained no usable product');
+  }
+  // A usable item is concrete evidence the image was read, so it wins over the
+  // provider's own verdict. This is what stops a normal product photo, which
+  // carries no merchant, from being reported as an unreadable image.
+  return { legibility: 'good', items };
+}
 
 class GeminiService {
-  async scanReceipt(base64Image: string, mode: 'receipt' | 'product' = 'receipt', options: { signal?: AbortSignal } = {}): Promise<ScannedReceipt[]> {
+  async scanReceipt(base64Image: string, mode: 'receipt' | 'product' = 'receipt', options: { signal?: AbortSignal; barcode?: string } = {}): Promise<ScannedReceipt[]> {
     const apiKey = await databaseService.getSecret('gemini_api_key');
     if (!apiKey) throw new AiError('missing_key', 'gemini', 'AI provider key is not configured');
 
@@ -44,31 +144,49 @@ class GeminiService {
       }
     `;
 
+    // The decoded code is product context only: it is appended to the product
+    // prompt and nowhere else, so the receipt prompt and the receipt path are
+    // byte identical to before this change (DEC-B41).
+    const scannedBarcode = mode === 'product' ? normalizeBarcode(options.barcode) : '';
+    const productBarcodeLine = scannedBarcode
+      ? `\n      The package barcode read on this device is ${scannedBarcode}. Use it to identify the product, and never invent a different code.`
+      : '';
+
     const productPrompt = `
       You are a product identification assistant.
-      Identify the product in this image. 
-       Return ONLY a valid JSON object with the following keys:
-       - legibility: "good" or "poor"
-       - items: [
-           {
-             "merchant": "store name found in image",
-             "item_name": "product name found in image",
-             "amount": "price found in image",
-             "category": "category from configured list",
-             "currency": "currency code found in image",
-             "confidence": "certainty for this item, number from 0 to 1; omit if unavailable"
-           }
-         ]
-       Do not invent values. Return legibility "poor" when any required value is not visible.
+      Identify the product shown in the image.${productBarcodeLine}
+
+      FIRST, assess the legibility of the image. Set "legibility" to "poor" ONLY when no product can be identified at all, for example the image is too blurry, too dark, or shows no product.
+      A product photo normally has no store name in it, and a price is often not visible. Neither of those makes the image illegible, so never set "legibility" to "poor" because a merchant or a price is missing.
+
+      SECOND, describe the product. For each product, provide:
+      - item_name: (the product name, as it appears on the item or its label)
+      - amount: (the price of one unit, as a NUMBER, for example 3.5; omit this key when no price is visible)
+      - unit_price: (the price per single unit as a NUMBER; the same value as amount when only one price is visible)
+      - units: (the quantity shown, as a whole number; use 1 when only one item is shown)
+      - category: (classify into one of: ${categoryList})
+      - currency: (3-letter ISO code, only when a currency is visible on the item; omit this key when none is visible)
+      - merchant: (the store name, ONLY when a store name is visible in the image; omit this key otherwise, which is the normal case)
+      - confidence: (your certainty for this item as a number from 0 to 1, where 1 is fully certain; omit this key entirely if you cannot estimate it)
+
+      Never invent a value. Never guess a merchant, a price or a currency that is not visible in the image.
+      Return ONLY a valid JSON object:
+      {
+        "legibility": "good" | "poor",
+        "items": [
+          { "item_name": "...", "amount": 3.5, "unit_price": 3.5, "units": 1, "category": "...", "currency": "...", "merchant": "...", "confidence": 0.9 },
+          ...
+        ]
+      }
     `;
 
     const prompt = mode === 'receipt' ? receiptPrompt : productPrompt;
 
     try {
       const response = await geminiClient.generate({ feature: 'receipt_ocr', prompt, imageBase64: base64Image, model: 'gemini-2.5-flash', signal: options.signal }, apiKey);
-      const parsed = parseReceiptResponse(response.text);
-       if (parsed.legibility === 'poor') throw new AiError('illegible_image', 'gemini', 'Receipt image could not be read');
-       const items = parsed.items;
+      const parsed = mode === 'receipt' ? parseReceiptResponse(response.text) : parseProductResponse(response.text);
+      if (parsed.legibility === 'poor') throw new AiError('illegible_image', 'gemini', mode === 'receipt' ? 'Receipt image could not be read' : 'Product image could not be read');
+      const items = parsed.items;
 
       // Resolve the model's category text to an existing category id only. OCR
       // must not create categories or write anything before the user confirms in

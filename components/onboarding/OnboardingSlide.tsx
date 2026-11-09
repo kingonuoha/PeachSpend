@@ -23,6 +23,12 @@ const ENTER_DURATION = 240;
 const ILLUSTRATION_MIN = 190;
 const ILLUSTRATION_MAX = 250;
 
+// The one fluid rule for the slide illustration, exported so the onboarding loading
+// skeleton mirrors the same geometry instead of restating the clamp.
+export function onboardingIllustrationSize(width: number): number {
+  return Math.min(Math.max(width * 0.64, ILLUSTRATION_MIN), ILLUSTRATION_MAX);
+}
+
 export const OnboardingSlide: React.FC<OnboardingSlideProps> = ({ title, subtitle, slideNumber, active }) => {
   const { width } = useWindowDimensions();
   const theme = useThemeStyles();
@@ -61,7 +67,7 @@ export const OnboardingSlide: React.FC<OnboardingSlideProps> = ({ title, subtitl
     transform: [{ translateX: 50 * (1 - subtitleProgress.value) }],
   }));
 
-  const illustrationSize = Math.min(Math.max(width * 0.64, ILLUSTRATION_MIN), ILLUSTRATION_MAX);
+  const illustrationSize = onboardingIllustrationSize(width);
   const titleFontSize = width >= 430 ? 27 : width < 360 ? 23 : 26;
   const copyMaxWidth = Math.min(width - Spacing.s6 * 2, 320);
 

@@ -1,7 +1,7 @@
 import 'react-native-get-random-values';
 import { HrefInputParams, Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { View, Text, TouchableOpacity, AppState } from 'react-native';
+import { View, Text, TouchableOpacity, AppState, Platform } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import * as React from 'react';
 import { 
@@ -36,7 +36,9 @@ import { recurringService, RECURRING_TASK_NAME } from '../services/RecurringServ
 import { cleanupService } from '../services/CleanupService';
 import { aiChatService } from '../services/AIChatService';
 import AutoCaptureConfirmHost from '../components/ui/AutoCaptureConfirmHost';
-import { canUseNativeRuntime } from '../utils/runtimeEnvironment';
+import DetectionAlertActionHost from '../components/ui/DetectionAlertActionHost';
+import { StaleReviewHost } from '../components/ui/StaleReviewHost';
+import { canUseNativeRuntime, isExpoGoRuntime } from '../utils/runtimeEnvironment';
 import { createShareIntentHandoff } from '../utils/shareIntentHandoff';
 
 SplashScreen.preventAutoHideAsync();
@@ -45,6 +47,18 @@ type ShareReceiveRoute = HrefInputParams & {
   pathname: '/(share)/receive';
   params: { handoffToken: string };
 };
+
+// iOS Expo Go has no Face ID support, so prompting there can trap the user
+// behind a retry that always fails. The skip below is development-shell only:
+// a dev client or a release build still runs the prompt.
+const biometricSkipNotices = new Set<string>();
+
+function logBiometricSkipOnce(reason: string): void {
+  if (typeof __DEV__ === 'undefined' || !__DEV__) return;
+  if (biometricSkipNotices.has(reason)) return;
+  biometricSkipNotices.add(reason);
+  logger.info(`BiometricGate: unlock prompt skipped (${reason})`);
+}
 
 function BiometricGate({ children }: { children: React.ReactNode }) {
   const { settings } = useSettings();
@@ -59,8 +73,23 @@ function BiometricGate({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      if (isExpoGoRuntime()) {
+        logBiometricSkipOnce('expo_go');
+        setBiometricPassed(true);
+        return;
+      }
+
       const compatible = await LocalAuthentication.hasHardwareAsync();
       if (!compatible) {
+        setBiometricPassed(true);
+        return;
+      }
+
+      // No supported authentication type means there is nothing to prompt with,
+      // so the device is treated as unavailable in every runtime, not just Go.
+      const supportedTypes = await LocalAuthentication.supportedAuthenticationTypesAsync();
+      if (supportedTypes.length === 0) {
+        logBiometricSkipOnce('no_supported_authentication_type');
         setBiometricPassed(true);
         return;
       }
@@ -127,7 +156,12 @@ function BiometricGate({ children }: { children: React.ReactNode }) {
 }
 
 function ShareIntentHandler() {
-  const { hasShareIntent, shareIntent, resetShareIntent } = useShareIntent();
+  // Expo Go does not ship expo-share-intent. Disabling the hook there stops it
+  // from subscribing to a module that is absent, while a real build keeps the
+  // default web guard intact and listens as before.
+  const { hasShareIntent, shareIntent, resetShareIntent } = useShareIntent({
+    disabled: isExpoGoRuntime() || Platform.OS === 'web',
+  });
   const router = useRouter();
   const segments = useSegments();
   const handled = React.useRef(false);
@@ -263,6 +297,8 @@ export default function RootLayout() {
                   <StreakGate>
                     {canUseNativeRuntime('expo-share-intent') && <ShareIntentHandler />}
                    <AutoCaptureConfirmHost />
+                   <DetectionAlertActionHost />
+                   <StaleReviewHost />
                    <Stack
                   screenOptions={{
                     headerShown: false,
@@ -276,6 +312,7 @@ export default function RootLayout() {
                   <Stack.Screen name="expense/manual" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
                   <Stack.Screen name="expense-review" options={{ presentation: 'modal' }} />
                   <Stack.Screen name="expense/[id]" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
+                  <Stack.Screen name="detection/[id]" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
                   <Stack.Screen name="privacy-policy" options={{ animation: 'slide_from_right' }} />
                   <Stack.Screen name="support-center" options={{ animation: 'slide_from_right' }} />
                   <Stack.Screen name="notifications" options={{ animation: 'slide_from_right' }} />
@@ -290,7 +327,7 @@ export default function RootLayout() {
                 </StreakGate>
               </BiometricGate>
             {showSplash && <AnimatedSplashScreen onFinish={handleSplashFinish} />}
-            <StatusBar style={showSplash ? 'dark' : 'light'} />
+            <StatusBar style="light" />
           </View>
             </AchievementProvider>
         </ToastProvider>

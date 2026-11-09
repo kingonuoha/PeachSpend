@@ -28,6 +28,12 @@ const migration1: Migration = {
   name: 'legacy-schema-baseline',
   oneWayReason: 'Baseline creates tables and cannot safely remove user data during rollback.',
   async up(db) {
+    // journal_mode is repeated here for a file opened outside the runner. The
+    // matching durability setting, `PRAGMA synchronous = NORMAL`, is deliberately
+    // NOT repeated here: this runs inside the runner's transaction, and SQLite
+    // refuses to change the safety level inside one ("Safety level may not be
+    // changed inside a transaction"). It is set once per open in runMigrations,
+    // outside any transaction, which is where the trade is documented.
     await db.execAsync(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS expenses (id TEXT PRIMARY KEY NOT NULL, merchant TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', category TEXT NOT NULL, note TEXT, scanned INTEGER NOT NULL DEFAULT 0, date INTEGER NOT NULL, created_at INTEGER NOT NULL);
@@ -115,13 +121,212 @@ const migration6: Migration = {
   },
 };
 
-export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6];
+// BUG-09-11a. Reader index coverage, derived from the queries the data layer actually
+// runs rather than from the shape of the schema. One index per column a query filters
+// or sorts on, and no composite index, because a wider index would cost write time on
+// the save path without serving any query in the app. Each line names the statement
+// that reads it, checked with EXPLAIN QUERY PLAN (see
+// bugfix-BUG-09-11-evidence.md):
+//
+// - expenses(date): every period read and every newest first read. Serves the range
+//   filter in getMonthlySummary, getNetBalance, getBudgetStatus, getRecentExpensesInRange,
+//   getExpensesByCategoryInRange and exportToCSV, and the ORDER BY date DESC in
+//   getExpenses, getRecentExpenses and the category drill down. The drill down also
+//   leans on it for its category predicate, because `LOWER(category) = LOWER(?)` is a
+//   different term from the column and cannot use the category index below.
+// - expenses(category): getExpensesByCategory groups by this column, so the planner
+//   walks the index in group order instead of building a temp b-tree over the table.
+// - expenses(is_reimbursable): getReimbursableTotal reads this flag twice, once for the
+//   sum and once for the rows.
+// - expenses(amount): the achievement totals statement reads the smallest amount with
+//   ORDER BY amount ASC, rowid ASC LIMIT 1. Without this index that scalar subquery
+//   sorted the whole table to return one row.
+// - income(date): the same period and newest first reads as expenses(date).
+// - notifications(created_at): getNotifications orders newest first.
+// - notifications(read): getUnreadNotificationCount answers its count from the index
+//   alone, and markAllNotificationsRead filters on the same flag.
+// - chat_messages(created_at): getChatHistory orders oldest first.
+//
+// Evaluated and deliberately NOT created, with the reason:
+// - expenses(scanned): the triage named it missing because the pre-collapse achievement
+//   pass ran `SELECT COUNT(*) FROM expenses WHERE scanned = 1`, which this index made
+//   covering. The collapse in services/DatabaseService.ts folds that count into the one
+//   aggregate statement, which must scan the table for the other eight columns, and no
+//   other statement in the app filters on scanned. The index would therefore cost write
+//   time on every save and be read by nothing. Add it with the query that consumes it if
+//   a scanned predicate returns.
+//
+// Reversible, so no oneWayReason is claimed: an index stores no user data, so down()
+// drops exactly the eight indexes this migration created and leaves every row intact.
+const migration7: Migration = {
+  version: 7,
+  name: 'reader-index-coverage',
+  async up(db) {
+    await db.execAsync(`
+      CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+      CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
+      CREATE INDEX IF NOT EXISTS idx_expenses_is_reimbursable ON expenses(is_reimbursable);
+      CREATE INDEX IF NOT EXISTS idx_expenses_amount ON expenses(amount);
+      CREATE INDEX IF NOT EXISTS idx_income_date ON income(date);
+      CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at);
+      CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);
+    `);
+  },
+  async down(db) {
+    await db.execAsync(`
+      DROP INDEX IF EXISTS idx_expenses_date;
+      DROP INDEX IF EXISTS idx_expenses_category;
+      DROP INDEX IF EXISTS idx_expenses_is_reimbursable;
+      DROP INDEX IF EXISTS idx_expenses_amount;
+      DROP INDEX IF EXISTS idx_income_date;
+      DROP INDEX IF EXISTS idx_notifications_created_at;
+      DROP INDEX IF EXISTS idx_notifications_read;
+      DROP INDEX IF EXISTS idx_chat_messages_created_at;
+    `);
+  },
+};
 
+// Phase 11 D2, ESC-11-09. The offline receipt draft store. A captured receipt is
+// kept here when OCR cannot run at all (no connection, no provider key) so the
+// user's photo survives until it can be retried, which no existing table covers:
+// capture_queue holds auto-capture push payloads and is deliberately not
+// repurposed (see data/ReceiptDrafts.ts).
+//
+// The composite index serves the two statements this table has. The claim reads
+// `WHERE status = ? ORDER BY created_at ASC LIMIT 1`, and the list surface reads
+// `WHERE status = ? ORDER BY created_at DESC`. A single (status, created_at) index
+// serves both, because SQLite can scan an index in either direction.
+//
+// One way, with the reason stated rather than left for a reader to guess: there is
+// no down(). This table is the only pointer the app holds to a receipt image the
+// user captured but has not saved yet, and the image file lives outside the
+// database. A rollback that dropped the table would silently discard those
+// pending receipts and leave their images orphaned in the cache, so the table is
+// additive and stays. The same reasoning migration 3 records for the capture
+// queue.
+const migration8: Migration = {
+  version: 8,
+  name: 'receipt-draft-store',
+  oneWayReason: 'A rollback would delete the pending offline receipts the user captured and orphan their image files.',
+  async up(db) {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS receipt_drafts (id TEXT PRIMARY KEY NOT NULL, image_uri TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_receipt_drafts_status_created_at ON receipt_drafts(status, created_at);
+    `);
+  },
+};
+
+// Phase 14 D1. The detection draft queue plus the inbox accounted flag. A
+// detection that awaits user confirmation is persisted here with its first
+// detection time, an optional snooze timestamp, and a link to its inbox row,
+// so it survives reboot and can age into the stale review queue. The
+// accounted column on notifications is the unread contract the S-14 read
+// path keys on: draft linked rows stay unread until a resolve operation sets
+// it, and nothing else writes it.
+//
+// The composite index serves the two statements this table has. The stale
+// read filters `WHERE status = ? AND detected_at < ?` oldest first, and the
+// pending list reads `WHERE status = ?` oldest first. One (status,
+// detected_at) index serves both, because SQLite can scan an index in either
+// direction.
+//
+// One way, with the reason stated rather than left for a reader to guess:
+// there is no down(). The draft rows are the only pointer the app holds to
+// detections the user has not resolved yet, and inbox rows link to them. A
+// rollback would strand pending detections and orphan those links.
+const migration9: Migration = {
+  version: 9,
+  name: 'detection-draft-queue',
+  oneWayReason: 'A rollback would strand pending user detections and orphan the inbox rows linked to them.',
+  async up(db) {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS detection_drafts (id TEXT PRIMARY KEY NOT NULL, merchant TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL, category TEXT NOT NULL, note TEXT, source TEXT NOT NULL, detected_at INTEGER NOT NULL, snoozed_until INTEGER, status TEXT NOT NULL, notification_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_detection_drafts_status_detected_at ON detection_drafts(status, detected_at);
+    `);
+    const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(notifications)');
+    if (!columns.some(item => item.name === 'accounted')) {
+      await db.execAsync('ALTER TABLE notifications ADD COLUMN accounted INTEGER NOT NULL DEFAULT 0');
+    }
+  },
+};
+
+// Phase 16 D2. The income shape for the detection draft queue. A credit leg
+// drafts as income (sourceName, amount, currency, category, date, note,
+// origin), so a backgrounded income detection persists with every field the
+// saveIncome boundary needs instead of squeezing through the expense shape.
+// Three additive columns on the migration 9 table, each guarded so an
+// interrupted retry is a no-op:
+//
+// - kind tells expense drafts ('expense', the default every pre-D2 row reads)
+//   from income drafts ('income'). Stale, snooze, counted, and batch reads
+//   never filter on it, so both kinds age and resolve identically.
+// - origin persists the candidate origin (auto_capture). Old rows read NULL
+//   and the store falls back to auto_capture when filing them.
+// - source_name persists the income sender. Expense drafts keep NULL here and
+//   keep merchant as the name; income drafts mirror the sender into merchant
+//   as well, so every reader predating D2 (stale sheet, alert content, inbox
+//   copy) keeps rendering a real name with no change.
+//
+// The existing (status, detected_at) index already serves both kinds, so no
+// new index ships.
+//
+// One way, with the reason stated rather than left for a reader to guess:
+// there is no down(). The draft rows are the only pointer the app holds to
+// detections the user has not resolved yet, now including income drafts, and
+// inbox rows link to them. A rollback would strand pending detections and
+// orphan those links.
+const migration10: Migration = {
+  version: 10,
+  name: 'detection-draft-income-shape',
+  oneWayReason: 'A rollback would strand pending user detections, now including income drafts, and orphan the inbox rows linked to them.',
+  async up(db) {
+    const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(detection_drafts)');
+    if (!columns.some(item => item.name === 'kind')) {
+      await db.execAsync("ALTER TABLE detection_drafts ADD COLUMN kind TEXT NOT NULL DEFAULT 'expense'");
+    }
+    if (!columns.some(item => item.name === 'origin')) {
+      await db.execAsync('ALTER TABLE detection_drafts ADD COLUMN origin TEXT');
+    }
+    if (!columns.some(item => item.name === 'source_name')) {
+      await db.execAsync('ALTER TABLE detection_drafts ADD COLUMN source_name TEXT');
+    }
+  },
+};
+
+export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10];
+
+// Connection level setup, applied on every open so the settings cannot drift between
+// an install that migrated and one that opened an already current file.
+//
+// DEC-B23, the durability trade, stated here so a later reader does not have to go
+// looking for it: with WAL, `synchronous = NORMAL` stops fsyncing on every commit and
+// only syncs at checkpoints, so a sudden power loss or a battery pull can lose the
+// last commit or two instead of corrupting the file. The owner accepted that trade for
+// a local financial log, knowing it. Do not raise this back to FULL without asking
+// Kingsley, and do not lower it to OFF.
+//
+// Connection pragmas evaluated for BUG-09-11a and deliberately NOT set, each with its
+// reason:
+// - cache_size: SQLite's default 2 MiB page cache already holds the whole file for a
+//   personal expense log, and the effect of raising it is a memory and read pattern
+//   claim that cannot be measured without the device run this pass bans.
+// - mmap_size: memory mapped pages would only move the same reads off the SQLite
+//   pager onto the OS page cache, which already serves repeat reads of a file this
+//   size, and it changes WAL checkpoint behaviour in a way only a device run could
+//   clear.
+// - temp_store: forcing temp tables and sort spills into memory grows the process with
+//   the table size on exactly the low end devices that need the headroom, and the
+//   indexes added in migration 7 remove the whole table sorts that motivated it.
+// - PRAGMA optimize IS set below, because it is cheap, idempotent, and the planner
+//   needs row counts to choose between the new indexes instead of a rule of thumb.
 export async function runMigrations(db: SQLite.SQLiteDatabase, list: Migration[] = migrations): Promise<void> {
   await db.execAsync('PRAGMA journal_mode = WAL;');
+  await db.execAsync('PRAGMA synchronous = NORMAL;');
+  await db.execAsync('PRAGMA busy_timeout = 5000;');
   const current = (await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version'))?.user_version ?? 0;
   for (const migration of list.filter(item => item.version > current).sort((a, b) => a.version - b.version)) {
-    await db.execAsync('BEGIN');
+    await db.execAsync('BEGIN IMMEDIATE');
     try {
       await migration.up(db);
       await db.execAsync(`PRAGMA user_version = ${migration.version}`);
@@ -131,4 +336,7 @@ export async function runMigrations(db: SQLite.SQLiteDatabase, list: Migration[]
       throw error;
     }
   }
+  // Analyses any table that has no statistics yet and is close to a no-op once they
+  // exist, so a first open pays for the planner's row counts and later opens do not.
+  await db.execAsync('PRAGMA optimize;');
 }

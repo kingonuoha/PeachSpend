@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Keyboard,
   KeyboardAvoidingView,
+  Modal,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -15,11 +18,11 @@ import Animated, {
   withSequence,
   withTiming,
 } from 'react-native-reanimated';
-import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Briefcase, Calendar, ChevronLeft, ChevronRight, Repeat, X } from 'lucide-react-native';
+import { Briefcase, Calendar, ChevronDown, ChevronLeft, ChevronRight, Repeat, X } from 'lucide-react-native';
 import { format, isToday } from 'date-fns';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import * as Haptics from 'expo-haptics';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
@@ -28,7 +31,9 @@ import { useSettings } from '../../components/ui/SettingsProvider';
 import { useToast } from '../../components/ui/ToastProvider';
 import { PeachButton } from '../../components/ui/PeachButton';
 import { ScalePressable } from '../../components/ui/ScalePressable';
-import { VirtualNumpad } from '../../components/capture/VirtualNumpad';
+import { DockedNumpad } from '../../components/capture/DockedNumpad';
+import { DateTimeFieldSheet } from '../../components/capture/DateTimeFieldSheet';
+import { useDateTimeFieldControl } from '../../components/capture/useDateTimeFieldControl';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
 import { EntryCurrencyPicker } from '../../components/capture/EntryCurrencyPicker';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
@@ -104,7 +109,6 @@ export default function IncomeEntryScreen() {
   const { showToast } = useToast();
   const { checkForNewAchievements } = useAchievements();
 
-  const [enteredAt] = useState(() => Date.now());
   const [amount, setAmount] = useState('0.00');
   const [source, setSource] = useState('');
   const [note, setNote] = useState('');
@@ -118,6 +122,24 @@ export default function IncomeEntryScreen() {
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateMatch | null>(null);
   const [saving, setSaving] = useState<'idle' | 'checking' | 'saving'>('idle');
   const [saveFailed, setSaveFailed] = useState(false);
+  const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
+  // DEC-11-01, identical to the expense screen: the amount card owns the bottom until a
+  // text field takes focus.
+  const [isAmountActive, setAmountActive] = useState(true);
+  const [isCurrencySheetOpen, setCurrencySheetOpen] = useState(false);
+  // The date and time control is one shared implementation with the expense form.
+  const {
+    platform: dateTimePlatform,
+    value: enteredDate,
+    field: dateTimeField,
+    open: openDateTimeField,
+    dismiss: dismissDateTimeField,
+    done: doneDateTimeField,
+    switchMode: selectDateTimeMode,
+    handleChange: handleDateChange,
+  } = useDateTimeFieldControl();
+  const sourceInputRef = useRef<TextInput>(null);
+  const noteInputRef = useRef<TextInput>(null);
 
   // The user's currency may resolve after the provider loads. Track whether the
   // picker was touched so a real manual choice is never clobbered.
@@ -186,7 +208,7 @@ export default function IncomeEntryScreen() {
 
   const symbol = getCurrencySymbol(selectedCurrency);
   const originLabel = typeof params.origin === 'string' && params.origin.trim() ? params.origin.trim() : null;
-  const dateLabel = `${isToday(enteredAt) ? 'Today' : format(enteredAt, 'EEE, MMM d')} · ${format(enteredAt, 'h:mm a')}`;
+  const dateLabel = `${isToday(enteredDate) ? 'Today' : format(enteredDate, 'EEE, MMM d')} · ${format(enteredDate, 'h:mm a')}`;
 
   // Supported currencies come from the real conversion-rate map, never a local
   // hardcoded list. The active entry currency is always present even before the
@@ -201,17 +223,28 @@ export default function IncomeEntryScreen() {
     : CategoryTints.other;
   const tintColors = ts.isDark ? tint.dark : tint.light;
 
-  // Design line 1142: the source field shows a red border only once an amount is
-  // present and the source is still empty.
-  const sourceNeedsAttention = !sourceValid && parsedAmount > 0;
+  // Validation speaks only after the user has tried to save, in the same pattern the
+  // expense form uses. Nothing is red on a freshly opened form.
+  const sourceNeedsAttention = hasAttemptedSave && !sourceValid;
+  const amountNeedsAttention = hasAttemptedSave && !amountValid;
+  const categoryNeedsAttention = hasAttemptedSave && !categoryValid;
 
-  const saveLabel = !amountValid
-    ? 'Enter an Amount'
-    : !sourceValid
-      ? 'Enter Income Source'
-      : !categoryValid
-        ? 'Select a Category'
-        : `Save Income (${formatCurrency(parsedAmount, selectedCurrency)})`;
+  // Plain, constant, positive. It states the amount and currency it will save and never
+  // becomes a checklist of what is missing.
+  const saveLabel = amountValid
+    ? `Save Income (${formatCurrency(parsedAmount, selectedCurrency)})`
+    : 'Save Income';
+
+  const activateAmount = useCallback(() => {
+    Keyboard.dismiss();
+    sourceInputRef.current?.blur();
+    noteInputRef.current?.blur();
+    setAmountActive(true);
+  }, []);
+
+  const deactivateAmount = useCallback(() => {
+    setAmountActive(false);
+  }, []);
 
   const handleKeyPress = useCallback((key: string) => {
     setAmount(prev => {
@@ -235,7 +268,8 @@ export default function IncomeEntryScreen() {
   }, []);
 
   const doSave = useCallback(async (allowDuplicate = false) => {
-    if (!selectedCategory) return;
+    setHasAttemptedSave(true);
+    if (!selectedCategory || !source.trim() || parsedAmount <= 0) return;
     setSaveFailed(false);
     setSaving(allowDuplicate ? 'saving' : 'checking');
     const candidate = {
@@ -245,7 +279,7 @@ export default function IncomeEntryScreen() {
       amount: parsedAmount,
       currency: selectedCurrency,
       category: selectedCategory.id,
-      date: enteredAt,
+      date: enteredDate.getTime(),
       note: note.trim() || undefined,
       isRecurring,
       recurrenceInterval: isRecurring ? recurrenceInterval : undefined,
@@ -278,7 +312,8 @@ export default function IncomeEntryScreen() {
       });
       setSaving('idle');
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      showToast('Income saved', 'success');
+      // Plain success copy that still states exactly what was saved.
+      showToast(`Income saved: ${formatCurrency(parsedAmount, selectedCurrency)}`, 'success');
       router.back();
     } catch {
       logger.error('Failed to save income', 'save_failed');
@@ -286,7 +321,7 @@ export default function IncomeEntryScreen() {
       setSaveFailed(true);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     }
-  }, [source, parsedAmount, selectedCurrency, selectedCategory, note, enteredAt, isRecurring, recurrenceInterval, checkForNewAchievements, showToast, router]);
+  }, [source, parsedAmount, selectedCurrency, selectedCategory, note, enteredDate, isRecurring, recurrenceInterval, checkForNewAchievements, showToast, router]);
 
   const handleSave = useCallback(() => {
     if (!canSave || busy) return;
@@ -306,6 +341,7 @@ export default function IncomeEntryScreen() {
   const selectCurrency = useCallback((code: string) => {
     currencyTouched.current = true;
     setSelectedCurrency(code);
+    setCurrencySheetOpen(false);
   }, []);
 
   const openCategory = useCallback(() => {
@@ -336,14 +372,17 @@ export default function IncomeEntryScreen() {
             ) : null}
           </View>
 
-          <View
-            accessibilityLabel={`Entry currency ${selectedCurrency}`}
+          <Pressable
+            onPress={() => { void Haptics.selectionAsync(); setCurrencySheetOpen(true); }}
+            accessibilityRole="button"
+            accessibilityLabel={`Entry currency ${selectedCurrency}. Change currency`}
             style={[styles.currencyChip, { backgroundColor: ts.raw.purple100, borderColor: ts.border.primary20 }]}
           >
             <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.micro, { fontFamily: 'Manrope_700Bold', color: ts.text.primary }]}>
               {`${selectedCurrency} ${symbol}`}
             </Text>
-          </View>
+            <ChevronDown size={12} color={ts.text.primary} />
+          </Pressable>
         </View>
 
         <ScrollView
@@ -364,9 +403,12 @@ export default function IncomeEntryScreen() {
               </View>
             ) : null}
 
-            <View
-              accessibilityLabel="Income amount"
-              style={[styles.card, styles.heroCard, { backgroundColor: ts.bg.surface, borderColor: ts.isDark ? ts.raw.outline : 'transparent' }]}
+            <Pressable
+              onPress={activateAmount}
+              accessibilityRole="button"
+              accessibilityLabel={`Income amount ${amount} ${selectedCurrency}. Tap to type with the keypad`}
+              accessibilityState={{ selected: isAmountActive }}
+              style={[styles.card, styles.heroCard, { backgroundColor: ts.bg.surface, borderColor: ts.raw.successBorder }]}
             >
               <View style={styles.rowBetween}>
                 <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Income Amount</Text>
@@ -379,25 +421,22 @@ export default function IncomeEntryScreen() {
                 <Text numberOfLines={1} adjustsFontSizeToFit style={[Typography.displayLg, styles.amountValue, { color: ts.text.onSurface }]}>
                   {amount}
                 </Text>
-                <Animated.View style={[styles.cursor, { backgroundColor: ts.text.primary }, cursorStyle]} />
+                {isAmountActive ? <Animated.View style={[styles.cursor, { backgroundColor: ts.text.primary }, cursorStyle]} /> : null}
               </View>
-              <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
-                Tap to enter via shared virtual numpad below
-              </Text>
-            </View>
-
-            <View style={styles.currencySection}>
-              <Text style={[Typography.labelMd, styles.sectionLabel, { color: ts.text.onSurfaceVariant }]}>Entry Currency</Text>
-              <EntryCurrencyPicker value={selectedCurrency} options={currencyOptions} onSelect={selectCurrency} />
-            </View>
+              {amountNeedsAttention ? (
+                <Text style={[Typography.micro, { color: ts.text.error, textAlign: 'center' }]}>Add the amount you received</Text>
+              ) : (
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, textAlign: 'center' }]}>
+                  {isAmountActive ? 'Typing with the keypad below' : 'Tap the amount to reopen the keypad'}
+                </Text>
+              )}
+            </Pressable>
 
             <View style={styles.fieldBlock}>
               <View style={styles.fieldLabelRow}>
-                <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>
-                  Income Source <Text style={{ color: ts.text.error }}>*</Text>
-                </Text>
+                <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Income Source</Text>
                 {sourceNeedsAttention ? (
-                  <Text style={[Typography.micro, { color: ts.text.error }]}>Required to save</Text>
+                  <Text style={[Typography.micro, { color: ts.text.error }]}>Say where this came from</Text>
                 ) : null}
               </View>
               <View style={[styles.inputRow, { backgroundColor: ts.bg.surface, borderColor: sourceNeedsAttention ? ts.border.error20 : ts.border.card }]}>
@@ -405,8 +444,10 @@ export default function IncomeEntryScreen() {
                   <Briefcase size={14} color={ts.text.primary} />
                 </View>
                 <TextInput
+                  ref={sourceInputRef}
                   value={source}
                   onChangeText={setSource}
+                  onFocus={deactivateAmount}
                   placeholder="e.g. Employer, Client, Investment, Gift"
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -430,16 +471,18 @@ export default function IncomeEntryScreen() {
             <View style={styles.fieldBlock}>
               <View style={styles.fieldLabelRow}>
                 <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Category</Text>
-                <Text style={[Typography.micro, { color: categoryValid ? ts.text.primary : ts.raw.warning }]}>
-                  {categoryValid ? 'Selected' : 'Required'}
-                </Text>
+                {categoryNeedsAttention ? (
+                  <Text style={[Typography.micro, { color: ts.text.error }]}>Pick a category</Text>
+                ) : selectedCategory ? (
+                  <Text style={[Typography.micro, { color: ts.text.primary }]}>Selected</Text>
+                ) : null}
               </View>
               <ScalePressable
                 haptic={false}
                 accessibilityRole="button"
                 accessibilityLabel={selectedCategory ? `Category, ${selectedCategory.title}. Change category` : 'Select category'}
                 onPress={openCategory}
-                style={[styles.categoryChip, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+                style={[styles.categoryChip, { backgroundColor: ts.bg.surface, borderColor: categoryNeedsAttention ? ts.border.error20 : ts.border.card }]}
               >
                 <View style={[styles.categoryIcon, { backgroundColor: tintColors[0] }]}>
                   <CategoryGlyph iconName={selectedCategory?.icon_name} size={20} color={tintColors[1]} />
@@ -466,7 +509,13 @@ export default function IncomeEntryScreen() {
               ) : null}
             </View>
 
-            <View style={[styles.card, styles.dateCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
+            <ScalePressable
+              haptic={false}
+              accessibilityRole="button"
+              accessibilityLabel={`Date and time: ${dateLabel}. Tap to change`}
+              onPress={() => { void Haptics.selectionAsync(); openDateTimeField(); }}
+              style={[styles.card, styles.dateCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+            >
               <View style={styles.dateLeft}>
                 <View style={[styles.dateIcon, { backgroundColor: ts.raw.purple100 }]}>
                   <Calendar size={16} color={ts.text.primary} />
@@ -476,10 +525,11 @@ export default function IncomeEntryScreen() {
                   <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{dateLabel}</Text>
                 </View>
               </View>
-              <View style={[styles.autoPill, { backgroundColor: ts.bg.elevated }]}>
-                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>Auto</Text>
+              <View style={styles.changeRow}>
+                <Text style={[Typography.labelMd, { color: ts.text.primary }]}>Change</Text>
+                <ChevronRight size={16} color={ts.text.primary} />
               </View>
-            </View>
+            </ScalePressable>
 
             <View style={styles.fieldBlock}>
               <View style={styles.fieldLabelRow}>
@@ -488,8 +538,10 @@ export default function IncomeEntryScreen() {
               </View>
               <View style={[styles.inputRow, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}>
                 <TextInput
+                  ref={noteInputRef}
                   value={note}
                   onChangeText={setNote}
+                  onFocus={deactivateAmount}
                   placeholder="Add deposit notes or invoice #..."
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
@@ -507,7 +559,7 @@ export default function IncomeEntryScreen() {
                   </View>
                   <View style={styles.flex}>
                     <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Recurring Income</Text>
-                    <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>Shared S-15 recurring model</Text>
+                    <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>Same schedule the recurring screen uses</Text>
                   </View>
                 </View>
                 <ToggleSwitch
@@ -544,20 +596,13 @@ export default function IncomeEntryScreen() {
               ) : null}
             </View>
 
-            <View style={styles.keypadSection}>
-              <VirtualNumpad onKeyPress={handleKeyPress} />
-            </View>
           </Animated.View>
         </ScrollView>
 
-        <View style={styles.footer} pointerEvents="box-none">
-          <LinearGradient
-            colors={[`${ts.bg.screen}00`, ts.bg.screen]}
-            locations={[0, 0.6]}
-            style={StyleSheet.absoluteFill}
-            pointerEvents="none"
-          />
-          <View style={[styles.footerContent, { paddingBottom: Math.max(Spacing.s5, insets.bottom) }]}>
+        {isAmountActive ? <DockedNumpad onKeyPress={handleKeyPress} /> : null}
+
+        <View style={[styles.footer, { backgroundColor: ts.bg.screen, borderTopColor: ts.border.subtle }]}>
+          <View style={[styles.footerContent, { paddingBottom: Math.max(Spacing.s4, insets.bottom) }]}>
             <View style={styles.actionRow}>
               <View style={styles.cancelSlot}>
                 <PeachButton
@@ -584,6 +629,16 @@ export default function IncomeEntryScreen() {
             </View>
           </View>
         </View>
+
+        {dateTimePlatform === 'android' && dateTimeField.visible ? (
+          <DateTimePicker
+            value={enteredDate}
+            mode={dateTimeField.mode}
+            is24Hour={false}
+            onValueChange={handleDateChange}
+            onDismiss={dismissDateTimeField}
+          />
+        ) : null}
       </KeyboardAvoidingView>
 
       <CategoryPickerSheet
@@ -597,6 +652,41 @@ export default function IncomeEntryScreen() {
         onClose={() => setCategoryPickerVisible(false)}
       />
 
+      {/* One currency control on this screen: the header chip opens this sheet. */}
+      <Modal visible={isCurrencySheetOpen} transparent animationType="slide" onRequestClose={() => setCurrencySheetOpen(false)}>
+        <View style={[styles.sheetScrim, { backgroundColor: ts.bg.overlay }]}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setCurrencySheetOpen(false)} accessibilityLabel="Dismiss currency picker" />
+          <View
+            accessibilityViewIsModal
+            style={[styles.sheet, { backgroundColor: ts.raw.surface, borderColor: ts.border.card, paddingBottom: Math.max(Spacing.s4, insets.bottom) }]}
+          >
+            <View style={[styles.sheetHandle, { backgroundColor: ts.raw.outline }]} />
+            <View style={styles.sheetHeader}>
+              <View style={styles.flex}>
+                <Text accessibilityRole="header" style={[Typography.headlineMd, { color: ts.text.onSurface }]}>Entry currency</Text>
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, marginTop: 2 }]}>
+                  This decides the currency this deposit is saved in.
+                </Text>
+              </View>
+              <Pressable onPress={() => setCurrencySheetOpen(false)} accessibilityRole="button" accessibilityLabel="Close currency picker" hitSlop={8} style={styles.sheetClose}>
+                <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>Close</Text>
+              </Pressable>
+            </View>
+            <EntryCurrencyPicker value={selectedCurrency} options={currencyOptions} onSelect={selectCurrency} maxVisible={8} />
+          </View>
+        </View>
+      </Modal>
+
+      <DateTimeFieldSheet
+        visible={dateTimePlatform === 'ios' && dateTimeField.visible}
+        value={enteredDate}
+        mode={dateTimeField.mode}
+        onValueChange={handleDateChange}
+        onDismiss={dismissDateTimeField}
+        onSwitchMode={selectDateTimeMode}
+        onDone={doneDateTimeField}
+      />
+
       {duplicateWarning ? (
         <DuplicateWarningModal
           visible
@@ -607,7 +697,7 @@ export default function IncomeEntryScreen() {
             currency: selectedCurrency,
             category: selectedCategory?.id ?? '',
             type: 'income',
-            date: enteredAt,
+            date: enteredDate.getTime(),
           }}
           onSaveAnyway={() => { setDuplicateWarning(null); void doSave(true); }}
           onDiscard={() => { setDuplicateWarning(null); showToast('Duplicate discarded', 'info'); }}
@@ -640,6 +730,8 @@ const styles = StyleSheet.create({
   },
   headerCenter: { flex: 1, minWidth: 0, alignItems: 'center' },
   currencyChip: {
+    flexDirection: 'row',
+    gap: Spacing.s1,
     minWidth: 44,
     minHeight: 44,
     paddingHorizontal: Spacing.s3,
@@ -649,7 +741,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     flexShrink: 0,
   },
-  body: { paddingHorizontal: Spacing.s5, paddingTop: Spacing.s2, paddingBottom: 168, gap: Spacing.s3 },
+  // The body no longer reserves space for a floating action bar: the dock and the
+  // action bar are layout siblings under the scroll view.
+  body: { paddingHorizontal: Spacing.s5, paddingTop: Spacing.s2, paddingBottom: Spacing.s6, gap: Spacing.s3 },
   stack: { gap: Spacing.s3 },
   card: { borderWidth: 1, borderRadius: Radii.lg, padding: Spacing.s4, gap: Spacing.s2 },
   heroCard: { borderRadius: Radii.xl, borderWidth: 2, padding: Spacing.s5 },
@@ -674,8 +768,6 @@ const styles = StyleSheet.create({
   amountRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: Spacing.s2 },
   amountValue: { fontVariant: ['tabular-nums'], marginLeft: Spacing.s1 },
   cursor: { width: 2, height: CURSOR_HEIGHT, borderRadius: 1, marginLeft: 2 },
-  currencySection: { gap: Spacing.s2, paddingHorizontal: Spacing.s1 },
-  sectionLabel: { fontFamily: 'Manrope_600SemiBold' },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -704,7 +796,6 @@ const styles = StyleSheet.create({
   dateCard: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   dateLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
   dateIcon: { width: 32, height: 32, borderRadius: Radii.sm, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
-  autoPill: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s1, borderRadius: Radii.full },
   recurringCard: { gap: Spacing.s3 },
   toggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.s3 },
   toggleLeft: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3, flex: 1, minWidth: 0 },
@@ -735,12 +826,24 @@ const styles = StyleSheet.create({
   },
   frequencyOptions: { flexDirection: 'row', gap: Spacing.s2 },
   frequencyButton: { paddingHorizontal: Spacing.s3, paddingVertical: Spacing.s2, borderRadius: Radii.sm, minHeight: 44, justifyContent: 'center' },
-  keypadSection: { marginTop: Spacing.s2 },
   errorBox: { borderWidth: 1, borderRadius: Radii.md, padding: Spacing.s3, gap: Spacing.s2 },
   retry: { minHeight: 44, justifyContent: 'center' },
-  footer: { position: 'absolute', left: 0, right: 0, bottom: 0 },
-  footerContent: { paddingHorizontal: Spacing.s4, paddingTop: Spacing.s6 },
+  footer: { borderTopWidth: 1 },
+  footerContent: { paddingHorizontal: Spacing.s4, paddingTop: Spacing.s3 },
   actionRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3 },
   cancelSlot: { width: '32%' },
   saveSlot: { flex: 1 },
+  sheetScrim: { flex: 1, justifyContent: 'flex-end' },
+  sheet: {
+    width: '100%',
+    borderTopLeftRadius: Radii.xxl,
+    borderTopRightRadius: Radii.xxl,
+    borderTopWidth: 1,
+    paddingTop: Spacing.s3,
+    paddingHorizontal: Spacing.s5,
+    gap: Spacing.s3,
+  },
+  sheetHandle: { width: 40, height: 6, borderRadius: Radii.full, alignSelf: 'center' },
+  sheetHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: Spacing.s3 },
+  sheetClose: { minHeight: 44, justifyContent: 'center' },
 });
