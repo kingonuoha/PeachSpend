@@ -17,6 +17,7 @@ import {
   Bell,
   ChevronRight,
   CreditCard,
+  History,
   RefreshCw,
   Trash2,
   TrendingUp,
@@ -27,6 +28,9 @@ import { LuminousCard } from '../components/ui/LuminousCard';
 import { PeachButton } from '../components/ui/PeachButton';
 import { ScalePressable } from '../components/ui/ScalePressable';
 import { Skeleton } from '../components/ui/Skeleton';
+import { StaleReviewSheet } from '../components/ui/StaleReviewSheet';
+import { databaseService } from '../services/DatabaseService';
+import { loadStaleReview } from '../services/StaleReviewService';
 import { useToast } from '../components/ui/ToastProvider';
 import { useDataFreshness } from '../hooks/useDataFreshness';
 import { useSettings } from '../components/ui/SettingsProvider';
@@ -40,6 +44,7 @@ import type {
   NotificationRecord,
 } from '../services/DataServices';
 import { formatRelativeDate } from '../utils/dateFormat';
+import { detectionRouteFor } from '../utils/detectionDeepLink';
 
 // S-14 Notifications. Rebuilt as the single S-14 surface (FR-14.1-FR-14.3):
 // one mixed unread/read inbox whose rows route recap to S-23, transaction to S-08
@@ -327,6 +332,11 @@ export default function NotificationsScreen() {
   const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Mirrors `undo` for the unmount cleanup, which cannot read state.
   const undoRef = useRef<UndoPending | null>(null);
+  // Phase 14 M5 stale review nag. The count drives the persistent inbox
+  // section plus header badge; the sheet owns the full list and the three
+  // batch moves. A failed stale read hides the nag rather than faking one.
+  const [staleCount, setStaleCount] = useState(0);
+  const [reviewOpen, setReviewOpen] = useState(false);
 
   const unreadCount = useMemo(() => records.filter((record) => !record.read).length, [records]);
   const visible = useMemo(
@@ -338,6 +348,16 @@ export default function NotificationsScreen() {
   // (a capture, an import, a recurring run) cannot make this list wrong, so it does
   // not wake it.
   const { isStale, markFresh } = useDataFreshness(NOTIFICATION_FRESHNESS_DOMAINS);
+
+  const loadStaleCount = useCallback(async () => {
+    try {
+      const store = await databaseService.getDetectionDraftStore();
+      const stale = await loadStaleReview(store, Date.now());
+      setStaleCount(stale.length);
+    } catch {
+      setStaleCount(0);
+    }
+  }, []);
 
   const load = useCallback(async () => {
     // A held swipe delete has to land before a re-read, or the reloaded list would
@@ -362,9 +382,11 @@ export default function NotificationsScreen() {
     } finally {
       setLoading(false);
     }
-    // Read-state behavior unchanged from v1: the loaded snapshot drives the
-    // visible unread treatment, then the persisted rows are marked read so the
-    // next visit shows them as read. A failure here is non-blocking.
+    // Read-state behavior unchanged from v1 except the Phase 14 M4 carve out:
+    // the loaded snapshot drives the visible unread treatment, then the
+    // persisted rows are marked read so the next visit shows them as read. The
+    // service skips draft linked rows that are not yet accounted, so they stay
+    // unread until confirmed, discarded, or filed. A failure here is non-blocking.
     await notificationDataService.markAllRead().catch(() => undefined);
     // BUG-09-11b. The read and the read-state write it triggers are the revision
     // this screen is now current with. Recording it after the write is what stops
@@ -376,17 +398,21 @@ export default function NotificationsScreen() {
   // Refetch discipline: a focus re-reads only when something was written since the
   // last read. Today's behaviour re-ran the list query and the mark-all-read write
   // on every focus, including a focus that followed no change at all.
+  // Phase 14 M5: the stale count refreshes on every focus alongside the list,
+  // so the persistent review section plus badge never show a stale copy.
   useFocusEffect(
     useCallback(() => {
+      void loadStaleCount();
       if (!isStale()) return;
       void load();
-    }, [isStale, load]),
+    }, [isStale, load, loadStaleCount]),
   );
 
   const retry = useCallback(() => {
     setLoading(true);
     void load();
-  }, [load]);
+    void loadStaleCount();
+  }, [load, loadStaleCount]);
 
   // Pull-to-refresh re-runs the same load without the full skeleton: only the
   // native refresh spinner shows, so an existing list stays on screen while it
@@ -395,10 +421,11 @@ export default function NotificationsScreen() {
     setRefreshing(true);
     try {
       await load();
+      await loadStaleCount();
     } finally {
       setRefreshing(false);
     }
-  }, [load]);
+  }, [load, loadStaleCount]);
 
   const goBack = useCallback(() => {
     if (router.canGoBack()) router.back();
@@ -407,6 +434,15 @@ export default function NotificationsScreen() {
 
   const openRecord = useCallback(
     (record: NotificationRecord) => {
+      // Phase 14 M4 unread carve out. A draft linked row opens the same queued
+      // draft sheet as the device alert through the M2 deep link contract, and
+      // it stays unread until the draft is confirmed, discarded, or filed. No
+      // local read flip and no mark read write here; everything else behaves
+      // as today.
+      if (record.draftId) {
+        router.push(detectionRouteFor(record.draftId) as never);
+        return;
+      }
       if (!record.read) {
         setRecords((prev) =>
           prev.map((item) => (item.id === record.id ? { ...item, read: true } : item)),
@@ -440,13 +476,21 @@ export default function NotificationsScreen() {
   );
 
   const markAllReadNow = useCallback(async () => {
-    // Optimistic: flip every row to read immediately, but capture the prior rows
-    // so a failed persist rolls the UI back to the real state.
+    // Phase 14 M4 unread carve out. The optimistic flip covers only accounted
+    // rows, so a draft linked row that is not yet accounted stays unread
+    // locally exactly as the store keeps it unread, until it is confirmed,
+    // discarded, or filed. Everything else behaves as today.
     const previous = records;
-    setRecords((prev) => prev.map((record) => ({ ...record, read: true })));
+    setRecords((prev) =>
+      prev.map((record) => (record.accounted ? { ...record, read: true } : record)),
+    );
+    const skipped = records.filter((record) => !record.read && !record.accounted).length;
     try {
       await notificationDataService.markAllRead();
-      showToast('All notifications marked as read', 'success');
+      showToast(
+        skipped > 0 ? 'Marked as read except pending detections' : 'All notifications marked as read',
+        'success',
+      );
     } catch {
       setRecords(previous);
       showToast('Could not mark notifications as read.', 'error');
@@ -585,9 +629,22 @@ export default function NotificationsScreen() {
               >
                 Notifications
               </Text>
-              <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
-                {unreadLabel}
-              </Text>
+              <View style={styles.headerMeta}>
+                <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={1}>
+                  {unreadLabel}
+                </Text>
+                {staleCount > 0 ? (
+                  <View
+                    accessibilityRole="text"
+                    accessibilityLabel={`${staleCount} detections need review`}
+                    style={[styles.staleBadge, { backgroundColor: ts.raw.warningContainer }]}
+                  >
+                    <Text style={[Typography.micro, styles.semibold, { color: ts.raw.warning }]}>
+                      {`Review ${staleCount}`}
+                    </Text>
+                  </View>
+                ) : null}
+              </View>
             </View>
           </View>
 
@@ -677,6 +734,34 @@ export default function NotificationsScreen() {
         </View>
       ) : (
         <View style={styles.listWrap}>
+          {staleCount > 0 ? (
+            <View style={styles.staleWrap}>
+              <View
+                accessibilityRole="text"
+                accessibilityLabel={`${staleCount} stale detections need review`}
+                style={[styles.staleCard, { backgroundColor: ts.bg.lowest, borderColor: ts.border.card }]}
+              >
+                <View style={[styles.staleIcon, { backgroundColor: ts.raw.warningContainer }]}>
+                  <History size={18} color={ts.raw.warning} />
+                </View>
+                <View style={styles.staleText}>
+                  <Text style={[Typography.captionBold, { color: ts.raw.onSurface }]} numberOfLines={1}>
+                    {`${staleCount} ${staleCount === 1 ? 'transaction needs' : 'transactions need'} review`}
+                  </Text>
+                  <Text style={[Typography.micro, { color: ts.raw.onSurfaceVariant }]} numberOfLines={2}>
+                    Older than 72 hours. Discard, file, or assign to one category.
+                  </Text>
+                </View>
+                <PeachButton
+                  title="Review"
+                  onPress={() => setReviewOpen(true)}
+                  variant="secondary"
+                  size="sm"
+                  accessibilityLabel="Review stale detections"
+                />
+              </View>
+            </View>
+          ) : null}
           <FlatList
             data={visible}
             keyExtractor={(item) => item.id}
@@ -816,6 +901,14 @@ export default function NotificationsScreen() {
           </View>
         </View>
       </Modal>
+      <StaleReviewSheet
+        visible={reviewOpen}
+        onClose={() => setReviewOpen(false)}
+        onCompleted={() => {
+          void loadStaleCount();
+          void load();
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -844,6 +937,41 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   headerText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  headerMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s2,
+    marginTop: 2,
+  },
+  staleBadge: {
+    paddingHorizontal: Spacing.s2,
+    paddingVertical: 2,
+    borderRadius: Radii.full,
+  },
+  staleWrap: {
+    paddingHorizontal: Spacing.s4,
+    paddingTop: Spacing.s3,
+  },
+  staleCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.s3,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    padding: Spacing.s4,
+  },
+  staleIcon: {
+    width: ICON_CHIP_SIZE,
+    height: ICON_CHIP_SIZE,
+    borderRadius: Radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  staleText: {
     flex: 1,
     minWidth: 0,
   },

@@ -20,6 +20,12 @@ export interface NotificationRecord {
   createdAt: number;
   destination: NotificationDestination;
   data: Record<string, string | null>;
+  // Phase 14 D1 unread contract. Draft linked inbox rows carry the detection
+  // draft id in their data and stay unread until the draft is confirmed,
+  // discarded, or filed. Rows without a draft link are always accounted, so
+  // every existing mark all read caller behaves as today for them.
+  draftId: string | null;
+  accounted: boolean;
 }
 
 export type NotificationListState =

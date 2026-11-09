@@ -5,6 +5,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import {
   ArrowLeft,
+  BatteryCharging,
+  BatteryWarning,
   Bell,
   BellOff,
   Check,
@@ -13,12 +15,14 @@ import {
   ExternalLink,
   PauseCircle,
   Search,
+  Smartphone,
   Zap,
 } from 'lucide-react-native';
 import { useThemeStyles } from '../hooks/useThemeStyles';
 import { CategoryTints, Radii, Spacing, Typography } from '../constants/tokens';
 import { createNativeAutoCaptureAdapter } from '../data/NativeAutoCaptureAdapter';
-import { buildDiagnosticActivity, type AutoCapturePermissionState, type AutoCaptureSourceDescriptor, type CaptureEventStatus, type DiagnosticActivityState } from '../data/contracts';
+import { getAutostartGuide } from '../data/AutoCaptureSource';
+import { buildDiagnosticActivity, type AutoCapturePermissionState, type AutoCaptureSourceDescriptor, type BatteryExemptionState, type CaptureEventStatus, type DiagnosticActivityState, type GuardServiceState } from '../data/contracts';
 import { databaseService } from '../services/DatabaseService';
 import { PeachButton } from '../components/ui/PeachButton';
 import { Skeleton } from '../components/ui/Skeleton';
@@ -94,19 +98,29 @@ export default function AutoCaptureSettingsScreen() {
   const [permission, setPermission] = useState<AutoCapturePermissionState | null>(null);
   const [sources, setSources] = useState<AutoCaptureSourceDescriptor[]>([]);
   const [activity, setActivity] = useState<DiagnosticActivityState | null>(null);
+  const [battery, setBattery] = useState<BatteryExemptionState | null>(null);
+  const [guard, setGuard] = useState<GuardServiceState | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [toggleError, setToggleError] = useState(false);
   const adapter = useMemo(() => createNativeAutoCaptureAdapter(), []);
 
   const refresh = useCallback(async () => {
+    // Battery exemption and guard state only exist on Android builds with the
+    // native module. Other platforms keep null so fallback values never render
+    // as sensed claims.
+    const isNative = adapter.capability === 'available';
     try {
-      const [nextPermission, nextSources] = await Promise.all([
+      const [nextPermission, nextSources, nextBattery, nextGuard] = await Promise.all([
         adapter.getPermissionState(),
         adapter.getSupportedSources(),
+        isNative ? (adapter.getBatteryExemption?.() ?? Promise.resolve(null)) : Promise.resolve(null),
+        isNative ? (adapter.getGuardState?.() ?? Promise.resolve(null)) : Promise.resolve(null),
       ]);
       setPermission(nextPermission);
       setSources(nextSources);
+      setBattery(nextBattery);
+      setGuard(nextGuard);
       setLoadError(false);
     } catch {
       setLoadError(true);
@@ -200,10 +214,41 @@ export default function AutoCaptureSettingsScreen() {
       ? 'Available on Android only.'
       : 'Not available in this build.'
     : listenerActive
-      ? 'Background parser enabled. Drafts queue for review.'
+      ? guard && !guard.running
+        ? 'Background service paused. Reopening the app restarts it.'
+        : 'Background parser enabled. Drafts queue for review.'
       : masterEnabled
         ? 'Waiting for notification access before drafts can queue.'
         : 'Listener suspended. Notification drafts paused.';
+
+  const batteryRestricted = isAvailable && battery !== null && !battery.exempt;
+  // Prototype scenario 10 copy (code.html lines 1216-1218). Shown only from the
+  // real PowerManager read, never as a fixture.
+  const showStalledBanner = Boolean(isAvailable && masterEnabled && isGranted && batteryRestricted);
+
+  const batteryBadge = !isAvailable
+    ? null
+    : battery === null
+      ? null
+      : battery.exempt
+        ? { label: 'Unrestricted', background: ts.raw.statusSuccessContainer, color: ts.raw.statusSuccessText }
+        : { label: 'Restricted', background: ts.raw.dangerSoft, color: ts.raw.dangerContainerText };
+
+  const batteryIcon = !isAvailable || battery === null
+    ? { background: ts.bg.card, color: ts.text.onSurfaceVariant, glyph: <BatteryWarning color={ts.text.onSurfaceVariant} size={18} /> }
+    : battery.exempt
+      ? { background: successTint[0], color: successTint[1], glyph: <BatteryCharging color={successTint[1]} size={18} /> }
+      : { background: ts.raw.dangerSoft, color: ts.raw.danger, glyph: <BatteryWarning color={ts.raw.danger} size={18} /> };
+
+  const batterySub = !isAvailable
+    ? ''
+    : battery === null
+      ? ''
+      : battery.exempt
+        ? 'Unrestricted. The listener can run in the background.'
+        : 'Restricted. Android can pause the listener.';
+
+  const autostartGuide = isAvailable ? getAutostartGuide() : [];
 
   const toggleMaster = async () => {
     if (!isAvailable) return;
@@ -227,6 +272,11 @@ export default function AutoCaptureSettingsScreen() {
   const openSystemSettings = () => {
     void Haptics.selectionAsync();
     void adapter.openSystemSettings();
+  };
+
+  const openBatterySettings = () => {
+    void Haptics.selectionAsync();
+    void adapter.openBatterySettings?.();
   };
 
   return (
@@ -371,6 +421,27 @@ export default function AutoCaptureSettingsScreen() {
             </View>
           )}
 
+          {showStalledBanner && (
+            <View
+              accessibilityRole="alert"
+              accessibilityLabel="Background listener stalled"
+              style={[styles.errorBanner, { backgroundColor: ts.bg.error10, borderColor: ts.border.error20 }]}
+            >
+              <CircleAlert color={ts.icon.error} size={20} />
+              <Text style={[Typography.labelMd, { color: ts.text.error, flex: 1 }]}>
+                Background Listener Stalled: Android battery optimization paused the service. Please disable battery restrictions in system settings.
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Open battery settings"
+                onPress={openBatterySettings}
+                style={styles.retryHit}
+              >
+                <Text style={[Typography.labelLg, { color: ts.text.error }]}>Open Settings</Text>
+              </Pressable>
+            </View>
+          )}
+
           <View
             accessibilityLabel="Notification access status"
             style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
@@ -422,6 +493,117 @@ export default function AutoCaptureSettingsScreen() {
               </>
             )}
           </View>
+
+          <View
+            accessibilityLabel="Battery exemption status"
+            style={[styles.card, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+          >
+            {loading && battery === null && isAvailable ? (
+              <CardLoadingSkeleton chipSize={34} tail="pill" label="Checking battery exemption" />
+            ) : (
+              <>
+                <View style={styles.permissionTop}>
+                  <View style={styles.permissionLabelGroup}>
+                    <View style={[styles.permissionIcon, { backgroundColor: batteryIcon.background }]}>
+                      {batteryIcon.glyph}
+                    </View>
+                    <View style={styles.flex}>
+                      <Text style={[Typography.labelBold, { color: ts.text.onSurface }]}>Battery Optimization</Text>
+                      <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, marginTop: Spacing.s1 }]}>
+                        {isAvailable ? batterySub : 'Battery exemption checks run on Android only.'}
+                      </Text>
+                    </View>
+                  </View>
+                  {batteryBadge && (
+                    <View
+                      accessibilityLabel={`Battery status: ${batteryBadge.label}`}
+                      style={[styles.pill, { backgroundColor: batteryBadge.background }]}
+                    >
+                      <Text style={[Typography.micro, { color: batteryBadge.color, fontFamily: 'Manrope_700Bold' }]}>
+                        {batteryBadge.label}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                {isAvailable && battery !== null ? (
+                  <PeachButton
+                    title={battery.exempt ? 'Manage Battery Settings' : 'Remove Battery Restrictions'}
+                    onPress={openBatterySettings}
+                    variant="secondary"
+                    size="lg"
+                    fullWidth
+                    icon={<ExternalLink color={ts.text.primary} size={18} />}
+                  />
+                ) : (
+                  <View style={styles.unavailableRow}>
+                    <PauseCircle color={ts.icon.muted} size={18} />
+                    <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant, flex: 1 }]}>
+                      {isUnsupported
+                        ? 'Battery exemption runs on Android only and stays safely inactive here.'
+                        : 'This device cannot report battery exemption, so this step stays inactive.'}
+                    </Text>
+                  </View>
+                )}
+              </>
+            )}
+          </View>
+
+          {isAvailable && (
+            <>
+              <View style={styles.sectionTitleBar}>
+                <Text style={[Typography.labelBold, { color: ts.text.onSurface, flex: 1 }]}>Autostart Steps</Text>
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>
+                  {`${autostartGuide.length} brands`}
+                </Text>
+              </View>
+
+              <View
+                accessibilityLabel="Autostart setup instructions"
+                style={[styles.card, styles.listCard, { backgroundColor: ts.bg.surface, borderColor: ts.border.card }]}
+              >
+                {autostartGuide.map((entry, index) => (
+                  <View
+                    key={entry.brand}
+                    accessible
+                    accessibilityLabel={`${entry.brand}. ${entry.systemPath}`}
+                    style={[
+                      styles.guideRow,
+                      index > 0 && { borderTopWidth: 1, borderTopColor: ts.border.subtle },
+                    ]}
+                  >
+                    <View style={styles.guideHeader}>
+                      <View style={[styles.sourceChip, { backgroundColor: neutralTint[0] }]}>
+                        <Smartphone color={neutralTint[1]} size={16} />
+                      </View>
+                      <View style={styles.flex}>
+                        <Text style={[Typography.captionBold, { color: ts.text.onSurface }]} numberOfLines={1}>
+                          {entry.brand}
+                        </Text>
+                        <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant }]} numberOfLines={2}>
+                          {entry.systemPath}
+                        </Text>
+                      </View>
+                    </View>
+                    <View style={{ gap: Spacing.s1 }}>
+                      {entry.steps.map((step, stepIndex) => (
+                        <View key={step} style={styles.guideStepRow}>
+                          <Text style={[Typography.labelMd, { color: ts.text.onSurfaceVariant }]}>
+                            {`${stepIndex + 1}.`}
+                          </Text>
+                          <Text style={[Typography.labelMd, { color: ts.text.onSurface, flex: 1 }]}>
+                            {step}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                ))}
+              </View>
+              <Text style={[Typography.micro, styles.fallbackNote, { color: ts.text.onSurfaceVariant }]}>
+                Android shows no autostart status to apps, so these steps are instructions only and never a detected state.
+              </Text>
+            </>
+          )}
 
           {isAvailable && (
             <>
@@ -658,6 +840,14 @@ const styles = StyleSheet.create({
   activityAmount: { flexShrink: 0 },
   actRight: { flexDirection: 'column', alignItems: 'flex-end', gap: Spacing.s1 },
   statusDot: { width: 5, height: 5, borderRadius: Radii.full },
+  guideRow: {
+    gap: Spacing.s3,
+    minHeight: 56,
+    paddingHorizontal: Spacing.s4,
+    paddingVertical: Spacing.s3,
+  },
+  guideHeader: { flexDirection: 'row', alignItems: 'center', gap: Spacing.s3 },
+  guideStepRow: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.s2 },
   emptyState: { alignItems: 'center', paddingHorizontal: Spacing.s5, paddingVertical: Spacing.s8, gap: Spacing.s2 },
   emptyIcon: {
     width: 44,

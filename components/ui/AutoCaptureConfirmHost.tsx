@@ -6,7 +6,7 @@ import { Check, Pencil, X } from 'lucide-react-native';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { useReduceMotion } from '../../hooks/useReduceMotion';
 import { RootAutoCaptureHost } from '../../data/AutoCaptureHost';
-import type { AutoCaptureEvent, AutoCaptureHostState, CaptureCandidate, CaptureRepository, DuplicateMatch } from '../../data/contracts';
+import type { AutoCaptureEvent, AutoCaptureEventSource, AutoCaptureHostState, CaptureCandidate, CaptureRepository, DuplicateMatch } from '../../data/contracts';
 import { databaseService } from '../../services/DatabaseService';
 import { createNativeAutoCaptureAdapter } from '../../data/NativeAutoCaptureAdapter';
 import { createNotificationParser, createParsedAutoCaptureSource, parseNotificationCandidate } from '../../data/AutoCaptureSource';
@@ -18,6 +18,7 @@ import { useSettings } from './SettingsProvider';
 import { useAchievements } from './AchievementProvider';
 import { notificationService } from '../../services/NotificationService';
 import { resolveExpenseSave, runCaptureSideEffects } from '../../data/CaptureService';
+import { raiseDetectionAlert } from '../../services/DetectionAlertService';
 import { CategoryTints, Radii, Spacing, Typography } from '../../constants/tokens';
 import { formatCurrency, resolveCurrency } from '../../utils/currency';
 import { formatRelativeDateWithTime } from '../../utils/dateFormat';
@@ -90,6 +91,28 @@ export default function AutoCaptureConfirmHost() {
     let disposed = false;
     let hostUnsubscribe: (() => void) | null = null;
     let refreshGeneration = 0;
+    // Phase 14 M2 background raise for the forwarding source below. Only the
+    // native Android adapter can post the device ping, so any other platform
+    // drops the detection here, exactly like a background overlay event the
+    // host would have dropped on reconcile. Best effort throughout: a failure
+    // drops the detection rather than retrying, and no notification content
+    // is logged.
+    const raiseBackgroundDetection = (candidate: CaptureCandidate, receivedAt: number): void => {
+      if (adapter.capability !== 'available') return;
+      void (async () => {
+        const draftStore = await databaseService.getDetectionDraftStore();
+        await raiseDetectionAlert(
+          {
+            createDraft: input => draftStore.createDetectionDraft(input),
+            linkDraftRow: (draftId, notificationId) => draftStore.setDetectionDraftNotificationId(draftId, notificationId),
+            insertInboxRow: row => databaseService.insertNotification(row),
+            showAlert: content => adapter.showDetectionAlert?.(content) ?? Promise.resolve({ posted: false }),
+          },
+          candidate,
+          receivedAt,
+        );
+      })().catch(() => undefined);
+    };
     const refreshLifecycle = () => {
       const generation = ++refreshGeneration;
       void Promise.all([adapter.getPermissionState(), adapter.getSupportedSources()]).then(([permission, sources]) => {
@@ -97,8 +120,24 @@ export default function AutoCaptureConfirmHost() {
         const host = hostRef.current;
         if (!host) return;
         host.setCapability(adapter.capability, sources);
-        const source = createParsedAutoCaptureSource(adapter, createNotificationParser(parseNotificationCandidate), sources);
-        host.syncLifecycle(settings.auto_capture_enabled === 'true', permission.status, source, false);
+        const parsed = createParsedAutoCaptureSource(adapter, createNotificationParser(parseNotificationCandidate), sources);
+        // Phase 14 M2: the overlay sheet owns foreground detections. A
+        // detection that arrives while the app is backgrounded becomes a
+        // queued draft plus inbox row plus device ping instead, so one
+        // detection yields exactly one surface and a backgrounded overlay can
+        // never double handle it. Foreground behavior is byte identical.
+        const forwardingSource: AutoCaptureEventSource = {
+          capability: parsed.capability,
+          setLifecycle: (enabled, permissionStatus) => parsed.setLifecycle?.(enabled, permissionStatus),
+          subscribe: listener => parsed.subscribe(event => {
+            if (AppState.currentState === 'active') {
+              listener(event);
+              return;
+            }
+            void raiseBackgroundDetection(event.candidate, event.receivedAt);
+          }),
+        };
+        host.syncLifecycle(settings.auto_capture_enabled === 'true', permission.status, forwardingSource, false);
       });
     };
     void databaseService.getCaptureRepository().then(repository => {

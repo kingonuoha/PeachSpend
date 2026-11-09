@@ -19,6 +19,7 @@ import { CLEAR_ALL_DATA_MEDIA_SCOPE, RESET_APP_MEDIA_SCOPE } from '../data/Media
 import { eraseOwnedMediaForScope } from './MediaErasureService';
 import { markDataChanged } from '../hooks/useDataFreshness';
 import { SqliteReceiptDraftStore, type ReceiptDraftStore } from '../data/ReceiptDrafts';
+import { SqliteDetectionDraftStore, type DetectionDraftEvents } from '../data/DetectionDrafts';
 import { CategoryLimitService } from '../data/CategoryLimits';
 import { assertChatRetentionDays, chatRetentionCutoff, CHAT_RETENTION_KEY, parseChatRetentionDays, type ChatRetentionDays } from '../data/ChatRetention';
 import { BUDGET_SUGGESTION_WINDOW_DAYS, buildSuggestedMonthlyBudget, type BudgetSuggestion } from '../data/BudgetSuggestion';
@@ -240,6 +241,18 @@ class DatabaseService implements OnboardingSettingsStore, ContinuityContract {
   // repository is, so no screen holds the database handle or writes its own SQL.
   async getReceiptDraftStore(): Promise<ReceiptDraftStore> {
     return new SqliteReceiptDraftStore(await this.getDb());
+  }
+
+  // Phase 14 M2. The one detection draft store accessor, handed out the same
+  // way the receipt draft store is, so no screen holds the database handle or
+  // writes its own SQL. The events port forwards to the capture repository's
+  // recordEvent, so the queue adds no second writer for capture events.
+  async getDetectionDraftStore(): Promise<SqliteDetectionDraftStore> {
+    const repository = new SqliteCaptureRepository(await this.getDb());
+    const events: DetectionDraftEvents = {
+      recordEvent: (event: CaptureEventInput) => repository.recordEvent(event),
+    };
+    return new SqliteDetectionDraftStore(await this.getDb(), events);
   }
 
   // The single accessor for the open handle. The init() call inside is

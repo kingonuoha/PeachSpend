@@ -5,6 +5,7 @@ import type {
   AutoCaptureEventSource,
   AutoCapturePermissionState,
   AutoCaptureSourceDescriptor,
+  AutostartGuideEntry,
   CaptureCandidate,
   NativeAutoCaptureNotification,
   NativeAutoCaptureSourceAdapter,
@@ -97,6 +98,22 @@ class UnavailableAutoCaptureSourceAdapter implements NativeAutoCaptureSourceAdap
   async getSupportedSources(): Promise<AutoCaptureSourceDescriptor[]> { return []; }
   subscribe(): () => void { return () => undefined; }
   async openSystemSettings(): Promise<void> { return undefined; }
+
+  // Honest fallback where the native guard has no meaning: exemption never
+  // claimed, guard never reported running, battery screen is a no op.
+  async getBatteryExemption(): Promise<{ exempt: boolean }> { return { exempt: false }; }
+  async getGuardState(): Promise<{ running: boolean; captureEnabled: boolean; listenerGranted: boolean }> {
+    return { running: false, captureEnabled: false, listenerGranted: false };
+  }
+  async openBatterySettings(): Promise<void> { return undefined; }
+
+  // Phase 14 M2 honest fallbacks where the native alert has no meaning: the
+  // device ping is never posted, the drain is always empty, and no listener
+  // is ever registered, so iOS and Expo Go keep inbox only behavior.
+  async showDetectionAlert(): Promise<{ posted: boolean }> { return { posted: false }; }
+  async cancelDetectionAlert(): Promise<void> { return undefined; }
+  subscribeAlertActions(): () => void { return () => undefined; }
+  async consumePendingAlertAction(): Promise<null> { return null; }
 }
 
 export function createOptionalAutoCaptureSourceAdapter(
@@ -276,3 +293,76 @@ function inferCurrency(text: string, userCurrency?: string | null): string {
 }
 
 export function getUnavailableReason(): string { return UNAVAILABLE_REASON; }
+
+// Phase 14 M1 autostart guide. Android exposes no API that reports whether an
+// OEM autostart manager allows this app, so every row is static instructions
+// written from public settings paths, never a sensed state. The guide always
+// opens with the generic row; brand rows narrow the path where the location
+// differs. No row claims the app verified anything on device.
+export const AUTOSTART_GUIDE: readonly AutostartGuideEntry[] = Object.freeze([
+  {
+    brand: 'Generic Android',
+    systemPath: 'Settings > Apps > PeachSpend > Battery',
+    steps: [
+      'Open Settings, then Apps, then PeachSpend.',
+      'Open Battery and choose Unrestricted.',
+      'If the phone maker list below matches this device, follow that row too.',
+    ],
+  },
+  {
+    brand: 'Samsung',
+    systemPath: 'Settings > Battery > Background usage limits',
+    steps: [
+      'Open Settings, then Battery, then Background usage limits.',
+      'Make sure PeachSpend is not in Sleeping apps or Deep sleeping apps.',
+      'Open Settings, then Apps, then PeachSpend, then Battery, and choose Unrestricted.',
+    ],
+  },
+  {
+    brand: 'Xiaomi',
+    systemPath: 'Settings > Apps > Manage apps > PeachSpend',
+    steps: [
+      'Open Settings, then Apps, then Manage apps, then PeachSpend.',
+      'Turn on Autostart.',
+      'Open Battery saver and choose No restrictions.',
+    ],
+  },
+  {
+    brand: 'Huawei',
+    systemPath: 'Settings > Battery > App launch',
+    steps: [
+      'Open Settings, then Battery, then App launch.',
+      'Turn off Manage automatically for PeachSpend.',
+      'Turn on Auto-launch, Secondary launch, and Run in background, then confirm.',
+    ],
+  },
+  {
+    brand: 'Oppo and Realme',
+    systemPath: 'Settings > Apps > PeachSpend > Battery usage',
+    steps: [
+      'Open Settings, then Apps, then PeachSpend.',
+      'Open Battery usage and choose Allow background activity.',
+      'Open Settings, then Battery, then App auto-launch, and allow PeachSpend.',
+    ],
+  },
+  {
+    brand: 'Vivo',
+    systemPath: 'Settings > Battery > Background power consumption management',
+    steps: [
+      'Open Settings, then Battery, then Background power consumption management.',
+      'Allow PeachSpend to run in the background.',
+      'Open Settings, then Apps, then PeachSpend, then Battery, and choose Unrestricted.',
+    ],
+  },
+  {
+    brand: 'OnePlus',
+    systemPath: 'Settings > Apps > PeachSpend > Battery',
+    steps: [
+      'Open Settings, then Apps, then PeachSpend, then Battery.',
+      'Choose Unrestricted or Allow background activity.',
+      'Open Recent apps, pull down on PeachSpend, and lock it if the lock option appears.',
+    ],
+  },
+]);
+
+export function getAutostartGuide(): readonly AutostartGuideEntry[] { return AUTOSTART_GUIDE; }

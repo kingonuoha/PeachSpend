@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Phase 14 M2: collapsed face of the rich detection alert. The expanded layout
+  carries the transaction details; this row stays compact (merchant plus amount)
+  so the collapsed shade shows the same parsed fields and nothing else. Colors
+  resolve from the OS notification theme (?android:attr) so the row stays
+  readable on light and dark shades. Type is the packaged Manrope pair vendored
+  in res/font (same family the app renders, already a dependency). Sizes are sp,
+  padding dp, no fixed pixel widths: the row stretches to the shade width. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:layout_width="match_parent"
+  android:layout_height="wrap_content"
+  android:orientation="horizontal"
+  android:gravity="center_vertical"
+  android:paddingStart="16dp"
+  android:paddingEnd="16dp"
+  android:paddingTop="12dp"
+  android:paddingBottom="12dp">
+
+  <LinearLayout
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:layout_weight="1"
+    android:orientation="vertical">
+
+    <TextView
+      android:id="@+id/detection_title"
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:fontFamily="@font/manrope_semibold"
+      android:textSize="14sp"
+      android:textColor="?android:attr/textColorPrimary"
+      android:singleLine="true"
+      android:ellipsize="end" />
+
+    <TextView
+      android:id="@+id/detection_source"
+      android:layout_width="wrap_content"
+      android:layout_height="wrap_content"
+      android:fontFamily="@font/manrope_regular"
+      android:textSize="12sp"
+      android:textColor="?android:attr/textColorSecondary"
+      android:singleLine="true"
+      android:ellipsize="end" />
+  </LinearLayout>
+
+  <TextView
+    android:id="@+id/detection_amount"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:layout_marginStart="12dp"
+    android:fontFamily="@font/manrope_semibold"
+    android:textSize="16sp"
+    android:textColor="?android:attr/textColorPrimary"
+    android:singleLine="true" />
+</LinearLayout>

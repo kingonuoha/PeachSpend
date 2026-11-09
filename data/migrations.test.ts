@@ -47,13 +47,14 @@ describe('SQLite migration upgrades', () => {
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'category', 'date', 'created_at']));
     db.tables.set('income', new Set(['id', 'source', 'amount', 'currency', 'date', 'created_at']));
     await runMigrations(db as never, migrations);
-    expect(db.userVersion).toBe(8);
+    expect(db.userVersion).toBe(9);
     expect(db.tables.get('income')?.has('category')).toBe(true);
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     expect(db.tables.get('capture_queue')?.has('expires_at')).toBe(true);
     expect(db.tables.get('merchant_category_memory')?.has('category')).toBe(true);
     expect(db.tables.get('expenses')?.has('source')).toBe(true);
     expect(db.tables.has('receipt_drafts')).toBe(true);
+    expect(db.tables.has('detection_drafts')).toBe(true);
   });
 
   it('rolls back version advancement when migration fails', async () => {
@@ -70,7 +71,7 @@ describe('SQLite migration upgrades', () => {
     db.tables.set('capture_queue', new Set(['id', 'payload', 'created_at', 'expires_at']));
     db.tables.set('expenses', new Set(['id', 'source']));
     await runMigrations(db as never, migrations);
-    expect(db.userVersion).toBe(8);
+    expect(db.userVersion).toBe(9);
     expect(db.tables.get('capture_queue')).toEqual(new Set(['id', 'payload', 'created_at', 'expires_at']));
     expect(db.tables.get('expenses')).toEqual(new Set(['id', 'source']));
   });
@@ -161,14 +162,14 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
     expect([...db.indexes]).toEqual([]);
   });
 
-  it('runs inside the runner as version 8 and leaves an existing row untouched', async () => {
+  it('runs inside the runner as version 9 and leaves an existing row untouched', async () => {
     const db = new MigrationDatabase();
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'note', 'scanned', 'date', 'created_at']));
 
     await runMigrations(db as never, migrations);
 
-    expect(db.userVersion).toBe(8);
-    expect(CURRENT_SCHEMA_VERSION).toBe(8);
+    expect(db.userVersion).toBe(9);
+    expect(CURRENT_SCHEMA_VERSION).toBe(9);
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     EXPECTED_INDEXES.forEach(index => expect(db.indexes.has(index)).toBe(true));
   });
@@ -260,14 +261,98 @@ describe('migration 8, receipt draft store (D2, ESC-11-09)', () => {
     db.userVersion = 7;
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'note', 'scanned', 'date', 'created_at', 'source']));
 
-    await runMigrations(db as never, migrations);
+    const v8 = migrations.filter(migration => migration.version <= 8);
+    await runMigrations(db as never, v8);
 
     expect(db.userVersion).toBe(8);
-    expect(CURRENT_SCHEMA_VERSION).toBe(8);
     expect(db.tables.has('receipt_drafts')).toBe(true);
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     // The classifier still reads a file written at this version as a v2 file.
     expect(classifyContinuitySchema(8, true)).toBe('v2');
     expect(classifyContinuitySchema(8, false)).toBe('v2');
+  });
+});
+
+// Phase 14 D1. Migration 9 creates the detection draft queue plus the inbox
+// accounted flag, and nothing else. These tests pin the parts a later reader
+// could quietly break: that it is additive, idempotent on an interrupted
+// retry, documented as one way for a stated product reason, and that it
+// leaves every existing table alone.
+describe('migration 9, detection draft queue (D1)', () => {
+  const migration9 = () => {
+    const found = migrations.find(migration => migration.version === 9);
+    if (!found) throw new Error('migration 9 is missing from the migration list');
+    return found;
+  };
+
+  it('creates the draft table with the columns the store reads', async () => {
+    const db = new MigrationDatabase();
+
+    await migration9().up(db as never);
+
+    expect(migration9().name).toBe('detection-draft-queue');
+    expect(db.tables.get('detection_drafts')).toEqual(new Set([
+      'id', 'merchant', 'amount', 'currency', 'category', 'note', 'source', 'detected_at',
+      'snoozed_until', 'status', 'notification_id', 'created_at', 'updated_at',
+    ]));
+  });
+
+  it('adds the status index and the notifications accounted column', async () => {
+    const db = new MigrationDatabase();
+    db.tables.set('notifications', new Set(['id', 'title', 'body', 'type', 'data', 'read', 'created_at']));
+
+    await migration9().up(db as never);
+
+    expect(db.indexes.has('idx_detection_drafts_status_detected_at')).toBe(true);
+    expect(db.tables.get('notifications')?.has('accounted')).toBe(true);
+  });
+
+  it('re-runs without duplicating and keeps the guarded column add once', async () => {
+    const db = new MigrationDatabase();
+    db.tables.set('notifications', new Set(['id', 'title', 'body', 'type', 'data', 'read', 'created_at']));
+
+    await migration9().up(db as never);
+    await migration9().up(db as never);
+
+    expect(db.indexes.has('idx_detection_drafts_status_detected_at')).toBe(true);
+    expect(db.statements.filter(statement => statement.includes('ADD COLUMN accounted'))).toHaveLength(1);
+  });
+
+  it('leaves every existing table untouched', async () => {
+    const db = new MigrationDatabase();
+    db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'date', 'created_at']));
+    db.tables.set('capture_queue', new Set(['id', 'source', 'payload', 'attempts', 'available_at', 'last_error_code', 'created_at', 'expires_at']));
+    const expensesBefore = [...(db.tables.get('expenses') ?? [])].sort();
+    const queueBefore = [...(db.tables.get('capture_queue') ?? [])].sort();
+
+    await migration9().up(db as never);
+
+    expect([...(db.tables.get('expenses') ?? [])].sort()).toEqual(expensesBefore);
+    expect([...(db.tables.get('capture_queue') ?? [])].sort()).toEqual(queueBefore);
+    expect(db.statements.join(' ')).not.toContain('ALTER TABLE expenses');
+    expect(db.statements.join(' ')).not.toContain('ALTER TABLE capture_queue');
+  });
+
+  it('is documented as one way with the reason, because a rollback would strand pending detections', async () => {
+    const target = migration9();
+
+    expect(target.down).toBeUndefined();
+    expect(target.oneWayReason).toMatch(/strand pending user detections/);
+  });
+
+  it('brings an existing v8 file to version 9 and keeps its rows', async () => {
+    const db = new MigrationDatabase();
+    db.userVersion = 8;
+    db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'note', 'scanned', 'date', 'created_at', 'source']));
+
+    await runMigrations(db as never, migrations);
+
+    expect(db.userVersion).toBe(9);
+    expect(CURRENT_SCHEMA_VERSION).toBe(9);
+    expect(db.tables.has('detection_drafts')).toBe(true);
+    expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
+    // The classifier still reads a file written at this version as a v2 file.
+    expect(classifyContinuitySchema(9, true)).toBe('v2');
+    expect(classifyContinuitySchema(9, false)).toBe('v2');
   });
 });

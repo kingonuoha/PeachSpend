@@ -36,9 +36,24 @@ export function resolveNotificationDestination(
   return { screen: null };
 }
 
-export function toNotificationRecord(row: StoredNotification): NotificationRecord {
+// The inbox link a detection inbox row carries in its data payload. Set once
+// at creation by the detection alert path; read here by the S-14 path and
+// written nowhere else in the data layer.
+export function getDraftNotificationLink(data: Record<string, string | null>): string | null {
+  return typeof data.draftId === 'string' && data.draftId ? data.draftId : null;
+}
+
+// Mark all read targets: every accounted row. Draft linked rows that are not
+// yet accounted are skipped, so they stay unread until confirmed, discarded,
+// or filed. All other rows behave as today.
+export function selectMarkAllReadTargets(records: NotificationRecord[]): string[] {
+  return records.filter(record => record.accounted).map(record => record.id);
+}
+
+export function toNotificationRecord(row: StoredNotification & { accounted?: number | null }): NotificationRecord {
   const data = parseNotificationData(row.data);
   const kind = mapNotificationKind(row.type);
+  const draftId = getDraftNotificationLink(data);
   return {
     id: row.id,
     title: row.title,
@@ -48,6 +63,11 @@ export function toNotificationRecord(row: StoredNotification): NotificationRecor
     createdAt: row.created_at,
     destination: resolveNotificationDestination(kind, data),
     data,
+    draftId,
+    // A row with no draft link is always accounted, so non draft rows behave
+    // as today. A draft linked row is accounted only once a resolve operation
+    // (confirm, discard, file) sets the stored flag; nothing else writes it.
+    accounted: draftId === null ? true : row.accounted === 1,
   };
 }
 
@@ -73,11 +93,23 @@ export class NotificationDataService {
   }
 
   async markRead(id: string): Promise<void> {
+    // A draft linked row that is not yet accounted stays unread until it is
+    // confirmed, discarded, or filed, so an explicit mark read skips it the
+    // same way mark all read does. Everything else behaves as today.
+    const records = (await this.source.getNotifications()).map(toNotificationRecord);
+    const target = records.find(record => record.id === id);
+    if (!target || !target.accounted) return;
     await this.source.markNotificationRead(id);
   }
 
   async markAllRead(): Promise<void> {
-    await this.source.markAllNotificationsRead();
+    // The existing mark all read path keys on the accounted flag: draft
+    // linked rows that are not yet accounted are skipped, all other rows are
+    // marked through the same per row write as before.
+    const records = (await this.source.getNotifications()).map(toNotificationRecord);
+    for (const id of selectMarkAllReadTargets(records)) {
+      await this.source.markNotificationRead(id);
+    }
   }
 
   async delete(id: string): Promise<NotificationDeleteResult> {

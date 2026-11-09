@@ -33,6 +33,20 @@ const rowToExpense = (candidate: CaptureCandidate, id: string): Expense => ({
   note: candidate.note, scanned: candidate.scanned ? 1 : 0, date: candidate.date, created_at: Date.now(), image_uri: candidate.imageUri,
   unit_price: candidate.unitPrice, units: candidate.units, is_reimbursable: candidate.isReimbursable ? 1 : 0, source: candidate.source,
 });
+
+// Shared expense write pieces. save() below and the Phase 14 stale queue filing
+// path build the same row through these helpers, so a column change lands in one
+// place. The filing path still performs its own INSERT because it must skip the
+// per-merchant memory write that save() performs (DEC-14-03).
+export const EXPENSE_INSERT_SQL = 'INSERT INTO expenses (id, merchant, amount, currency, category, note, scanned, date, created_at, image_uri, unit_price, units, is_reimbursable, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+
+export function buildExpenseRecord(candidate: CaptureCandidate, id: string): Expense {
+  return rowToExpense(candidate, id);
+}
+
+export function expenseInsertParams(expense: Expense): (string | number | null)[] {
+  return [expense.id, expense.merchant, expense.amount, expense.currency, expense.category, expense.note || null, expense.scanned, expense.date, expense.created_at, expense.image_uri || null, expense.unit_price ?? null, expense.units ?? null, expense.is_reimbursable ?? 0, expense.source ?? null];
+}
 const rowToCaptureEvent = (row: { id: string; source: string; status: string; merchant: string | null; amount: number | null; category: string | null; error_code: string | null; created_at: number; updated_at: number }): CaptureEventRead => ({
   id: row.id, source: row.source as CaptureSource, status: row.status as CaptureEventRead['status'], merchant: row.merchant,
   amount: row.amount, category: row.category, errorCode: row.error_code, createdAt: row.created_at, updatedAt: row.updated_at,
@@ -70,8 +84,8 @@ export class SqliteCaptureRepository implements CaptureRepository {
     const duplicate = allowDuplicate ? null : await this.findDuplicate(resolvedCandidate);
     if (duplicate) throw new Error('duplicate');
     const id = uuid();
-    const expense = rowToExpense(resolvedCandidate, id);
-    await this.db.runAsync('INSERT INTO expenses (id, merchant, amount, currency, category, note, scanned, date, created_at, image_uri, unit_price, units, is_reimbursable, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [expense.id, expense.merchant, expense.amount, expense.currency, expense.category, expense.note || null, expense.scanned, expense.date, expense.created_at, expense.image_uri || null, expense.unit_price ?? null, expense.units ?? null, expense.is_reimbursable ?? 0, expense.source ?? null]);
+    const expense = buildExpenseRecord(resolvedCandidate, id);
+    await this.db.runAsync(EXPENSE_INSERT_SQL, expenseInsertParams(expense));
     await this.rememberCategory(resolvedCandidate.merchant, resolvedCandidate.category, resolvedCandidate.source);
     await this.recordEvent({ source: resolvedCandidate.source, status: 'confirmed', merchant: resolvedCandidate.merchant, amount: resolvedCandidate.amount, category: resolvedCandidate.category, payload: JSON.stringify({ origin: resolvedCandidate.origin ?? 'home' }) });
     return expense;

@@ -36,6 +36,8 @@ import { recurringService, RECURRING_TASK_NAME } from '../services/RecurringServ
 import { cleanupService } from '../services/CleanupService';
 import { aiChatService } from '../services/AIChatService';
 import AutoCaptureConfirmHost from '../components/ui/AutoCaptureConfirmHost';
+import DetectionAlertActionHost from '../components/ui/DetectionAlertActionHost';
+import { StaleReviewHost } from '../components/ui/StaleReviewHost';
 import { canUseNativeRuntime, isExpoGoRuntime } from '../utils/runtimeEnvironment';
 import { createShareIntentHandoff } from '../utils/shareIntentHandoff';
 
@@ -295,6 +297,8 @@ export default function RootLayout() {
                   <StreakGate>
                     {canUseNativeRuntime('expo-share-intent') && <ShareIntentHandler />}
                    <AutoCaptureConfirmHost />
+                   <DetectionAlertActionHost />
+                   <StaleReviewHost />
                    <Stack
                   screenOptions={{
                     headerShown: false,
@@ -308,6 +312,7 @@ export default function RootLayout() {
                   <Stack.Screen name="expense/manual" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
                   <Stack.Screen name="expense-review" options={{ presentation: 'modal' }} />
                   <Stack.Screen name="expense/[id]" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
+                  <Stack.Screen name="detection/[id]" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
                   <Stack.Screen name="privacy-policy" options={{ animation: 'slide_from_right' }} />
                   <Stack.Screen name="support-center" options={{ animation: 'slide_from_right' }} />
                   <Stack.Screen name="notifications" options={{ animation: 'slide_from_right' }} />

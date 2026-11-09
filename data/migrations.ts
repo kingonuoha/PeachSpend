@@ -217,7 +217,41 @@ const migration8: Migration = {
   },
 };
 
-export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8];
+// Phase 14 D1. The detection draft queue plus the inbox accounted flag. A
+// detection that awaits user confirmation is persisted here with its first
+// detection time, an optional snooze timestamp, and a link to its inbox row,
+// so it survives reboot and can age into the stale review queue. The
+// accounted column on notifications is the unread contract the S-14 read
+// path keys on: draft linked rows stay unread until a resolve operation sets
+// it, and nothing else writes it.
+//
+// The composite index serves the two statements this table has. The stale
+// read filters `WHERE status = ? AND detected_at < ?` oldest first, and the
+// pending list reads `WHERE status = ?` oldest first. One (status,
+// detected_at) index serves both, because SQLite can scan an index in either
+// direction.
+//
+// One way, with the reason stated rather than left for a reader to guess:
+// there is no down(). The draft rows are the only pointer the app holds to
+// detections the user has not resolved yet, and inbox rows link to them. A
+// rollback would strand pending detections and orphan those links.
+const migration9: Migration = {
+  version: 9,
+  name: 'detection-draft-queue',
+  oneWayReason: 'A rollback would strand pending user detections and orphan the inbox rows linked to them.',
+  async up(db) {
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS detection_drafts (id TEXT PRIMARY KEY NOT NULL, merchant TEXT NOT NULL, amount REAL NOT NULL, currency TEXT NOT NULL, category TEXT NOT NULL, note TEXT, source TEXT NOT NULL, detected_at INTEGER NOT NULL, snoozed_until INTEGER, status TEXT NOT NULL, notification_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_detection_drafts_status_detected_at ON detection_drafts(status, detected_at);
+    `);
+    const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(notifications)');
+    if (!columns.some(item => item.name === 'accounted')) {
+      await db.execAsync('ALTER TABLE notifications ADD COLUMN accounted INTEGER NOT NULL DEFAULT 0');
+    }
+  },
+};
+
+export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9];
 
 // Connection level setup, applied on every open so the settings cannot drift between
 // an install that migrated and one that opened an already current file.

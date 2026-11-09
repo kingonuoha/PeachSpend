@@ -3,6 +3,9 @@ package expo.modules.autocapture
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
@@ -10,7 +13,7 @@ import expo.modules.kotlin.modules.ModuleDefinition
 class AutoCaptureModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ExpoAutoCapture")
-    Events("onNotification")
+    Events("onNotification", "onAlertAction")
 
     AsyncFunction("getPermissionState") { mapOf(
       "status" to if (isListenerEnabled()) "granted" else "denied",
@@ -33,15 +36,60 @@ class AutoCaptureModule : Module() {
     }
 
     AsyncFunction("setLifecycle") { enabled: Boolean, permission: String ->
-      setCaptureEnabled(appContext.reactContext, enabled && permission == "granted")
+      val granted = enabled && permission == "granted"
+      setCaptureEnabled(appContext.reactContext, granted)
+      syncGuardService(appContext.reactContext, granted)
+    }
+
+    AsyncFunction("getBatteryExemption") {
+      mapOf("exempt" to isBatteryExempt(appContext.reactContext))
+    }
+
+    AsyncFunction("openBatterySettings") {
+      openBatterySettings(appContext.reactContext)
+    }
+
+    // Phase 14 M2 rich detection alert. The builder posts an expanded custom
+    // notification with Confirm, Edit, and Remind later actions; Confirm and
+    // Remind later land in AutoCaptureAlertReceiver, which records the intent
+    // for the JS drain instead of writing any table. Edit and the content tap
+    // are deep links into the queued draft sheet. All strings arrive
+    // preformatted from JS (parsed fields only); nothing is logged here.
+    AsyncFunction("showDetectionAlert") { draftId: String, merchant: String, amountText: String, sourceLabel: String, timeText: String ->
+      val context = appContext.reactContext
+      mapOf("posted" to (context?.let { AutoCaptureDetectionAlert.show(it, draftId, merchant, amountText, sourceLabel, timeText) } ?: false))
+    }
+
+    AsyncFunction("cancelDetectionAlert") { draftId: String ->
+      appContext.reactContext?.let { AutoCaptureDetectionAlert.cancel(it, draftId) }
+    }
+
+    // Drains one durable receiver action per call, oldest first. The JS action
+    // host loops until null. Returns null when nothing is pending.
+    AsyncFunction("consumePendingAlertAction") {
+      val context = appContext.reactContext
+      context?.let { AutoCaptureAlertReceiver.consumePendingAction(it) }
+    }
+
+    // Phase 14 M1 setup state for S-22 (M3). The running flag tracks the guard
+    // service process only; autostart state has no detection API, so the guide
+    // ships as static instructions in TS and never as a sensed value here.
+    AsyncFunction("getGuardState") {
+      val context = appContext.reactContext
+      mapOf(
+        "running" to guardRunning,
+        "captureEnabled" to (context?.let(::isCaptureEnabled) ?: false),
+        "listenerGranted" to (context?.let(::isListenerEnabled) ?: false),
+      )
     }
 
     OnCreate {
-      setCaptureEnabled(appContext.reactContext, false)
+      // Phase 14 M1: the persisted capture toggle must survive process start so
+      // the boot receiver can re arm after reboot. Lifecycle ownership rests
+      // with setLifecycle (JS) plus the boot receiver, never with a reset here.
       listener = this@AutoCaptureModule
     }
     OnDestroy {
-      setCaptureEnabled(appContext.reactContext, false)
       if (listener === this@AutoCaptureModule) listener = null
     }
   }
@@ -120,6 +168,11 @@ class AutoCaptureModule : Module() {
       "com.vfd.app" to "Vbank",
     )
     private var listener: AutoCaptureModule? = null
+    private var guardRunning: Boolean = false
+
+    fun setGuardRunning(running: Boolean) {
+      guardRunning = running
+    }
 
     fun isSupportedPackage(packageName: String): Boolean = supportedPackages.contains(packageName)
     fun displayName(packageName: String): String = displayNames[packageName] ?: "Supported payment app"
@@ -128,6 +181,18 @@ class AutoCaptureModule : Module() {
       val context = listener?.appContext?.reactContext ?: return
       if (!isCaptureEnabled(context)) return
       listener?.sendEvent("onNotification", payload)
+    }
+
+    // Phase 14 M2: live delivery of a receiver action intent to JS. Best
+    // effort only; the receiver persists the record first, so a dead runtime
+    // loses nothing and the JS drain picks it up on the next start.
+    fun publishAlertAction(draftId: String, action: String) {
+      val context = listener?.appContext?.reactContext ?: return
+      if (!isCaptureEnabled(context)) return
+      listener?.sendEvent(
+        "onAlertAction",
+        mapOf("draftId" to draftId, "action" to action, "receivedAt" to System.currentTimeMillis().toString()),
+      )
     }
 
     fun isCaptureEnabled(context: Context): Boolean = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
@@ -144,6 +209,53 @@ class AutoCaptureModule : Module() {
         ?.edit()
         ?.putBoolean(CAPTURE_ENABLED_KEY, enabled)
         ?.commit()
+    }
+
+    // Battery exemption is directly detectable via PowerManager (API 23 and up).
+    // Below API 23 there is no Doze allowlist, so the check reads as exempt.
+    private fun isBatteryExempt(context: Context?): Boolean {
+      if (context == null) return false
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+      val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+      return try {
+        power.isIgnoringBatteryOptimizations(context.packageName)
+      } catch (_: Exception) {
+        false
+      }
+    }
+
+    private fun openBatterySettings(context: Context?) {
+      if (context == null) return
+      val direct = try {
+        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${context.packageName}"))
+          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      } catch (_: Exception) {
+        null
+      }
+      try {
+        if (direct != null) context.startActivity(direct)
+      } catch (_: Exception) {
+        try {
+          context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) {
+          return
+        }
+      }
+    }
+
+    private fun syncGuardService(context: Context?, enabled: Boolean) {
+      if (context == null) return
+      try {
+        val guard = Intent(context, AutoCaptureGuardService::class.java)
+        if (enabled) {
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(guard)
+          else context.startService(guard)
+        } else {
+          context.stopService(guard)
+        }
+      } catch (_: Exception) {
+        return
+      }
     }
   }
 }
