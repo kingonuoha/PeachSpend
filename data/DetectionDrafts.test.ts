@@ -1,18 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { Expense } from '../types/database';
+import type { Expense, Income } from '../types/database';
 import {
   DRAFT_SNOOZE_MS,
   STALE_AFTER_MS,
   SqliteDetectionDraftStore,
   UNCATEGORIZED_FILING_CATEGORY,
   buildFilingNote,
+  incomeSourceNameOf,
+  isIncomeDraft,
   isRePingSuppressed,
   isStaleDraft,
+  normalizeDraftKind,
+  toIncomeCandidate,
   DetectionDraftValidationError,
   type DetectionDraft,
   type DetectionDraftInput,
+  type IncomeDetectionDraftInput,
 } from './DetectionDrafts';
-import type { CaptureEventInput } from './contracts';
+import type { CaptureEventInput, IncomeCandidate } from './contracts';
 
 // The store is exercised against a fake that keeps rows and honours the
 // statements the store issues. An unrecognised statement throws instead of
@@ -33,6 +38,9 @@ interface FakeDraftRow {
   notification_id: string | null;
   created_at: number;
   updated_at: number;
+  kind: string | null;
+  origin: string | null;
+  source_name: string | null;
 }
 
 const NOW = 1_000_000_000_000;
@@ -40,17 +48,19 @@ const NOW = 1_000_000_000_000;
 class FakeDetectionDatabase {
   rows: FakeDraftRow[] = [];
   expenseMerges: unknown[][] = [];
+  incomeMerges: unknown[][] = [];
   accountedNotifications: string[] = [];
   statements: string[] = [];
   userCurrency: string | null = 'USD';
   failExpenseInsertForMerchant = new Set<string>();
+  failIncomeInsertForSource = new Set<string>();
 
   async runAsync(sql: string, params: unknown[] = []): Promise<void> {
     this.statements.push(sql);
     if (sql.startsWith('INSERT INTO detection_drafts')) {
-      const [id, merchant, amount, currency, category, note, source, detected_at, snoozed_until, status, notification_id, created_at, updated_at] =
-        params as [string, string, number, string, string, string | null, string, number, number | null, string, string | null, number, number];
-      this.rows.push({ id, merchant, amount, currency, category, note, source, detected_at, snoozed_until, status, notification_id, created_at, updated_at });
+      const [id, merchant, amount, currency, category, note, source, detected_at, snoozed_until, status, notification_id, created_at, updated_at, kind, origin, source_name] =
+        params as [string, string, number, string, string, string | null, string, number, number | null, string, string | null, number, number, string | null, string | null, string | null];
+      this.rows.push({ id, merchant, amount, currency, category, note, source, detected_at, snoozed_until, status, notification_id, created_at, updated_at, kind, origin, source_name });
       return;
     }
     if (sql.startsWith('UPDATE detection_drafts SET snoozed_until')) {
@@ -77,6 +87,11 @@ class FakeDetectionDatabase {
     if (sql.startsWith('INSERT INTO expenses')) {
       if (this.failExpenseInsertForMerchant.has(params[1] as string)) throw new Error('write_failed');
       this.expenseMerges.push(params);
+      return;
+    }
+    if (sql.startsWith('INSERT INTO income')) {
+      if (this.failIncomeInsertForSource.has(params[1] as string)) throw new Error('write_failed');
+      this.incomeMerges.push(params);
       return;
     }
     throw new Error(`unrecognised statement: ${sql}`);
@@ -130,6 +145,19 @@ const input = (overrides: Partial<DetectionDraftInput> = {}): DetectionDraftInpu
 const at = (hoursAgo: number): number => NOW - hoursAgo * 60 * 60 * 1000;
 
 const savedExpense = (id: string): Expense => ({ id, merchant: 'Shoprite', amount: 12500, currency: 'NGN', category: 'groceries', scanned: 0, date: NOW, created_at: NOW }) as Expense;
+
+const savedIncome = (id: string): Income => ({ id, source: 'KINGSLEY U', amount: 2000, currency: 'NGN', category: 'other', date: NOW, created_at: NOW }) as Income;
+
+const incomeInput = (overrides: Partial<IncomeDetectionDraftInput> = {}): IncomeDetectionDraftInput => ({
+  sourceName: 'KINGSLEY U',
+  amount: 2000,
+  currency: 'NGN',
+  category: 'other',
+  note: 'Detected from Messages',
+  source: 'auto_capture',
+  origin: 'auto_capture',
+  ...overrides,
+});
 
 describe('detection draft stale query', () => {
   it('ships the stale window as one named 72 hour constant', () => {
@@ -415,5 +443,248 @@ describe('detection draft helpers', () => {
     expect(buildFilingNote('Lunch')).toBe('Lunch | Filed from stale review');
     expect(buildFilingNote(null)).toBe('Filed from stale review');
     expect(buildFilingNote('  ')).toBe('Filed from stale review');
+  });
+});
+
+// Phase 16 D2. Income drafts persist with every field the saveIncome boundary
+// needs, and the merchant mirror keeps readers predating D2 rendering a real
+// name with no change.
+describe('detection draft income shape', () => {
+  it('persists an income draft and reloads every carried field', async () => {
+    const { drafts } = setup();
+
+    const created = await drafts.createIncomeDetectionDraft({ ...incomeInput(), detectedAt: at(1), notificationId: 'inbox-9' }, NOW);
+    const reloaded = await drafts.getDetectionDraft(created.id);
+
+    expect(created.kind).toBe('income');
+    expect(reloaded).toMatchObject({
+      kind: 'income',
+      sourceName: 'KINGSLEY U',
+      merchant: 'KINGSLEY U',
+      amount: 2000,
+      currency: 'NGN',
+      category: 'other',
+      detectedAt: at(1),
+      note: 'Detected from Messages',
+      origin: 'auto_capture',
+      source: 'auto_capture',
+      status: 'pending',
+      notificationId: 'inbox-9',
+    });
+  });
+
+  it('keeps expense drafts expense shaped and byte compatible', async () => {
+    const { drafts } = setup();
+
+    const created = await drafts.createDetectionDraft(input(), NOW);
+    const reloaded = await drafts.getDetectionDraft(created.id);
+
+    expect(reloaded).toMatchObject({
+      kind: 'expense',
+      origin: 'auto_capture',
+      sourceName: null,
+      merchant: 'Shoprite',
+      amount: 12500,
+      currency: 'NGN',
+      category: 'groceries',
+      note: 'Weekly shop',
+    });
+  });
+
+  it('reads a pre-D2 row with null kind columns as an expense draft', async () => {
+    const { db, drafts } = setup();
+    db.rows.push({
+      id: 'legacy-1', merchant: 'Shoprite', amount: 12500, currency: 'NGN', category: 'groceries',
+      note: 'Weekly shop', source: 'auto_capture', detected_at: at(80), snoozed_until: null,
+      status: 'pending', notification_id: null, created_at: at(80), updated_at: at(80),
+      kind: null, origin: null, source_name: null,
+    });
+
+    const reloaded = await drafts.getDetectionDraft('legacy-1');
+
+    expect(reloaded).toMatchObject({ kind: 'expense', origin: null, sourceName: null, merchant: 'Shoprite' });
+    expect(isIncomeDraft(reloaded as DetectionDraft)).toBe(false);
+    expect(await drafts.listStaleDrafts(NOW)).toHaveLength(1);
+  });
+
+  it('reads an absent kind as expense, so M3 era literals keep compiling and behaving', () => {
+    const legacy: DetectionDraft = {
+      id: 'd', merchant: 'KINGSLEY U', amount: 2000, currency: 'NGN', category: 'other',
+      note: 'Detected from Messages', source: 'auto_capture', detectedAt: NOW, snoozedUntil: null,
+      status: 'pending', notificationId: null, createdAt: NOW, updatedAt: NOW,
+    };
+    expect(normalizeDraftKind(legacy)).toBe('expense');
+    expect(isIncomeDraft(legacy)).toBe(false);
+    expect(incomeSourceNameOf({ ...legacy, sourceName: 'KINGSLEY U' })).toBe('KINGSLEY U');
+    expect(incomeSourceNameOf({ ...legacy, sourceName: null })).toBe('KINGSLEY U');
+  });
+
+  it('rebuilds the pure D1 income candidate with no merchant key', () => {
+    const draft: DetectionDraft = {
+      id: 'd', merchant: 'KINGSLEY U', amount: 2000, currency: 'NGN', category: 'other',
+      note: 'Detected from Messages', source: 'auto_capture', detectedAt: NOW, snoozedUntil: null,
+      status: 'pending', notificationId: null, createdAt: NOW, updatedAt: NOW,
+      kind: 'income', origin: 'auto_capture', sourceName: 'KINGSLEY U',
+    };
+    const candidate: IncomeCandidate = toIncomeCandidate(draft);
+    expect('merchant' in candidate).toBe(false);
+    expect(candidate).toMatchObject({
+      sourceName: 'KINGSLEY U',
+      amount: 2000,
+      currency: 'NGN',
+      category: 'other',
+      date: NOW,
+      note: 'Detected from Messages',
+      source: 'auto_capture',
+      origin: 'auto_capture',
+    });
+  });
+
+  it('rejects an income draft with no sender, no amount, or no currency', async () => {
+    const { drafts } = setup();
+
+    await expect(drafts.createIncomeDetectionDraft({ ...incomeInput(), sourceName: '   ' }, NOW)).rejects.toMatchObject({ code: 'detection_draft_validation', field: 'sourceName' });
+    await expect(drafts.createIncomeDetectionDraft({ ...incomeInput(), amount: 0 }, NOW)).rejects.toBeInstanceOf(DetectionDraftValidationError);
+    await expect(drafts.createIncomeDetectionDraft({ ...incomeInput(), currency: '  ' }, NOW)).rejects.toBeInstanceOf(DetectionDraftValidationError);
+  });
+});
+
+describe('detection draft income stale, snooze, and discard parity', () => {
+  it('applies the stale window to income drafts exactly like expense drafts', async () => {
+    const { drafts } = setup();
+    await drafts.createIncomeDetectionDraft({ ...incomeInput(), detectedAt: at(80) }, NOW);
+    await drafts.createDetectionDraft({ ...input(), detectedAt: at(73) }, NOW);
+    await drafts.createIncomeDetectionDraft({ ...incomeInput(), detectedAt: at(72) }, NOW);
+    await drafts.createIncomeDetectionDraft({ ...incomeInput(), detectedAt: at(1) }, NOW);
+
+    const stale = await drafts.listStaleDrafts(NOW);
+
+    expect(stale.map(item => item.draft.detectedAt)).toEqual([at(80), at(73)]);
+    expect(stale.map(item => item.draft.kind)).toEqual(['income', 'expense']);
+    expect(stale.map(item => item.ageMs)).toEqual([80 * 60 * 60 * 1000, 73 * 60 * 60 * 1000]);
+  });
+
+  it('snoozes an income draft with the same 24 hour suppression and running stale clock', async () => {
+    const { drafts } = setup();
+    const draft = await drafts.createIncomeDetectionDraft({ ...incomeInput(), detectedAt: at(73) }, NOW);
+
+    const outcome = await drafts.snoozeDetectionDraft(draft.id, NOW);
+
+    expect(outcome).toMatchObject({ status: 'snoozed', snoozedUntil: NOW + DRAFT_SNOOZE_MS });
+    const reloaded = await drafts.getDetectionDraft(draft.id);
+    expect(isRePingSuppressed(reloaded as DetectionDraft, NOW)).toBe(true);
+    expect(await drafts.listPendingDrafts()).toHaveLength(1);
+    expect(await drafts.countPendingDrafts()).toBe(1);
+    const stale = await drafts.listStaleDrafts(NOW);
+    expect(stale).toHaveLength(1);
+    expect(stale[0].draft.kind).toBe('income');
+  });
+
+  it('discards an income draft with the sender as the event name and the linked row accounted', async () => {
+    const { db, drafts, recordEvent } = setup();
+    const draft = await drafts.createIncomeDetectionDraft({ ...incomeInput(), notificationId: 'inbox-7' }, NOW);
+
+    const report = await drafts.discardDetectionDrafts([draft.id], NOW);
+
+    expect(report.items).toEqual([{ id: draft.id, status: 'discarded' }]);
+    expect(recordEvent).toHaveBeenCalledWith(expect.objectContaining({ status: 'discarded', merchant: 'KINGSLEY U' }));
+    expect(db.accountedNotifications).toEqual(['inbox-7']);
+  });
+});
+
+describe('detection draft income batch filing', () => {
+  it('files uncategorized as income rows with the filing note and no memory write', async () => {
+    const { db, drafts, recordEvent } = setup();
+    const income = await drafts.createIncomeDetectionDraft({ ...incomeInput(), notificationId: 'inbox-1' }, NOW);
+    const expense = await drafts.createDetectionDraft({ ...input(), notificationId: 'inbox-2' }, NOW);
+
+    const report = await drafts.fileDetectionDraftsUncategorized([income.id, expense.id], NOW);
+
+    expect(report.items).toEqual([
+      { id: income.id, status: 'filed', incomeId: expect.any(String) },
+      { id: expense.id, status: 'filed', expenseId: expect.any(String) },
+    ]);
+    // Income insert columns: id, source, amount, currency, category, note, is_recurring, date, created_at.
+    expect(db.incomeMerges).toHaveLength(1);
+    expect(db.incomeMerges[0]?.slice(1, 6)).toEqual(['KINGSLEY U', 2000, 'NGN', 'other', 'Detected from Messages | Filed from stale review']);
+    expect(db.expenseMerges).toHaveLength(1);
+    expect(db.expenseMerges.map(params => params[4])).toEqual(['other']);
+    expect(db.statements.join(' ')).not.toContain('merchant_category_memory');
+    expect(recordEvent).toHaveBeenCalledWith(expect.objectContaining({ status: 'confirmed', merchant: 'KINGSLEY U', category: 'other' }));
+    expect(db.accountedNotifications).toEqual(['inbox-1', 'inbox-2']);
+    expect(db.rows.every(row => row.status === 'filed')).toBe(true);
+  });
+
+  it('assigns one caller category to income drafts with no memory write and the original note kept', async () => {
+    const { db, drafts, recordEvent } = setup();
+    const income = await drafts.createIncomeDetectionDraft(incomeInput(), NOW);
+    const expense = await drafts.createDetectionDraft(input(), NOW);
+
+    const report = await drafts.assignDetectionDrafts([income.id, expense.id], 'salary', NOW);
+
+    expect(report.items).toEqual([
+      { id: income.id, status: 'assigned', incomeId: expect.any(String) },
+      { id: expense.id, status: 'assigned', expenseId: expect.any(String) },
+    ]);
+    expect(db.incomeMerges.map(params => params[4])).toEqual(['salary']);
+    expect(db.incomeMerges.map(params => params[5])).toEqual(['Detected from Messages']);
+    expect(db.expenseMerges.map(params => params[4])).toEqual(['salary']);
+    expect(db.statements.join(' ')).not.toContain('merchant_category_memory');
+    expect(recordEvent).toHaveBeenCalledWith(expect.objectContaining({ status: 'confirmed', merchant: 'KINGSLEY U', category: 'salary' }));
+    expect(db.rows.every(row => row.status === 'filed')).toBe(true);
+  });
+});
+
+describe('detection draft income confirm and accounted contract', () => {
+  it('confirms an income draft through the shared saveIncome boundary and marks the row accounted', async () => {
+    const { db, drafts } = setup();
+    const draft = await drafts.createIncomeDetectionDraft({ ...incomeInput(), notificationId: 'inbox-1' }, NOW);
+    const resolveSave = vi.fn(async (candidate: IncomeCandidate) => ({ status: 'saved', record: savedIncome('inc-1'), origin: { source: 'auto_capture', origin: 'auto_capture', reviewed: true } }));
+
+    const outcome = await drafts.confirmIncomeDetectionDraft(draft.id, resolveSave as never, NOW);
+
+    expect(outcome).toMatchObject({ status: 'confirmed', incomeId: 'inc-1' });
+    expect(resolveSave).toHaveBeenCalledWith(expect.objectContaining({ sourceName: 'KINGSLEY U', amount: 2000, currency: 'NGN', category: 'other', origin: 'auto_capture' }));
+    expect(resolveSave.mock.calls[0]?.[0]).not.toHaveProperty('merchant');
+    expect((await drafts.getDetectionDraft(draft.id))?.status).toBe('confirmed');
+    expect(db.accountedNotifications).toEqual(['inbox-1']);
+  });
+
+  it('a duplicate keeps the income draft pending and the inbox row unaccounted', async () => {
+    const { db, drafts } = setup();
+    const draft = await drafts.createIncomeDetectionDraft({ ...incomeInput(), notificationId: 'inbox-1' }, NOW);
+    const resolveSave = vi.fn(async () => ({ status: 'duplicate', duplicate: { existing: savedIncome('inc-0'), reason: 'source_amount_24h' }, origin: { source: 'auto_capture', origin: 'auto_capture', reviewed: true } }));
+
+    const outcome = await drafts.confirmIncomeDetectionDraft(draft.id, resolveSave as never, NOW);
+
+    expect(outcome.status).toBe('duplicate');
+    expect((await drafts.getDetectionDraft(draft.id))?.status).toBe('pending');
+    expect(db.accountedNotifications).toEqual([]);
+  });
+
+  it('refuses to cross kinds without calling either saver', async () => {
+    const { drafts } = setup();
+    const income = await drafts.createIncomeDetectionDraft(incomeInput(), NOW);
+    const expense = await drafts.createDetectionDraft(input(), NOW);
+    const incomeSave = vi.fn();
+    const expenseSave = vi.fn();
+
+    await expect(drafts.confirmIncomeDetectionDraft(expense.id, incomeSave as never, NOW)).resolves.toMatchObject({ status: 'already_resolved' });
+    await expect(drafts.confirmDetectionDraft(income.id, expenseSave as never, NOW)).resolves.toMatchObject({ status: 'already_resolved' });
+    expect(incomeSave).not.toHaveBeenCalled();
+    expect(expenseSave).not.toHaveBeenCalled();
+    expect((await drafts.getDetectionDraft(income.id))?.status).toBe('pending');
+    expect((await drafts.getDetectionDraft(expense.id))?.status).toBe('pending');
+  });
+
+  it('confirm reports missing and resolved income drafts without calling the saver', async () => {
+    const { drafts } = setup();
+    const resolveSave = vi.fn();
+
+    await expect(drafts.confirmIncomeDetectionDraft('missing', resolveSave as never, NOW)).resolves.toMatchObject({ status: 'not_found' });
+    const draft = await drafts.createIncomeDetectionDraft(incomeInput(), NOW);
+    await drafts.discardDetectionDraft(draft.id, NOW);
+    await expect(drafts.confirmIncomeDetectionDraft(draft.id, resolveSave as never, NOW)).resolves.toMatchObject({ status: 'already_resolved' });
+    expect(resolveSave).not.toHaveBeenCalled();
   });
 });

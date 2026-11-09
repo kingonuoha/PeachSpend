@@ -7,6 +7,7 @@ import type {
   AutoCaptureSourceDescriptor,
   AutostartGuideEntry,
   CaptureCandidate,
+  IncomeCandidate,
   NativeAutoCaptureNotification,
   NativeAutoCaptureSourceAdapter,
 } from './contracts';
@@ -186,7 +187,7 @@ export function createParsedAutoCaptureSource(
         const source = byPackage.get(notification.packageName) ?? {
           id: notification.packageName,
           packageName: notification.packageName,
-          displayName: notification.packageName,
+          displayName: resolveSourceDisplayName(notification.packageName),
           status: 'active' as const,
         };
         const outcome = parser.parse(notification, source);
@@ -216,6 +217,126 @@ const SUFFIX_AMOUNT_PATTERN = new RegExp(`(${AMOUNT_CORE})\\s*${AMOUNT_SUFFIX}`,
 // sentence boundary, ends the capture.
 const MERCHANT_PATTERN = /\b(?:at|to|from)\b\s+([^.;|]+?)(?:\s+(?:on|with|using)\b|[.;|]|$)/i;
 
+// Phase 16 D1 direction plus Nigerian field parsing plus friendly names
+// (brief section 4, FR-SHNEW.1, FR-SHNEW.2, FR-SHNEW.4). One shared extractor
+// set serves both the legacy expense parse below and the directed parse, so
+// there is exactly one merchant implementation, never two.
+export type AutoCaptureDirection = 'debit' | 'credit' | 'ambiguous';
+
+export type ParsedAutoCaptureDetection =
+  | { direction: 'debit' | 'ambiguous'; kind: 'expense'; candidate: CaptureCandidate }
+  | { direction: 'credit'; kind: 'income'; candidate: IncomeCandidate };
+
+// Income fallback category. Matches the income.category schema default from
+// migration 5 and the expense fallback the parser already uses, so an
+// unremembered auto-capture never invents a category name.
+export const AUTO_CAPTURE_INCOME_CATEGORY = 'other';
+
+const DEBIT_SIGNAL_PATTERN = /\btxn\s*:\s*dr\b|\bdebit(?:ed)?\b|\bsent\b|\bpaid\b|\bspent\b/i;
+const CREDIT_SIGNAL_PATTERN = /\btxn\s*:\s*cr\b|\bcredit(?:ed)?\b|\breceived\b/i;
+
+export function detectTransferDirection(text: string): AutoCaptureDirection {
+  const debit = DEBIT_SIGNAL_PATTERN.test(text);
+  const credit = CREDIT_SIGNAL_PATTERN.test(text);
+  if (debit && !credit) return 'debit';
+  if (credit && !debit) return 'credit';
+  return 'ambiguous';
+}
+
+// Nigerian bank SMS shape (brief section 3 fixtures). Fields arrive as
+// Key:value pairs on one line, so Des runs until the next known key or the
+// end. acc precedes ac so Acc: never truncates to its first two letters.
+const DES_FIELD_PATTERN = /\bdes\s*:\s*([\s\S]*?)(?=\b(?:acc|amt|bal|date|txn|time|ref|narration|ac)\s*:|$)/i;
+
+function extractDesField(text: string): string | null {
+  const value = text.match(DES_FIELD_PATTERN)?.[1]?.trim();
+  return value ? value : null;
+}
+
+// Footer starts, in order of the fixtures: a Dial plus star code clause, a
+// cancel tail, and a Loan plus question promo. cleanDesValue cuts the Des
+// value at the first marker, so footer copy never reaches the merchant.
+// stripSmsFooters applies the same cuts plus balance only segments to the
+// whole text before the generic at/to/from fallback runs.
+function cleanDesValue(raw: string): string {
+  const cutAt = raw.search(/\bDial\s*\*|\bto\s+cancel\b|\bcancel\s+SMS\b|\bLoan\?/i);
+  const truncated = (cutAt >= 0 ? raw.slice(0, cutAt) : raw).replace(/\s+/g, ' ').trim();
+  return truncated.replace(/^For\s+/i, '');
+}
+
+function isFooterText(value: string): boolean {
+  return /\bDial\s*\*|\bcancel\s+SMS\b|\bLoan\?/i.test(value);
+}
+
+function isBalanceOnlySegment(segment: string): boolean {
+  return /^\s*(?:Bal|Avl\.?\s*Bal|Available\s+Bal(?:ance)?)\s*:?\s*(?:[A-Z]{0,3}\s?)?[\d,.]+\s*$/i.test(segment);
+}
+
+function stripSmsFooters(text: string): string {
+  const withoutClauses = text
+    .replace(/\bDial\s*\*[\d*]*(?:\*[\d*]+)*#?[^\n;|]*/gi, ' ')
+    .replace(/\bto\s+cancel\s+SMS\s+Alerts?[^\n;|]*/gi, ' ')
+    .replace(/\bcancel\s+SMS\s+Alerts?[^\n;|]*/gi, ' ')
+    .replace(/\bLoan\?[^\n;|]*/gi, ' ');
+  return withoutClauses
+    .split(/[|\n]/)
+    .filter(segment => !isBalanceOnlySegment(segment))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Des first, generic fallback second. A Des value that is only footer residue
+// falls through to the generic path, which runs on footer stripped text, so
+// footer only text yields no merchant instead of footer garbage.
+function resolveDesMerchant(desValue: string | null, strippedText: string): string | null {
+  if (desValue) {
+    const cleaned = cleanDesValue(desValue);
+    if (cleaned && !isFooterText(cleaned)) {
+      const inner = cleaned.match(MERCHANT_PATTERN)?.[1]?.trim();
+      if (inner && !isFooterText(inner)) return inner;
+      return cleaned;
+    }
+  }
+  const generic = strippedText.match(MERCHANT_PATTERN)?.[1]?.trim();
+  return generic || null;
+}
+
+// Income sender, read from the Des value first. Transfer from NAME is the
+// primary cue; without it the segment before the slash minus its code prefix
+// is the fallback; without either the generic merchant stands in.
+function extractIncomeSourceName(desValue: string | null, fallbackMerchant: string | null): string | null {
+  if (desValue) {
+    const fromMatch = desValue.match(/\bfrom\s+([^/;|]+?)\s*$/i)?.[1]?.trim();
+    if (fromMatch) return fromMatch;
+    const firstSegment = desValue.split('/')[0].trim().replace(/^[A-Z]{2,}-/, '');
+    if (firstSegment) return firstSegment;
+  }
+  return fallbackMerchant;
+}
+
+const PACKAGE_TO_DISPLAY_NAME: ReadonlyMap<string, string> = new Map(
+  Object.values(ALLOWED_SOURCE_METADATA).map(metadata => [metadata.packageName, metadata.displayName]),
+);
+
+// System packages outside the banking registry that still deliver bank SMS.
+// com.android.mms renders Messages. Anything else unknown renders the short
+// package tail, never invented branding. An empty package is not a name, so
+// it reads as the same generic label the alert service already uses.
+const SYSTEM_PACKAGE_DISPLAY_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  'com.android.mms': 'Messages',
+});
+
+export function resolveSourceDisplayName(packageName: string): string {
+  const clean = packageName.trim();
+  if (!clean) return 'Payment app';
+  const registry = PACKAGE_TO_DISPLAY_NAME.get(clean);
+  if (registry) return registry;
+  const system = SYSTEM_PACKAGE_DISPLAY_NAMES[clean];
+  if (system) return system;
+  return clean.split('.').filter(Boolean).pop() ?? clean;
+}
+
 function normalizeGroupedAmount(raw: string): number | null {
   const value = raw.trim();
   if (!value) return null;
@@ -233,32 +354,95 @@ export function parseNotificationCandidate(
   source: AutoCaptureSourceDescriptor,
   userCurrency?: string | null,
 ): CaptureCandidate | null {
-  // Combined title plus text signal. Title is optional: a missing title reads
-  // as an empty prefix, never a crash. Neither field alone is required; text
-  // carries the match when the title is absent and the title can carry the
-  // merchant when the body holds only the amount. Debit and credit phrasing
-  // both parse through the same amount plus merchant shape; direction is
-  // decided at the confirm sheet, not here. Packages outside the named
-  // registry must additionally pass the shaped gate (FR-SHNEW.1): a
-  // transaction keyword plus the amount plus the merchant below.
+  // Legacy expense only entry, kept for pipeline compatibility (FR-SHNEW.2):
+  // the host and the confirm sheet still consume CaptureCandidate, so this
+  // keeps its signature and expense shape. New work uses
+  // parseAutoCaptureDetection, which shares every extractor below and adds
+  // direction routing. Debit and credit phrasing both parse through the same
+  // amount plus merchant shape; direction is routed by the directed parse,
+  // not here. Packages outside the named registry must additionally pass the
+  // shaped gate (FR-SHNEW.1): a transaction keyword plus the amount plus the
+  // merchant below.
   const text = `${notification.title ?? ''} ${notification.text}`.trim();
   if (!isRegistryPackage(source.packageName) && !passesShapedGate(text)) return null;
-  const amountToken = text.match(PREFIX_AMOUNT_PATTERN)?.[1] ?? text.match(SUFFIX_AMOUNT_PATTERN)?.[1];
+  const stripped = stripSmsFooters(text);
+  const amountToken = stripped.match(PREFIX_AMOUNT_PATTERN)?.[1] ?? stripped.match(SUFFIX_AMOUNT_PATTERN)?.[1];
   if (!amountToken) return null;
   const amount = normalizeGroupedAmount(amountToken);
   if (amount === null) return null;
-  const merchantMatch = text.match(MERCHANT_PATTERN);
-  const merchant = merchantMatch?.[1]?.trim();
+  const merchant = resolveDesMerchant(extractDesField(stripped), stripped);
   if (!merchant) return null;
   return {
     merchant,
     amount,
-    currency: inferCurrency(text, userCurrency),
+    currency: inferCurrency(stripped, userCurrency),
     category: 'other',
     date: notification.receivedAt,
     source: 'auto_capture',
     origin: 'auto_capture',
-    note: `Detected from ${source.displayName}`,
+    note: `Detected from ${resolveSourceDisplayName(source.packageName)}`,
+  };
+}
+
+// Phase 16 D1 directed parse (brief section 4, FR-SHNEW.4). Debit routes to
+// an expense candidate exactly as the legacy parse above; credit routes to an
+// income candidate with the sender as sourceName, the income category
+// default, the notification time as date, and origin auto_capture for the
+// shared saveIncome boundary. Ambiguous text keeps expense behavior and
+// records the ambiguity in the note, never a guessed direction. Returns null
+// for unparseable text (no amount, no merchant, no sender) exactly like the
+// legacy parse, so the notification parser keeps its ignored outcome.
+export function parseAutoCaptureDetection(
+  notification: NativeAutoCaptureNotification,
+  source: AutoCaptureSourceDescriptor,
+  userCurrency?: string | null,
+): ParsedAutoCaptureDetection | null {
+  const text = `${notification.title ?? ''} ${notification.text}`.trim();
+  if (!isRegistryPackage(source.packageName) && !passesShapedGate(text)) return null;
+  const stripped = stripSmsFooters(text);
+  const amountToken = stripped.match(PREFIX_AMOUNT_PATTERN)?.[1] ?? stripped.match(SUFFIX_AMOUNT_PATTERN)?.[1];
+  if (!amountToken) return null;
+  const amount = normalizeGroupedAmount(amountToken);
+  if (amount === null) return null;
+  const currency = inferCurrency(stripped, userCurrency);
+  const displayName = resolveSourceDisplayName(source.packageName);
+  const desValue = extractDesField(stripped);
+  const direction = detectTransferDirection(stripped);
+  if (direction === 'credit') {
+    const sourceName = extractIncomeSourceName(desValue, resolveDesMerchant(desValue, stripped));
+    if (!sourceName) return null;
+    return {
+      direction,
+      kind: 'income',
+      candidate: {
+        sourceName,
+        amount,
+        currency,
+        category: AUTO_CAPTURE_INCOME_CATEGORY,
+        date: notification.receivedAt,
+        note: `Detected from ${displayName}`,
+        source: 'auto_capture',
+        origin: 'auto_capture',
+      },
+    };
+  }
+  const merchant = resolveDesMerchant(desValue, stripped);
+  if (!merchant) return null;
+  return {
+    direction,
+    kind: 'expense',
+    candidate: {
+      merchant,
+      amount,
+      currency,
+      category: 'other',
+      date: notification.receivedAt,
+      source: 'auto_capture',
+      origin: 'auto_capture',
+      note: direction === 'ambiguous'
+        ? `Detected from ${displayName} (direction unclear, kept as expense)`
+        : `Detected from ${displayName}`,
+    },
   };
 }
 

@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  AUTO_CAPTURE_INCOME_CATEGORY,
   createOptionalAutoCaptureSourceAdapter,
   createParsedAutoCaptureSource,
   createNotificationParser,
+  detectTransferDirection,
+  parseAutoCaptureDetection,
   parseNotificationCandidate,
+  resolveSourceDisplayName,
   sanitizeNativeNotification,
   filterSupportedSources,
   isRegistryPackage,
@@ -199,11 +203,108 @@ describe('optional auto-capture source boundary', () => {
     });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
-      candidate: { merchant: 'Jane Doe', amount: 25000, note: `Detected from ${smsFallback.packageName}` },
+      candidate: { merchant: 'Jane Doe', amount: 25000, note: 'Detected from smsapp' },
     });
   });
 
   it('gives shaped fallback packages no registry row', () => {
     expect(filterSupportedSources([smsFallback], new Set([smsFallback.packageName]))).toEqual([]);
+  });
+});
+
+// Phase 16 D1 pins (brief section 3 fixtures, masked exactly as shown, never
+// unmasked or expanded). Direction plus Nigerian field parsing plus friendly
+// names share the extractors above, so these pin the contract Mobile M2 and
+// M3 build against.
+describe('phase 16 direction plus Nigerian field parsing plus friendly names', () => {
+  // Kingsley device evidence, 2026-11-09, account digits masked as recorded.
+  const OPAY_DEBIT_SMS = 'DEBIT ALERT Acc:907****170 Amt:NGN2,000.00 Bal:NGN77,199.58 Date:09-Nov-2026 16:18 Des:For Transfer Via E-Channel Dial *955*100# to cancel SMS Alerts';
+  const UBA_CREDIT_SMS = 'Txn:CR Ac:2XX..31X Amt:NGN 2,000.00 Des:TNF-KINGSLEY UZOMA ONUOHA/Transfer from KINGSLEY U Date:09-11-2026 16:18 Bal:NGN 9,693.60';
+
+  const smsSource: AutoCaptureSourceDescriptor = {
+    id: 'com.android.mms', packageName: 'com.android.mms', displayName: 'com.android.mms', status: 'active',
+  };
+
+  it('routes the OPay debit fixture to an expense with a non footer merchant', () => {
+    const detected = parseAutoCaptureDetection(
+      { id: 'opay-debit-device', packageName: opaySource.packageName, text: OPAY_DEBIT_SMS, receivedAt: 100 },
+      opaySource,
+    );
+    expect(detected).not.toBeNull();
+    expect(detected?.direction).toBe('debit');
+    expect(detected?.kind).toBe('expense');
+    if (detected?.kind !== 'expense') return;
+    expect(detected.candidate).toMatchObject({
+      merchant: 'Transfer Via E-Channel',
+      amount: 2000,
+      currency: 'NGN',
+      category: 'other',
+      date: 100,
+      source: 'auto_capture',
+      origin: 'auto_capture',
+      note: 'Detected from OPay',
+    });
+    expect(detected.candidate.merchant.toLowerCase()).not.toContain('cancel');
+    expect(detected.candidate.merchant.toLowerCase()).not.toContain('sms alert');
+  });
+
+  it('routes the UBA credit fixture to an income candidate with the sender as sourceName', () => {
+    const detected = parseAutoCaptureDetection(
+      { id: 'uba-credit-device', packageName: smsSource.packageName, text: UBA_CREDIT_SMS, receivedAt: 200 },
+      smsSource,
+    );
+    expect(detected).not.toBeNull();
+    expect(detected?.direction).toBe('credit');
+    expect(detected?.kind).toBe('income');
+    if (detected?.kind !== 'income') return;
+    expect(detected.candidate).toMatchObject({
+      sourceName: 'KINGSLEY U',
+      amount: 2000,
+      currency: 'NGN',
+      category: AUTO_CAPTURE_INCOME_CATEGORY,
+      date: 200,
+      source: 'auto_capture',
+      origin: 'auto_capture',
+      note: 'Detected from Messages',
+    });
+  });
+
+  it('keeps an ambiguous direction as expense and notes the ambiguity', () => {
+    expect(detectTransferDirection('NGN 25,000 at Shoprite')).toBe('ambiguous');
+    const detected = parseAutoCaptureDetection(
+      { id: 'ambiguous', packageName: source.packageName, text: 'NGN 25,000 at Shoprite', receivedAt: 300 },
+      source,
+    );
+    expect(detected?.direction).toBe('ambiguous');
+    expect(detected?.kind).toBe('expense');
+    if (detected?.kind !== 'expense') return;
+    expect(detected.candidate).toMatchObject({ merchant: 'Shoprite', amount: 25000, currency: 'NGN' });
+    expect(detected.candidate.note).toContain('direction unclear, kept as expense');
+  });
+
+  it('marks text with both debit and credit signals ambiguous, never a guessed direction', () => {
+    expect(detectTransferDirection('Txn:DR debit then Txn:CR credit on one line')).toBe('ambiguous');
+    expect(detectTransferDirection('DEBIT ALERT Acc:907****170 Amt:NGN2,000.00')).toBe('debit');
+    expect(detectTransferDirection('Txn:CR Ac:2XX..31X Amt:NGN 2,000.00')).toBe('credit');
+  });
+
+  it('yields no merchant from footer only text instead of footer garbage', () => {
+    const footerOnly = 'Debit alert Amt:NGN2,000.00 Des:Dial *955*100# to cancel SMS Alerts Date:09-Nov-2026';
+    expect(parseAutoCaptureDetection(
+      { id: 'footer-only', packageName: source.packageName, text: footerOnly, receivedAt: 400 },
+      source,
+    )).toBeNull();
+    expect(parseNotificationCandidate(
+      { id: 'footer-only-legacy', packageName: source.packageName, text: footerOnly, receivedAt: 400 },
+      source,
+    )).toBeNull();
+  });
+
+  it('resolves friendly source names and falls back to the short package tail', () => {
+    expect(resolveSourceDisplayName('com.android.mms')).toBe('Messages');
+    expect(resolveSourceDisplayName('team.opay.pay')).toBe('OPay');
+    expect(resolveSourceDisplayName('com.ubanquity.redd.uba')).toBe('UBA Mobile App');
+    expect(resolveSourceDisplayName('com.example.smsapp')).toBe('smsapp');
+    expect(resolveSourceDisplayName('  ')).toBe('Payment app');
   });
 });

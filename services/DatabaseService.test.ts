@@ -1300,7 +1300,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v1', userVersion: 0, currentVersion: 9, hasRecords: false,
+      schema: 'v1', userVersion: 0, currentVersion: 10, hasRecords: false,
     });
   });
 
@@ -1313,7 +1313,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v2', userVersion: 6, currentVersion: 9, hasRecords: true,
+      schema: 'v2', userVersion: 6, currentVersion: 10, hasRecords: true,
     });
   });
 
@@ -1329,7 +1329,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'v2', userVersion: 7, currentVersion: 9, hasRecords: true,
+      schema: 'v2', userVersion: 7, currentVersion: 10, hasRecords: true,
     });
   });
 
@@ -1342,7 +1342,7 @@ describe('DatabaseService v1 to v2 continuity detection and migration (DEC-32)',
     });
 
     await expect(databaseService.detectContinuity()).resolves.toEqual({
-      schema: 'none', userVersion: 0, currentVersion: 9, hasRecords: false,
+      schema: 'none', userVersion: 0, currentVersion: 10, hasRecords: false,
     });
   });
 

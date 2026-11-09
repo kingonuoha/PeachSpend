@@ -251,7 +251,50 @@ const migration9: Migration = {
   },
 };
 
-export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9];
+// Phase 16 D2. The income shape for the detection draft queue. A credit leg
+// drafts as income (sourceName, amount, currency, category, date, note,
+// origin), so a backgrounded income detection persists with every field the
+// saveIncome boundary needs instead of squeezing through the expense shape.
+// Three additive columns on the migration 9 table, each guarded so an
+// interrupted retry is a no-op:
+//
+// - kind tells expense drafts ('expense', the default every pre-D2 row reads)
+//   from income drafts ('income'). Stale, snooze, counted, and batch reads
+//   never filter on it, so both kinds age and resolve identically.
+// - origin persists the candidate origin (auto_capture). Old rows read NULL
+//   and the store falls back to auto_capture when filing them.
+// - source_name persists the income sender. Expense drafts keep NULL here and
+//   keep merchant as the name; income drafts mirror the sender into merchant
+//   as well, so every reader predating D2 (stale sheet, alert content, inbox
+//   copy) keeps rendering a real name with no change.
+//
+// The existing (status, detected_at) index already serves both kinds, so no
+// new index ships.
+//
+// One way, with the reason stated rather than left for a reader to guess:
+// there is no down(). The draft rows are the only pointer the app holds to
+// detections the user has not resolved yet, now including income drafts, and
+// inbox rows link to them. A rollback would strand pending detections and
+// orphan those links.
+const migration10: Migration = {
+  version: 10,
+  name: 'detection-draft-income-shape',
+  oneWayReason: 'A rollback would strand pending user detections, now including income drafts, and orphan the inbox rows linked to them.',
+  async up(db) {
+    const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(detection_drafts)');
+    if (!columns.some(item => item.name === 'kind')) {
+      await db.execAsync("ALTER TABLE detection_drafts ADD COLUMN kind TEXT NOT NULL DEFAULT 'expense'");
+    }
+    if (!columns.some(item => item.name === 'origin')) {
+      await db.execAsync('ALTER TABLE detection_drafts ADD COLUMN origin TEXT');
+    }
+    if (!columns.some(item => item.name === 'source_name')) {
+      await db.execAsync('ALTER TABLE detection_drafts ADD COLUMN source_name TEXT');
+    }
+  },
+};
+
+export const migrations: Migration[] = [migration1, migration2, migration3, migration4, migration5, migration6, migration7, migration8, migration9, migration10];
 
 // Connection level setup, applied on every open so the settings cannot drift between
 // an install that migrated and one that opened an already current file.

@@ -38,6 +38,7 @@ import { useThemeStyles } from '../hooks/useThemeStyles';
 import { useReduceMotion } from '../hooks/useReduceMotion';
 import { Radii, Spacing, Typography } from '../constants/tokens';
 import { notificationDataService } from '../services/DataServices';
+import { resolveSourceDisplayName } from '../data/AutoCaptureSource';
 import type {
   NotificationDestination,
   NotificationKind,
@@ -84,6 +85,24 @@ const MASK = '••••';
 
 function maskAmounts(text: string): string {
   return text.replace(AMOUNT_TOKEN, MASK);
+}
+
+// Phase 16 M2 friendly source display (D1 contract). Detection inbox bodies are
+// stored as "<amount> from <source>. Open to confirm, edit, or snooze." where
+// the source was written at raise time. Rows raised before D1 can carry the raw
+// package (for example "from com.android.mms"), so draft rows map any
+// package-like source fragment through the shared resolveSourceDisplayName at
+// render time. Already friendly labels pass through unchanged (no dot, no
+// match), and non-draft rows never carry a source fragment, so they are
+// untouched. One mapping implementation lives in the data layer; this is a
+// display call, not a second copy.
+const PACKAGE_SOURCE_PATTERN = /\bfrom\s+([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)\b/;
+
+export function friendlyDetectionBody(body: string): string {
+  return body.replace(
+    PACKAGE_SOURCE_PATTERN,
+    (_match, packageName: string) => `from ${resolveSourceDisplayName(packageName)}`,
+  );
 }
 
 type KindIcon = React.ComponentType<{ size?: number; color?: string }>;
@@ -166,7 +185,10 @@ function NotificationRow({ record, pricesVisible, onOpen }: NotificationRowProps
   const Icon = visual.Icon;
   const unread = !record.read;
   const badge = destinationBadge(record.destination.screen);
-  const body = pricesVisible ? record.body : maskAmounts(record.body);
+  // Draft rows render the D1 display name, never the raw package. New rows are
+  // already friendly at rest; the render call also heals rows stored before D1.
+  const stored = pricesVisible ? record.body : maskAmounts(record.body);
+  const body = record.draftId ? friendlyDetectionBody(stored) : stored;
   // The canonical row is `bg-white dark:bg-[#1C1730]`: white card in light,
   // surface (not raised) in dark. LuminousCard `high` is surfaceContainerHigh,
   // so dark must use `low` to land on #1C1730 rather than #241D3D.

@@ -6,18 +6,62 @@ import { canUseNativeRuntime, isExpoGoRuntime } from '../utils/runtimeEnvironmen
 
 let Notifications: typeof import('expo-notifications') | null = null;
 if (!isExpoGoRuntime()) {
-  // Keep native module lazy, Expo Go cannot load it.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const loadedNotifications = require('expo-notifications') as typeof import('expo-notifications');
-  Notifications = loadedNotifications;
-  loadedNotifications.setNotificationHandler({
-    handleNotification: async () => ({
-      shouldShowBanner: true,
-      shouldShowList: true,
-      shouldPlaySound: true,
-      shouldSetBadge: false,
-    }),
-  });
+  // Keep native module lazy, Expo Go cannot load it. The try boundary keeps
+  // non runtime imports (node tests) honest: a load failure reads as no
+  // module instead of crashing the import.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const loadedNotifications = require('expo-notifications') as typeof import('expo-notifications');
+    Notifications = loadedNotifications;
+    loadedNotifications.setNotificationHandler({
+      handleNotification: async () => ({
+        shouldShowBanner: true,
+        shouldShowList: true,
+        shouldPlaySound: true,
+        shouldSetBadge: false,
+      }),
+    });
+  } catch {
+    Notifications = null;
+  }
+}
+
+// Phase 16 M1 device ping permission. The rich detection alert posts through
+// the native NotificationManager, not through this service, but Android 13
+// plus gates every post behind the same POST_NOTIFICATIONS runtime grant that
+// expo-notifications requests. The Phase 15 build declared the manifest
+// permission yet never asked at runtime on the detection path, so the native
+// post was refused (caught inside the Kotlin builder, posted false) while the
+// draft plus inbox row persisted. These helpers expose that grant so the
+// auto-capture setup screen can read it and request it with honest copy. No
+// channel, no schedule, and no listener change here: the detection channel
+// stays native HIGH with full screen intent, and the expense channel below
+// keeps DEFAULT importance.
+export type DeviceAlertPermissionState = 'granted' | 'denied' | 'undetermined' | 'unavailable' | 'unsupported';
+
+export function toDeviceAlertPermissionState(status: unknown): DeviceAlertPermissionState {
+  if (status === 'granted' || status === 'denied' || status === 'undetermined') return status;
+  return 'unavailable';
+}
+
+async function resolveNotificationsModule(): Promise<typeof import('expo-notifications') | null> {
+  if (Notifications) return Notifications;
+  if (!canUseNativeRuntime('expo-notifications')) return null;
+  try {
+    const loaded = await import('expo-notifications');
+    Notifications = loaded;
+    loaded.setNotificationHandler({
+      handleNotification: async () => ({
+        shouldShowBanner: true,
+        shouldShowList: true,
+        shouldPlaySound: true,
+        shouldSetBadge: false,
+      }),
+    });
+    return loaded;
+  } catch {
+    return null;
+  }
 }
 
 class NotificationService {
@@ -54,6 +98,35 @@ class NotificationService {
       return true;
     } catch {
       logger.error('Failed to request notification permissions', 'notification_permission_failed');
+      return false;
+    }
+  }
+
+  // Reads the OS device alert grant without prompting. Unsupported means
+  // this runtime cannot post (Expo Go, web, missing module); unavailable
+  // means the read itself failed. Neither state invents a grant.
+  async getDeviceAlertPermission(): Promise<DeviceAlertPermissionState> {
+    const native = await resolveNotificationsModule();
+    if (!native) return 'unsupported';
+    try {
+      const { status } = await native.getPermissionsAsync();
+      return toDeviceAlertPermissionState(status);
+    } catch {
+      return 'unavailable';
+    }
+  }
+
+  // Asks the OS for the device alert grant on Android 13 plus. Returns true
+  // only when the grant is held afterwards. A refusal keeps drafts and inbox
+  // rows working; only the popup stays silent.
+  async requestDeviceAlertPermission(): Promise<boolean> {
+    const native = await resolveNotificationsModule();
+    if (!native) return false;
+    try {
+      const { status } = await native.requestPermissionsAsync();
+      return status === 'granted';
+    } catch {
+      logger.error('Failed to request device alert permission', 'device_alert_permission_failed');
       return false;
     }
   }

@@ -7,9 +7,11 @@ import { ArrowLeft, Check, Pencil } from 'lucide-react-native';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { databaseService } from '../../services/DatabaseService';
 import { createNativeAutoCaptureAdapter } from '../../data/NativeAutoCaptureAdapter';
-import type { CaptureCandidate, DuplicateMatch } from '../../data/contracts';
+import type { CaptureCandidate, DuplicateMatch, IncomeCandidate } from '../../data/contracts';
 import type { DetectionDraft } from '../../data/DetectionDrafts';
-import { resolveExpenseSave, runCaptureSideEffects } from '../../data/CaptureService';
+import { incomeSourceNameOf, isIncomeDraft, toIncomeCandidate } from '../../data/DetectionDrafts';
+import { resolveExpenseSave, resolveIncomeSave, runCaptureSideEffects } from '../../data/CaptureService';
+import { buildIncomeSaveCandidate } from '../../components/ui/autoCaptureConfirmIncome';
 import { DuplicateWarningModal } from '../../components/expense/DuplicateWarningModal';
 import { CategoryPickerSheet, type CaptureCategory } from '../../components/capture/CategoryPickerSheet';
 import { CategoryGlyph } from '../../components/capture/CategoryGlyph';
@@ -83,6 +85,8 @@ export default function DetectionDraftSheet() {
         return;
       }
       setDraft(found);
+      // The merchant column mirrors the sender for income drafts (D2), so
+      // this prefill serves both modes with no branch.
       setFields({ merchant: found.merchant, amount: String(found.amount), categoryId: found.category });
       setLoadState('ready');
     }).catch(() => {
@@ -130,6 +134,14 @@ export default function DetectionDraftSheet() {
     };
   }, [fields, view]);
 
+  // Phase 16 M4 income derivation (D2 contract, FR-11.3). The persisted
+  // income draft rebuilds the pure D1 income candidate, then the shared M3
+  // edit merge applies, so summary and edit views share one derivation and
+  // no second income implementation exists. Expense builds above unchanged.
+  const buildIncomeCandidate = useCallback((base: DetectionDraft, overrideCategory?: string): IncomeCandidate => {
+    return buildIncomeSaveCandidate(toIncomeCandidate(base), fields, view, overrideCategory);
+  }, [fields, view]);
+
   const finishTerminal = useCallback(async (status: 'confirmed' | 'discarded') => {
     const store = await databaseService.getDetectionDraftStore();
     await store.resolveDetectionDraft(draftId, status);
@@ -139,6 +151,49 @@ export default function DetectionDraftSheet() {
 
   const confirm = useCallback(async (decision: 'confirm' | 'save_anyway' = 'confirm', overrideCategory?: string) => {
     if (!draft) return;
+    // Phase 16 M4 income path (D2 contract, FR-11.3): an income draft
+    // confirms through the shared saveIncome boundary with duplicate check,
+    // streak only achievement, and shared notification scheduling. Nothing
+    // persists before this tap, same as expense. Expense below unchanged.
+    if (isIncomeDraft(draft)) {
+      if (decision === 'confirm') {
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        setConfirming(true);
+        setSaveError(false);
+      }
+      const incomeCandidate = buildIncomeCandidate(draft, overrideCategory);
+      try {
+        const repository = await databaseService.getCaptureRepository();
+        const resolution = await resolveIncomeSave(repository, incomeCandidate, decision);
+        if (resolution.status === 'duplicate') {
+          setDuplicate(resolution.duplicate);
+          setConfirming(false);
+          return;
+        }
+        if (resolution.status !== 'saved') {
+          setConfirming(false);
+          return;
+        }
+        await runCaptureSideEffects(resolution, incomeCandidate, {
+          onExpenseSaved: async () => undefined,
+          // FR-11.3: income uses the income hook only, never the
+          // expense-only spend badge path.
+          onIncomeSaved: checkForNewAchievements,
+          scheduleNotification: saved => {
+            if ('sourceName' in saved) notificationService.scheduleExpenseNotification(saved.sourceName, formatCurrency(saved.amount, saved.currency));
+          },
+        });
+        if (rememberRule && incomeCandidate.category !== draft.category) {
+          await repository.rememberCategory(incomeCandidate.sourceName, incomeCandidate.category, 'auto_capture').catch(() => undefined);
+        }
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        await finishTerminal('confirmed');
+      } catch {
+        setConfirming(false);
+        setSaveError(true);
+      }
+      return;
+    }
     if (decision === 'confirm') {
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       setConfirming(true);
@@ -173,10 +228,28 @@ export default function DetectionDraftSheet() {
       setConfirming(false);
       setSaveError(true);
     }
-  }, [draft, buildCandidate, checkForNewAchievements, rememberRule, finishTerminal]);
+  }, [draft, buildCandidate, buildIncomeCandidate, checkForNewAchievements, rememberRule, finishTerminal]);
 
   const discard = useCallback(async () => {
     if (!draft) return;
+    // M4: income discards audit through the income boundary, so the audit
+    // names the source, mirroring the M3 overlay. Expense below unchanged.
+    if (isIncomeDraft(draft)) {
+      const incomeCandidate = buildIncomeCandidate(draft);
+      try {
+        const repository = await databaseService.getCaptureRepository();
+        await resolveIncomeSave(repository, incomeCandidate, 'discard');
+      } catch {
+        // A failed audit write never blocks the release; the draft still
+        // resolves below so the user is never stuck on a dead ping.
+      }
+      try {
+        await finishTerminal('discarded');
+      } catch {
+        showToast('Could not discard that detection. Please try again.', 'error');
+      }
+      return;
+    }
     const candidate = buildCandidate(draft);
     try {
       const repository = await databaseService.getCaptureRepository();
@@ -190,7 +263,7 @@ export default function DetectionDraftSheet() {
     } catch {
       showToast('Could not discard that detection. Please try again.', 'error');
     }
-  }, [draft, buildCandidate, finishTerminal, showToast]);
+  }, [draft, buildCandidate, buildIncomeCandidate, finishTerminal, showToast]);
 
   if (loadState === 'loading') {
     return (
@@ -238,8 +311,15 @@ export default function DetectionDraftSheet() {
   const categoryTitle = categories.find(category => category.id === fields.categoryId)?.title ?? draft.category;
   const categoryTint = tintFor(fields.categoryId);
   const resolvedTint = ts.isDark ? categoryTint.dark : categoryTint.light;
+  // M4 two sheet modes (D2 contract): expense confirms as today through the
+  // expense boundary; income confirms through the shared saveIncome boundary.
+  // The sender renders from incomeSourceNameOf, so expense drafts read the
+  // merchant and income drafts the sender with one name each.
+  const isIncomeSheet = isIncomeDraft(draft);
+  const displayName = isIncomeSheet ? incomeSourceNameOf(draft) : draft.merchant;
   const savePreview = buildCandidate(draft);
-  const amountText = formatCurrency(savePreview.amount, draft.currency);
+  const incomeSavePreview = isIncomeSheet ? buildIncomeCandidate(draft) : null;
+  const amountText = formatCurrency(incomeSavePreview ? incomeSavePreview.amount : savePreview.amount, draft.currency);
   const busy = confirming;
   const contentWidth = Math.min(width, SHEET_MAX_WIDTH);
 
@@ -293,7 +373,7 @@ export default function DetectionDraftSheet() {
                     <CategoryGlyph iconName={categories.find(c => c.id === draft.category)?.icon_name} size={18} color={resolvedTint[1]} />
                   </View>
                   <View style={{ flex: 1, minWidth: 0 }}>
-                    <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.text.onSurface }]}>{draft.merchant}</Text>
+                    <Text numberOfLines={1} style={[Typography.labelBold, { color: ts.text.onSurface }]}>{displayName}</Text>
                     <Text numberOfLines={1} style={[Typography.micro, { color: ts.text.onSurfaceVariant }]}>{formatRelativeDateWithTime(draft.detectedAt)}</Text>
                   </View>
                 </View>
@@ -322,7 +402,7 @@ export default function DetectionDraftSheet() {
                 <View style={[styles.ruleBanner, { backgroundColor: ts.raw.successContainer, borderColor: ts.raw.successBorder }]}>
                   <Text style={[Typography.micro, { color: ts.raw.successText, fontFamily: 'Manrope_700Bold' }]}>Rule Auto-Learned</Text>
                   <Text style={[Typography.micro, { color: ts.raw.successText, marginTop: 2 }]}>
-                    {`Future ${draft.merchant} auto-captures will use this category without asking.`}
+                    {`Future ${displayName} auto-captures will use this category without asking.`}
                   </Text>
                 </View>
               ) : null}
@@ -364,14 +444,14 @@ export default function DetectionDraftSheet() {
               </View>
 
               <View>
-                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, fontFamily: 'Manrope_600SemiBold', marginBottom: Spacing.s1 }]}>Merchant Name</Text>
+                <Text style={[Typography.micro, { color: ts.text.onSurfaceVariant, fontFamily: 'Manrope_600SemiBold', marginBottom: Spacing.s1 }]}>{isIncomeSheet ? 'Income Source' : 'Merchant Name'}</Text>
                 <TextInput
                   value={fields.merchant}
                   onChangeText={value => setFields(prev => ({ ...prev, merchant: value }))}
-                  placeholder="Merchant"
+                  placeholder={isIncomeSheet ? 'Income source' : 'Merchant'}
                   placeholderTextColor={ts.text.onSurfaceVariant}
                   selectionColor={ts.raw.primary}
-                  accessibilityLabel="Merchant name"
+                  accessibilityLabel={isIncomeSheet ? 'Income source name' : 'Merchant name'}
                   style={[styles.input, { backgroundColor: ts.bg.screen, borderColor: ts.border.card, color: ts.text.onSurface }]}
                 />
               </View>
@@ -407,7 +487,7 @@ export default function DetectionDraftSheet() {
                 onPress={() => { void Haptics.selectionAsync(); setRememberRule(prev => !prev); }}
                 accessibilityRole="checkbox"
                 accessibilityState={{ checked: rememberRule }}
-                accessibilityLabel={`Remember this category rule for future ${draft.merchant} auto-captures`}
+                accessibilityLabel={`Remember this category rule for future ${displayName} auto-captures`}
                 style={[styles.rememberBox, { backgroundColor: ts.bg.primary5, borderColor: ts.border.primary20 }]}
               >
                 <View
@@ -419,7 +499,7 @@ export default function DetectionDraftSheet() {
                   {rememberRule ? <Check size={14} color={ts.text.white} strokeWidth={3} /> : null}
                 </View>
                 <Text style={[Typography.micro, { color: ts.text.onSurface, flex: 1 }]}>
-                  {`Remember this category rule for future ${draft.merchant} auto-captures.`}
+                  {`Remember this category rule for future ${displayName} auto-captures.`}
                 </Text>
               </Pressable>
 
@@ -457,8 +537,8 @@ export default function DetectionDraftSheet() {
         visible={pickerOpen}
         categories={categories}
         selectedId={fields.categoryId}
-        flowType="expense"
-        originLabel={fields.merchant.trim() || draft.merchant}
+        flowType={isIncomeSheet ? 'income' : 'expense'}
+        originLabel={fields.merchant.trim() || displayName}
         originAmount={Number.isFinite(amountValue) && amountValue > 0 ? formatCurrency(amountValue, draft.currency) : undefined}
         onSelect={category => { setFields(prev => ({ ...prev, categoryId: category.id })); setPickerOpen(false); }}
         onClose={() => setPickerOpen(false)}
@@ -469,11 +549,11 @@ export default function DetectionDraftSheet() {
           visible
           duplicate={duplicate}
           incoming={{
-            merchant: savePreview.merchant,
-            amount: savePreview.amount,
+            merchant: incomeSavePreview ? incomeSavePreview.sourceName : savePreview.merchant,
+            amount: incomeSavePreview ? incomeSavePreview.amount : savePreview.amount,
             currency: draft.currency,
             category: categoryTitle,
-            type: 'expense',
+            type: isIncomeSheet ? 'income' : 'expense',
             date: draft.detectedAt,
           }}
           onSaveAnyway={() => { setDuplicate(null); void confirm('save_anyway', fields.categoryId); }}

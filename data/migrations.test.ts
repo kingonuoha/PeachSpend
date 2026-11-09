@@ -47,7 +47,7 @@ describe('SQLite migration upgrades', () => {
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'category', 'date', 'created_at']));
     db.tables.set('income', new Set(['id', 'source', 'amount', 'currency', 'date', 'created_at']));
     await runMigrations(db as never, migrations);
-    expect(db.userVersion).toBe(9);
+    expect(db.userVersion).toBe(10);
     expect(db.tables.get('income')?.has('category')).toBe(true);
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     expect(db.tables.get('capture_queue')?.has('expires_at')).toBe(true);
@@ -55,6 +55,11 @@ describe('SQLite migration upgrades', () => {
     expect(db.tables.get('expenses')?.has('source')).toBe(true);
     expect(db.tables.has('receipt_drafts')).toBe(true);
     expect(db.tables.has('detection_drafts')).toBe(true);
+    expect(db.tables.get('detection_drafts')).toEqual(new Set([
+      'id', 'merchant', 'amount', 'currency', 'category', 'note', 'source', 'detected_at',
+      'snoozed_until', 'status', 'notification_id', 'created_at', 'updated_at',
+      'kind', 'origin', 'source_name',
+    ]));
   });
 
   it('rolls back version advancement when migration fails', async () => {
@@ -71,7 +76,7 @@ describe('SQLite migration upgrades', () => {
     db.tables.set('capture_queue', new Set(['id', 'payload', 'created_at', 'expires_at']));
     db.tables.set('expenses', new Set(['id', 'source']));
     await runMigrations(db as never, migrations);
-    expect(db.userVersion).toBe(9);
+    expect(db.userVersion).toBe(10);
     expect(db.tables.get('capture_queue')).toEqual(new Set(['id', 'payload', 'created_at', 'expires_at']));
     expect(db.tables.get('expenses')).toEqual(new Set(['id', 'source']));
   });
@@ -162,14 +167,14 @@ describe('migration 7, reader index coverage (BUG-09-11a)', () => {
     expect([...db.indexes]).toEqual([]);
   });
 
-  it('runs inside the runner as version 9 and leaves an existing row untouched', async () => {
+  it('runs inside the runner as version 10 and leaves an existing row untouched', async () => {
     const db = new MigrationDatabase();
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'note', 'scanned', 'date', 'created_at']));
 
     await runMigrations(db as never, migrations);
 
-    expect(db.userVersion).toBe(9);
-    expect(CURRENT_SCHEMA_VERSION).toBe(9);
+    expect(db.userVersion).toBe(10);
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     EXPECTED_INDEXES.forEach(index => expect(db.indexes.has(index)).toBe(true));
   });
@@ -340,19 +345,105 @@ describe('migration 9, detection draft queue (D1)', () => {
     expect(target.oneWayReason).toMatch(/strand pending user detections/);
   });
 
-  it('brings an existing v8 file to version 9 and keeps its rows', async () => {
+  it('brings an existing v8 file to version 10 and keeps its rows', async () => {
     const db = new MigrationDatabase();
     db.userVersion = 8;
     db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'category', 'note', 'scanned', 'date', 'created_at', 'source']));
 
     await runMigrations(db as never, migrations);
 
-    expect(db.userVersion).toBe(9);
-    expect(CURRENT_SCHEMA_VERSION).toBe(9);
+    expect(db.userVersion).toBe(10);
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
     expect(db.tables.has('detection_drafts')).toBe(true);
+    expect(db.tables.get('detection_drafts')).toEqual(new Set([
+      'id', 'merchant', 'amount', 'currency', 'category', 'note', 'source', 'detected_at',
+      'snoozed_until', 'status', 'notification_id', 'created_at', 'updated_at',
+      'kind', 'origin', 'source_name',
+    ]));
     expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
     // The classifier still reads a file written at this version as a v2 file.
-    expect(classifyContinuitySchema(9, true)).toBe('v2');
-    expect(classifyContinuitySchema(9, false)).toBe('v2');
+    expect(classifyContinuitySchema(10, true)).toBe('v2');
+    expect(classifyContinuitySchema(10, false)).toBe('v2');
+  });
+});
+
+// Phase 16 D2. Migration 10 adds the income shape to the detection draft
+// queue and nothing else. These tests pin the parts a later reader could
+// quietly break: that it is additive, idempotent on an interrupted retry,
+// documented as one way for a stated product reason, that it adds no index,
+// and that it leaves every existing table alone.
+describe('migration 10, detection draft income shape (D2)', () => {
+  const migration10 = () => {
+    const found = migrations.find(migration => migration.version === 10);
+    if (!found) throw new Error('migration 10 is missing from the migration list');
+    return found;
+  };
+
+  const v9DetectionDrafts = (): Set<string> => new Set([
+    'id', 'merchant', 'amount', 'currency', 'category', 'note', 'source', 'detected_at',
+    'snoozed_until', 'status', 'notification_id', 'created_at', 'updated_at',
+  ]);
+
+  it('adds kind, origin, and source_name to the draft table the store reads', async () => {
+    const db = new MigrationDatabase();
+    db.tables.set('detection_drafts', v9DetectionDrafts());
+
+    await migration10().up(db as never);
+
+    expect(migration10().name).toBe('detection-draft-income-shape');
+    expect(db.tables.get('detection_drafts')).toEqual(new Set([...v9DetectionDrafts(), 'kind', 'origin', 'source_name']));
+  });
+
+  it('re-runs without duplicating and adds no index', async () => {
+    const db = new MigrationDatabase();
+    db.tables.set('detection_drafts', v9DetectionDrafts());
+
+    await migration10().up(db as never);
+    await migration10().up(db as never);
+
+    expect(db.statements.filter(statement => statement.includes('ADD COLUMN kind'))).toHaveLength(1);
+    expect(db.statements.filter(statement => statement.includes('ADD COLUMN origin'))).toHaveLength(1);
+    expect(db.statements.filter(statement => statement.includes('ADD COLUMN source_name'))).toHaveLength(1);
+    expect(db.statements.join(' ')).not.toContain('CREATE INDEX');
+  });
+
+  it('leaves every existing table untouched', async () => {
+    const db = new MigrationDatabase();
+    db.tables.set('expenses', new Set(['id', 'merchant', 'amount', 'currency', 'date', 'created_at']));
+    db.tables.set('notifications', new Set(['id', 'title', 'body', 'type', 'data', 'read', 'created_at', 'accounted']));
+    db.tables.set('detection_drafts', v9DetectionDrafts());
+    const expensesBefore = [...(db.tables.get('expenses') ?? [])].sort();
+    const notificationsBefore = [...(db.tables.get('notifications') ?? [])].sort();
+
+    await migration10().up(db as never);
+
+    expect([...(db.tables.get('expenses') ?? [])].sort()).toEqual(expensesBefore);
+    expect([...(db.tables.get('notifications') ?? [])].sort()).toEqual(notificationsBefore);
+    expect(db.statements.join(' ')).not.toContain('ALTER TABLE expenses');
+    expect(db.statements.join(' ')).not.toContain('ALTER TABLE notifications');
+  });
+
+  it('is documented as one way with the reason, because a rollback would strand pending detections', async () => {
+    const target = migration10();
+
+    expect(target.down).toBeUndefined();
+    expect(target.oneWayReason).toMatch(/strand pending user detections, now including income drafts/);
+  });
+
+  it('brings an existing v9 file to version 10 and keeps its rows', async () => {
+    const db = new MigrationDatabase();
+    db.userVersion = 9;
+    db.tables.set('detection_drafts', v9DetectionDrafts());
+    db.tables.set('notifications', new Set(['id', 'title', 'body', 'type', 'data', 'read', 'created_at', 'accounted']));
+
+    await runMigrations(db as never, migrations);
+
+    expect(db.userVersion).toBe(10);
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
+    expect(db.tables.get('detection_drafts')).toEqual(new Set([...v9DetectionDrafts(), 'kind', 'origin', 'source_name']));
+    expect(db.records[0]).toEqual({ id: 'v1-expense', merchant: 'Market', amount: 12.5 });
+    // The classifier still reads a file written at this version as a v2 file.
+    expect(classifyContinuitySchema(10, true)).toBe('v2');
+    expect(classifyContinuitySchema(10, false)).toBe('v2');
   });
 });
