@@ -38,6 +38,8 @@ import { aiChatService } from '../services/AIChatService';
 import AutoCaptureConfirmHost from '../components/ui/AutoCaptureConfirmHost';
 import DetectionAlertActionHost from '../components/ui/DetectionAlertActionHost';
 import { StaleReviewHost } from '../components/ui/StaleReviewHost';
+import { dataToken, subscribeDataFreshness } from '../hooks/useDataFreshness';
+import { syncHomeWidgetSnapshot } from '../services/HomeWidgetService';
 import { canUseNativeRuntime, isExpoGoRuntime } from '../utils/runtimeEnvironment';
 import { createShareIntentHandoff } from '../utils/shareIntentHandoff';
 
@@ -210,6 +212,35 @@ function NotificationPermissionGate() {
   return null;
 }
 
+const HOME_WIDGET_DOMAINS = ['ledger', 'settings', 'notifications'] as const;
+
+function HomeWidgetSyncHost() {
+  React.useEffect(() => {
+    let lastToken = dataToken(HOME_WIDGET_DOMAINS);
+    void syncHomeWidgetSnapshot();
+
+    const unsubscribe = subscribeDataFreshness(() => {
+      const nextToken = dataToken(HOME_WIDGET_DOMAINS);
+      if (nextToken === lastToken) return;
+      lastToken = nextToken;
+      void syncHomeWidgetSnapshot();
+    });
+
+    const appState = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        void syncHomeWidgetSnapshot();
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      appState.remove();
+    };
+  }, []);
+
+  return null;
+}
+
 export default function RootLayout() {
   const [loaded, error] = useFonts({
     'NotoSerif_400Regular': NotoSerif_400Regular,
@@ -294,6 +325,7 @@ export default function RootLayout() {
             <AchievementProvider>
             <View style={{ flex: 1, backgroundColor: Colors.background }}>
               <DetectionAlertActionHost />
+              <HomeWidgetSyncHost />
               <BiometricGate>
                   <StreakGate>
                     {canUseNativeRuntime('expo-share-intent') && <ShareIntentHandler />}

@@ -26,6 +26,7 @@
     "date-fns": "^4.1.0",
     "expo": "~57.0.27",
     "expo-auto-capture": "file:./modules/expo-auto-capture",
+    "expo-home-widget": "file:./modules/expo-home-widget",
     "expo-background-fetch": "~57.0.21",
     "expo-background-task": "~57.0.21",
     "expo-blur": "~57.0.3",

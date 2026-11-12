@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="widget_name">PeachSpend</string>
+  <string name="widget_description">Track this month spend, today total, budget progress, and pending alerts.</string>
+  <string name="widget_month_label">This month</string>
+  <string name="widget_action_add">+ Expense</string>
+  <string name="widget_action_scan">Scan</string>
+  <string name="widget_action_alerts">Alerts</string>
+  <string name="widget_no_budget">No budget set</string>
+  <string name="widget_no_streak">No streak yet</string>
+  <string name="widget_alerts_inbox">Inbox</string>
+  <string name="widget_empty_spend">Open PeachSpend to sync</string>
+</resources>

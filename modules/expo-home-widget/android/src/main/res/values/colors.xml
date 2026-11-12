@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <color name="widget_surface">#FFFFFF</color>
+  <color name="widget_border">#ECECF2</color>
+  <color name="widget_text_primary">#17162A</color>
+  <color name="widget_text_secondary">#8B8B99</color>
+  <color name="widget_accent">#7C3AED</color>
+  <color name="widget_pill_bg">#EDE9FE</color>
+  <color name="widget_pill_text">#7C3AED</color>
+  <color name="widget_action_bg">#F7F7FB</color>
+  <color name="widget_progress_track">#ECECF3</color>
+  <color name="widget_success">#10B981</color>
+  <color name="widget_warning">#F59E0B</color>
+  <color name="widget_danger">#EF4444</color>
+  <color name="widget_on_accent">#FFFFFF</color>
+</resources>

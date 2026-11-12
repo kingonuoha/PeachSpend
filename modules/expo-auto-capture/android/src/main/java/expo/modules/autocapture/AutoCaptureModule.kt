@@ -281,6 +281,7 @@ class AutoCaptureModule : Module() {
 
       val parsed = AutoCaptureNativeParser.parse(payload) ?: return
       PendingDetectionQueue.enqueue(resolvedContext, parsed)
+      notifyHomeWidgetRefresh(resolvedContext)
       val heading = if (parsed.kind == "income") "Income detected" else "Payment detected"
       AutoCaptureDetectionAlert.show(
         resolvedContext,
@@ -407,6 +408,18 @@ class AutoCaptureModule : Module() {
         true
       } catch (_: Exception) {
         false
+      }
+    }
+
+    private fun notifyHomeWidgetRefresh(context: Context) {
+      try {
+        val intent = Intent("expo.modules.homewidget.ACTION_REFRESH").apply {
+          setPackage(context.packageName)
+          setComponent(ComponentName(context.packageName, "expo.modules.homewidget.PeachSpendWidgetProvider"))
+        }
+        context.sendBroadcast(intent)
+      } catch (_: Exception) {
+        return
       }
     }
 

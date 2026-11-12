@@ -1,0 +1,10 @@
+{
+  "name": "expo-home-widget",
+  "version": "1.0.0",
+  "main": "index.js",
+  "expo": {
+    "autolinking": {
+      "android": { "modules": ["expo.modules.homewidget.HomeWidgetModule"] }
+    }
+  }
+}

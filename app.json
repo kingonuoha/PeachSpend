@@ -91,6 +91,7 @@
       ],
       "expo-notifications",
       "./plugins/withAutoCapture",
+      "./plugins/withHomeWidget",
       "@react-native-community/datetimepicker"
     ],
     "experiments": {
