@@ -276,7 +276,7 @@ object AutoCaptureNativeParser {
 
   private fun formatCurrency(amount: Double, currency: String): String {
     val magnitude = kotlin.math.abs(amount)
-    val whole = magnitude == kotlin.math.rint(magnitude) && magnitude < Long.MAX_VALUE.toDouble()
+    val whole = magnitude == kotlin.math.truncate(magnitude) && magnitude < Long.MAX_VALUE.toDouble()
     val pattern = if (whole) "#,##0" else "#,##0.00"
     val number = DecimalFormat(pattern, DecimalFormatSymbols(Locale.US)).format(magnitude)
     val prefix = if (amount < 0.0) "-" else ""
