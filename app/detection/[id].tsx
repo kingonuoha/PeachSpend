@@ -7,6 +7,7 @@ import { ArrowLeft, Check, Pencil } from 'lucide-react-native';
 import { useThemeStyles } from '../../hooks/useThemeStyles';
 import { databaseService } from '../../services/DatabaseService';
 import { createNativeAutoCaptureAdapter } from '../../data/NativeAutoCaptureAdapter';
+import { drainNativeDetections } from '../../services/NativeDetectionDrainService';
 import type { CaptureCandidate, DuplicateMatch, IncomeCandidate } from '../../data/contracts';
 import type { DetectionDraft } from '../../data/DetectionDrafts';
 import { incomeSourceNameOf, isIncomeDraft, toIncomeCandidate } from '../../data/DetectionDrafts';
@@ -76,7 +77,9 @@ export default function DetectionDraftSheet() {
     // A missing id reads as missing from the initial state above, so this
     // effect only resolves a real id and never sets state synchronously.
     if (!draftId) return;
-    void databaseService.getDetectionDraftStore().then(async store => {
+    void (async () => {
+      await drainNativeDetections(createNativeAutoCaptureAdapter());
+      const store = await databaseService.getDetectionDraftStore();
       const found = await store.getDetectionDraft(draftId);
       if (!active) return;
       if (!found || found.status !== 'pending') {
@@ -89,7 +92,7 @@ export default function DetectionDraftSheet() {
       // this prefill serves both modes with no branch.
       setFields({ merchant: found.merchant, amount: String(found.amount), categoryId: found.category });
       setLoadState('ready');
-    }).catch(() => {
+    })().catch(() => {
       if (active) setLoadState('failed');
     });
     return () => { active = false; };

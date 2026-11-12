@@ -115,6 +115,8 @@ class UnavailableAutoCaptureSourceAdapter implements NativeAutoCaptureSourceAdap
   async cancelDetectionAlert(): Promise<void> { return undefined; }
   subscribeAlertActions(): () => void { return () => undefined; }
   async consumePendingAlertAction(): Promise<null> { return null; }
+  async consumePendingNativeDetections(): Promise<null> { return null; }
+  async openAutostartSettings(): Promise<boolean> { return false; }
 }
 
 export function createOptionalAutoCaptureSourceAdapter(

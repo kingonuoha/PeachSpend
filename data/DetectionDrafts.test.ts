@@ -687,4 +687,18 @@ describe('detection draft income confirm and accounted contract', () => {
     await expect(drafts.confirmIncomeDetectionDraft(draft.id, resolveSave as never, NOW)).resolves.toMatchObject({ status: 'already_resolved' });
     expect(resolveSave).not.toHaveBeenCalled();
   });
+
+  it('preserves caller-supplied native draftId idempotently for both expense and income', async () => {
+    const { db, drafts } = setup();
+    const firstExpense = await drafts.createDetectionDraft({ ...input(), id: 'native-exp-1' }, NOW);
+    const repeatExpense = await drafts.createDetectionDraft({ ...input(), id: 'native-exp-1' }, NOW + 10);
+    expect(firstExpense.id).toBe('native-exp-1');
+    expect(repeatExpense.id).toBe('native-exp-1');
+
+    const firstIncome = await drafts.createIncomeDetectionDraft({ ...incomeInput(), id: 'native-inc-1' }, NOW);
+    const repeatIncome = await drafts.createIncomeDetectionDraft({ ...incomeInput(), id: 'native-inc-1' }, NOW + 10);
+    expect(firstIncome.id).toBe('native-inc-1');
+    expect(repeatIncome.id).toBe('native-inc-1');
+    expect(db.rows).toHaveLength(2);
+  });
 });

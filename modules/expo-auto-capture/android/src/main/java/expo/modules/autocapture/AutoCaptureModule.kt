@@ -3,10 +3,12 @@ package expo.modules.autocapture
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
@@ -14,6 +16,14 @@ class AutoCaptureModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ExpoAutoCapture")
     Events("onNotification", "onAlertAction")
+
+    OnStartObserving("onNotification") {
+      hasNotificationObserver = true
+    }
+
+    OnStopObserving("onNotification") {
+      hasNotificationObserver = false
+    }
 
     AsyncFunction("getPermissionState") { mapOf(
       "status" to if (isListenerEnabled()) "granted" else "denied",
@@ -23,9 +33,9 @@ class AutoCaptureModule : Module() {
     AsyncFunction("getSupportedSources") {
       supportedPackages.map { packageName ->
         mapOf(
-          "id" to packageName,
+          "id" to sourceId(packageName),
           "packageName" to packageName,
-           "displayName" to displayNames[packageName]!!,
+          "displayName" to displayNames[packageName]!!,
           "status" to if (isPackageInstalled(packageName)) "active" else "not_detected",
         )
       }
@@ -36,9 +46,20 @@ class AutoCaptureModule : Module() {
     }
 
     AsyncFunction("setLifecycle") { enabled: Boolean, permission: String ->
+      val context = appContext.reactContext
       val granted = enabled && permission == "granted"
-      setCaptureEnabled(appContext.reactContext, granted)
-      syncGuardService(appContext.reactContext, granted)
+      setCaptureEnabled(context, granted)
+      syncGuardService(context, granted)
+      if (context != null) {
+        if (granted) {
+          if (isListenerEnabled(context) && !listenerConnected) {
+            requestListenerRebind(context)
+          }
+          AutoCaptureKeepAliveScheduler.schedule(context)
+        } else {
+          AutoCaptureKeepAliveScheduler.cancel(context)
+        }
+      }
     }
 
     AsyncFunction("getBatteryExemption") {
@@ -47,6 +68,10 @@ class AutoCaptureModule : Module() {
 
     AsyncFunction("openBatterySettings") {
       openBatterySettings(appContext.reactContext)
+    }
+
+    AsyncFunction("openAutostartSettings") {
+      openAutostartSettings(appContext.reactContext)
     }
 
     // Phase 14 M2 rich detection alert. The builder posts an expanded custom
@@ -71,15 +96,28 @@ class AutoCaptureModule : Module() {
       context?.let { AutoCaptureAlertReceiver.consumePendingAction(it) }
     }
 
-    // Phase 14 M1 setup state for S-22 (M3). The running flag tracks the guard
-    // service process only; autostart state has no detection API, so the guide
-    // ships as static instructions in TS and never as a sensed value here.
+    // Drains one parsed native detection record per call, oldest first, when
+    // detections arrived while the JS runtime was unloaded. Returns null when empty.
+    AsyncFunction("consumePendingNativeDetections") {
+      val context = appContext.reactContext
+      context?.let { PendingDetectionQueue.consumeNext(it) }
+    }
+
+    // Phase 14 M1 / Phase 17 setup state for S-22. Reports guard running state
+    // alongside real NotificationListenerService connection state, and nudges
+    // requestRebind when enabled, granted, and currently disconnected.
     AsyncFunction("getGuardState") {
       val context = appContext.reactContext
+      val captureEnabled = context?.let(::isCaptureEnabled) ?: false
+      val listenerGranted = context?.let(::isListenerEnabled) ?: false
+      if (context != null && captureEnabled && listenerGranted && !listenerConnected) {
+        requestListenerRebind(context)
+      }
       mapOf(
         "running" to guardRunning,
-        "captureEnabled" to (context?.let(::isCaptureEnabled) ?: false),
-        "listenerGranted" to (context?.let(::isListenerEnabled) ?: false),
+        "connected" to listenerConnected,
+        "captureEnabled" to captureEnabled,
+        "listenerGranted" to listenerGranted,
       )
     }
 
@@ -90,6 +128,7 @@ class AutoCaptureModule : Module() {
       listener = this@AutoCaptureModule
     }
     OnDestroy {
+      hasNotificationObserver = false
       if (listener === this@AutoCaptureModule) listener = null
     }
   }
@@ -137,6 +176,36 @@ class AutoCaptureModule : Module() {
       "com.chippercash",
       "com.vfd.app",
     )
+    private val sourceIds = mapOf(
+      "com.google.android.apps.walletnfcrel" to "google-wallet",
+      "com.chase.sig.android" to "chase",
+      "com.paypal.android.p2pmobile" to "paypal",
+      "com.squareup.cash" to "cash-app",
+      "com.accessbank.nextgen" to "access-bank",
+      "com.firstbank.firstmobile" to "first-bank",
+      "com.gtbank.gtworldv1" to "gtbank",
+      "com.uba.vericash" to "uba",
+      "com.ubanquity.redd.uba" to "uba-mobile-app",
+      "com.zenithBank.eazymoney" to "zenith-bank",
+      "com.interswitchng.www" to "fidelity-bank",
+      "com.appzonegroup.fcmb" to "fcmb",
+      "com.ceva.ubmobile.stallion" to "union-bank",
+      "com.sterlingng.sterlingmobile" to "sterling-bank",
+      "com.wemabank.alat.prod" to "wema-alat",
+      "com.StanbicMobile" to "stanbic-ibtc",
+      "com.app.ecobank" to "ecobank",
+      "com.ecobank.mobileapp5" to "ecobank-mobile",
+      "team.opay.pay" to "opay",
+      "com.transsnet.palmpay" to "palmpay",
+      "com.moniepoint.personal" to "moniepoint",
+      "com.moniepoint.business" to "moniepoint-business",
+      "com.kudabank.app" to "kuda",
+      "com.lenddo.mobile.paylater" to "carbon",
+      "ng.com.fairmoney.fairmoney" to "fairmoney",
+      "com.mypaga.customer" to "paga",
+      "com.chippercash" to "chipper-cash",
+      "com.vfd.app" to "vbank",
+    )
     private val displayNames = mapOf(
       "com.google.android.apps.walletnfcrel" to "Google Wallet",
       "com.chase.sig.android" to "Chase Mobile",
@@ -167,20 +236,61 @@ class AutoCaptureModule : Module() {
       "com.chippercash" to "Chipper Cash",
       "com.vfd.app" to "Vbank",
     )
+    @Volatile
     private var listener: AutoCaptureModule? = null
+    @Volatile
+    private var hasNotificationObserver: Boolean = false
+    @Volatile
     private var guardRunning: Boolean = false
+    @Volatile
+    private var listenerConnected: Boolean = false
 
     fun setGuardRunning(running: Boolean) {
       guardRunning = running
     }
 
+    fun setListenerConnected(connected: Boolean) {
+      listenerConnected = connected
+    }
+
+    fun isListenerConnected(): Boolean = listenerConnected
+
     fun isSupportedPackage(packageName: String): Boolean = supportedPackages.contains(packageName)
+    fun sourceId(packageName: String): String = sourceIds[packageName] ?: packageName
+    fun registryDisplayName(packageName: String): String? = displayNames[packageName]
     fun displayName(packageName: String): String = displayNames[packageName] ?: "Supported payment app"
 
     fun publishNotification(payload: Map<String, Any?>) {
-      val context = listener?.appContext?.reactContext ?: return
-      if (!isCaptureEnabled(context)) return
-      listener?.sendEvent("onNotification", payload)
+      publishNotification(listener?.appContext?.reactContext, payload)
+    }
+
+    fun publishNotification(context: Context?, payload: Map<String, Any?>) {
+      val resolvedContext = context ?: listener?.appContext?.reactContext ?: return
+      if (!isCaptureEnabled(resolvedContext)) return
+
+      val activeModule = listener
+      val activeReactContext = activeModule?.appContext?.reactContext
+      if (activeModule != null && activeReactContext != null && hasNotificationObserver) {
+        try {
+          activeModule.sendEvent("onNotification", payload)
+          return
+        } catch (_: Exception) {
+          // Fall through to zero-drop native handling if the JS bridge is tearing down.
+        }
+      }
+
+      val parsed = AutoCaptureNativeParser.parse(payload) ?: return
+      PendingDetectionQueue.enqueue(resolvedContext, parsed)
+      val heading = if (parsed.kind == "income") "Income detected" else "Payment detected"
+      AutoCaptureDetectionAlert.show(
+        resolvedContext,
+        parsed.draftId,
+        parsed.merchant,
+        parsed.amountText,
+        parsed.appName,
+        parsed.timeText,
+        heading,
+      )
     }
 
     // Phase 14 M2: live delivery of a receiver action intent to JS. Best
@@ -202,6 +312,18 @@ class AutoCaptureModule : Module() {
       val enabled = Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners") ?: return false
       val component = ComponentName(context, AutoCaptureNotificationListenerService::class.java)
       return enabled.split(":").contains(component.flattenToString())
+    }
+
+    fun requestListenerRebind(context: Context?) {
+      if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+      if (!isCaptureEnabled(context) || !isListenerEnabled(context)) return
+      try {
+        NotificationListenerService.requestRebind(
+          ComponentName(context, AutoCaptureNotificationListenerService::class.java),
+        )
+      } catch (_: Exception) {
+        return
+      }
     }
 
     private fun setCaptureEnabled(context: Context?, enabled: Boolean) {
@@ -240,6 +362,51 @@ class AutoCaptureModule : Module() {
         } catch (_: Exception) {
           return
         }
+      }
+    }
+
+    private fun openAutostartSettings(context: Context?): Boolean {
+      if (context == null) return false
+      val candidates = listOf(
+        ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
+        ComponentName("com.miui.securitycenter", "com.miui.powercenter.PowerSettings"),
+        ComponentName("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"),
+        ComponentName("com.oppo.safe", "com.oppo.safe.permission.startup.StartupAppListActivity"),
+        ComponentName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"),
+        ComponentName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"),
+        ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"),
+        ComponentName("com.oneplus.security", "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity"),
+        ComponentName("com.samsung.android.lool", "com.samsung.android.sm.ui.battery.BatteryActivity"),
+      )
+      val pm = context.packageManager
+      for (component in candidates) {
+        val intent = Intent().apply {
+          setComponent(component)
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val resolvable = try {
+          pm.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY) != null
+        } catch (_: Exception) {
+          false
+        }
+        if (resolvable) {
+          try {
+            context.startActivity(intent)
+            return true
+          } catch (_: Exception) {
+            continue
+          }
+        }
+      }
+      return try {
+        val fallback = Intent(
+          Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+          Uri.fromParts("package", context.packageName, null),
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(fallback)
+        true
+      } catch (_: Exception) {
+        false
       }
     }
 

@@ -293,11 +293,11 @@ export default function RootLayout() {
           <ToastProvider>
             <AchievementProvider>
             <View style={{ flex: 1, backgroundColor: Colors.background }}>
+              <DetectionAlertActionHost />
               <BiometricGate>
                   <StreakGate>
                     {canUseNativeRuntime('expo-share-intent') && <ShareIntentHandler />}
                    <AutoCaptureConfirmHost />
-                   <DetectionAlertActionHost />
                    <StaleReviewHost />
                    <Stack
                   screenOptions={{

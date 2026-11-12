@@ -6,6 +6,7 @@ const LISTENER = 'expo.modules.autocapture.AutoCaptureNotificationListenerServic
 const GUARD = 'expo.modules.autocapture.AutoCaptureGuardService';
 const RECEIVER = 'expo.modules.autocapture.AutoCaptureBootReceiver';
 const ALERT_RECEIVER = 'expo.modules.autocapture.AutoCaptureAlertReceiver';
+const KEEP_ALIVE_RECEIVER = 'expo.modules.autocapture.AutoCaptureKeepAliveReceiver';
 
 function blankManifest(): AndroidManifest {
   return {
@@ -52,20 +53,28 @@ describe('withAutoCapture manifest', () => {
     const guard = app.service?.find(entry => entry.$?.['android:name'] === GUARD);
     expect(guard?.$?.['android:foregroundServiceType']).toBe('dataSync');
     expect(namesOf(app.receiver)).toContain(RECEIVER);
+    const boot = app.receiver?.find(entry => entry.$?.['android:name'] === RECEIVER);
+    expect(boot?.$?.['android:directBootAware']).toBe('true');
     const raw = JSON.stringify(out);
     expect(raw).toContain('android.intent.action.BOOT_COMPLETED');
+    expect(raw).toContain('android.intent.action.LOCKED_BOOT_COMPLETED');
+    expect(raw).toContain('android.intent.action.MY_PACKAGE_REPLACED');
   });
 
-  it('registers the alert receiver unexported with no intent filter', () => {
+  it('registers the alert and keep-alive receivers unexported with no intent filter', () => {
     const out = applyAutoCaptureManifest(blankManifest());
     const app = (out.manifest?.application?.[0] ?? {}) as {
       service?: { $?: Record<string, string> }[];
       receiver?: { $?: Record<string, string>; 'intent-filter'?: unknown }[];
     };
     expect(namesOf(app.receiver)).toContain(ALERT_RECEIVER);
+    expect(namesOf(app.receiver)).toContain(KEEP_ALIVE_RECEIVER);
     const alert = app.receiver?.find(entry => entry.$?.['android:name'] === ALERT_RECEIVER);
+    const keepAlive = app.receiver?.find(entry => entry.$?.['android:name'] === KEEP_ALIVE_RECEIVER);
     expect(alert?.$?.['android:exported']).toBe('false');
     expect(alert?.['intent-filter']).toBeUndefined();
+    expect(keepAlive?.$?.['android:exported']).toBe('false');
+    expect(keepAlive?.['intent-filter']).toBeUndefined();
   });
 
   it('is idempotent across repeated prebuild passes', () => {

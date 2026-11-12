@@ -11,6 +11,7 @@ import type {
   NativeAutoCaptureNotification,
   NativeAutoCaptureSourceAdapter,
   PendingAlertAction,
+  PendingNativeDetection,
 } from './contracts';
 import { createOptionalAutoCaptureSourceAdapter, sanitizeNativeNotification } from './AutoCaptureSource';
 
@@ -32,6 +33,9 @@ interface NativeAutoCaptureModule {
   cancelDetectionAlert?(draftId: string): Promise<void>;
   addListener(eventName: 'onAlertAction', listener: (action: { draftId?: string; action?: string }) => void): EventSubscription;
   consumePendingAlertAction?(): Promise<{ draftId?: string; action?: string; receivedAt?: string } | null>;
+  // Phase 17 additions. Same optional rule: older native builds return null / false.
+  consumePendingNativeDetections?(): Promise<Record<string, unknown> | null>;
+  openAutostartSettings?(): Promise<boolean>;
 }
 
 function getNativeModule(): NativeAutoCaptureModule | null {
@@ -107,6 +111,16 @@ class OptionalNativeAutoCaptureAdapter implements NativeAutoCaptureSourceAdapter
     return parseAlertAction(await this.nativeModule.consumePendingAlertAction());
   }
 
+  async consumePendingNativeDetections(): Promise<PendingNativeDetection | null> {
+    if (typeof this.nativeModule.consumePendingNativeDetections !== 'function') return null;
+    return parsePendingNativeDetection(await this.nativeModule.consumePendingNativeDetections());
+  }
+
+  async openAutostartSettings(): Promise<boolean> {
+    if (typeof this.nativeModule.openAutostartSettings !== 'function') return false;
+    return Boolean(await this.nativeModule.openAutostartSettings());
+  }
+
   subscribe(listener: (notification: NativeAutoCaptureNotification) => void): () => void {
     const subscription = this.nativeModule.addListener('onNotification', notification => {
       const safe = sanitizeNativeNotification(notification);
@@ -137,4 +151,52 @@ export function parseAlertAction(raw: { draftId?: string; action?: string; recei
   const receivedAt = Number(raw.receivedAt);
   if (!Number.isFinite(receivedAt) || receivedAt <= 0) return null;
   return { draftId, action: raw.action, receivedAt };
+}
+
+export function parsePendingNativeDetection(raw: Record<string, unknown> | null | undefined): PendingNativeDetection | null {
+  if (!raw) return null;
+  const draftId = typeof raw.draftId === 'string' ? raw.draftId.trim() : '';
+  const packageName = typeof raw.packageName === 'string' ? raw.packageName.trim() : '';
+  const merchant = typeof raw.merchant === 'string' ? raw.merchant.trim() : '';
+  const currency = typeof raw.currency === 'string' ? raw.currency.trim().toUpperCase() : '';
+  const kind = raw.kind === 'expense' || raw.kind === 'income' ? raw.kind : null;
+  const receivedAt = typeof raw.receivedAt === 'number' ? raw.receivedAt : Number(raw.receivedAt);
+  const amount = typeof raw.amount === 'number' ? raw.amount : Number(raw.amount);
+  if (
+    !draftId ||
+    !packageName ||
+    !merchant ||
+    !currency ||
+    !kind ||
+    !Number.isFinite(receivedAt) ||
+    receivedAt <= 0 ||
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    return null;
+  }
+  const sourceId = typeof raw.sourceId === 'string' && raw.sourceId.trim() ? raw.sourceId.trim() : packageName;
+  const appName = typeof raw.appName === 'string' && raw.appName.trim() ? raw.appName.trim() : 'Payment app';
+  const sourceName = typeof raw.sourceName === 'string' && raw.sourceName.trim() ? raw.sourceName.trim() : null;
+  const confidenceRaw = typeof raw.confidence === 'number' ? raw.confidence : Number(raw.confidence);
+  const confidence = raw.confidence !== null && raw.confidence !== undefined && Number.isFinite(confidenceRaw) && confidenceRaw > 0 && confidenceRaw <= 1
+    ? confidenceRaw
+    : null;
+  const directionAmbiguous = Boolean(raw.directionAmbiguous);
+  const note = typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : `Detected from ${appName}`;
+  return {
+    draftId,
+    sourceId,
+    packageName,
+    appName,
+    receivedAt,
+    amount,
+    currency,
+    kind,
+    merchant,
+    sourceName,
+    confidence,
+    directionAmbiguous,
+    note,
+  };
 }

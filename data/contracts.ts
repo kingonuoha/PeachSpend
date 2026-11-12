@@ -253,6 +253,28 @@ export interface NativeAutoCaptureSourceAdapter {
   cancelDetectionAlert?(draftId: string): Promise<void>;
   subscribeAlertActions?(listener: (action: PendingAlertAction) => void): () => void;
   consumePendingAlertAction?(): Promise<PendingAlertAction | null>;
+  // Phase 17 background reliability additions. Optional so iOS, web, Expo Go,
+  // and older native builds degrade to null / false without crashing.
+  consumePendingNativeDetections?(): Promise<PendingNativeDetection | null>;
+  openAutostartSettings?(): Promise<boolean>;
+}
+
+// One parsed detection persisted natively while the JS runtime was unloaded.
+// Carries parsed fields only (never raw notification text).
+export interface PendingNativeDetection {
+  draftId: string;
+  sourceId: string;
+  packageName: string;
+  appName: string;
+  receivedAt: number;
+  amount: number;
+  currency: string;
+  kind: 'expense' | 'income';
+  merchant: string;
+  sourceName?: string | null;
+  confidence?: number | null;
+  directionAmbiguous: boolean;
+  note: string;
 }
 
 // Preformatted alert strings, derived from parsed detection fields only. The
@@ -285,9 +307,11 @@ export interface BatteryExemptionState {
 }
 
 // Foreground guard service state. Running tracks the guard process only and
-// never claims autostart status, which has no detection API.
+// connected tracks NotificationListenerService binding state. Never claims
+// autostart status, which has no detection API.
 export interface GuardServiceState {
   running: boolean;
+  connected?: boolean;
   captureEnabled: boolean;
   listenerGranted: boolean;
 }

@@ -1,18 +1,21 @@
 import { v4 as uuid } from 'uuid';
-import type { Expense } from '../types/database';
+import type { Expense, Income } from '../types/database';
 import { formatCurrency } from '../utils/currency';
 import { formatRelativeDateWithTime } from '../utils/dateFormat';
 import type {
   CaptureCandidate,
   DetectionAlertContent,
+  IncomeCandidate,
   PendingAlertAction,
   SaveResolution,
 } from '../data/contracts';
-import type {
-  DetectionDraft,
-  DetectionDraftInput,
-  DraftConfirmOutcome,
-  DraftSnoozeOutcome,
+import {
+  isIncomeDraft,
+  type DetectionDraft,
+  type DetectionDraftInput,
+  type DraftConfirmOutcome,
+  type DraftIncomeConfirmOutcome,
+  type DraftSnoozeOutcome,
 } from '../data/DetectionDrafts';
 
 // Phase 14 M2 detection alert service. Bridges the native rich alert and the
@@ -118,6 +121,7 @@ export async function raiseDetectionAlert(
 
 export type AlertActionOutcome =
   | { status: 'confirmed'; expenseId: string }
+  | { status: 'confirmed'; incomeId: string }
   | { status: 'duplicate' }
   | { status: 'snoozed'; snoozedUntil: number }
   | { status: 'already_resolved' }
@@ -128,6 +132,9 @@ export interface ApplyAlertActionDeps {
   snoozeDraft: (id: string) => Promise<DraftSnoozeOutcome>;
   cancelAlert: (draftId: string) => Promise<void>;
   resolveSave: (candidate: CaptureCandidate) => Promise<SaveResolution<Expense>>;
+  getDraft?: (id: string) => Promise<DetectionDraft | null>;
+  confirmIncomeDraft?: (id: string, resolveSave: (candidate: IncomeCandidate) => Promise<SaveResolution<Income>>) => Promise<DraftIncomeConfirmOutcome>;
+  resolveIncomeSave?: (candidate: IncomeCandidate) => Promise<SaveResolution<Income>>;
 }
 
 // Applies one receiver action through the shared store boundary, then clears
@@ -150,6 +157,15 @@ export async function applyAlertAction(
     await deps.cancelAlert(action.draftId).catch(() => undefined);
     if (outcome.status === 'snoozed') return { status: 'snoozed', snoozedUntil: outcome.snoozedUntil };
     return { status: outcome.status };
+  }
+  if (deps.getDraft && deps.confirmIncomeDraft && deps.resolveIncomeSave) {
+    const draft = await deps.getDraft(action.draftId);
+    if (draft && isIncomeDraft(draft)) {
+      const incomeOutcome = await deps.confirmIncomeDraft(action.draftId, deps.resolveIncomeSave);
+      await deps.cancelAlert(action.draftId).catch(() => undefined);
+      if (incomeOutcome.status === 'confirmed') return { status: 'confirmed', incomeId: incomeOutcome.incomeId };
+      return { status: incomeOutcome.status };
+    }
   }
   const outcome = await deps.confirmDraft(action.draftId, deps.resolveSave);
   await deps.cancelAlert(action.draftId).catch(() => undefined);

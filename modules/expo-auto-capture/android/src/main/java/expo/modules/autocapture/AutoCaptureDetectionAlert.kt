@@ -88,6 +88,7 @@ object AutoCaptureDetectionAlert {
     amountText: String,
     sourceLabel: String,
     timeText: String,
+    heading: String = "Payment detected",
   ): Boolean {
     if (draftId.isBlank()) return false
     return try {
@@ -104,6 +105,7 @@ object AutoCaptureDetectionAlert {
           )
         }
       }
+      val headingText = clean(heading).ifEmpty { "Payment detected" }
       val merchantText = clean(merchant).ifEmpty { "Payment" }
       val amount = clean(amountText).ifEmpty { "" }
       val source = clean(sourceLabel).ifEmpty { "Payment app" }
@@ -115,7 +117,7 @@ object AutoCaptureDetectionAlert {
         setTextViewText(R.id.detection_amount, amount)
       }
       val expanded = RemoteViews(context.packageName, R.layout.autocapture_detection_expanded).apply {
-        setTextViewText(R.id.detection_heading, "Payment detected")
+        setTextViewText(R.id.detection_heading, headingText)
         setTextViewText(R.id.detection_amount, amount)
         setTextViewText(R.id.detection_merchant, merchantText)
         setTextViewText(R.id.detection_source, if (time.isEmpty()) source else "$source  •  $time")

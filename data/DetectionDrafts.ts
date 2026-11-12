@@ -68,6 +68,7 @@ export interface DetectionDraft {
 }
 
 export interface DetectionDraftInput {
+  id?: string;
   merchant: string;
   amount: number;
   currency: string;
@@ -82,6 +83,7 @@ export interface DetectionDraftInput {
 // amount, currency, category, date (detectedAt), note, and origin; source
 // defaults to auto_capture like the expense input.
 export interface IncomeDetectionDraftInput {
+  id?: string;
   sourceName: string;
   amount: number;
   currency: string;
@@ -296,8 +298,13 @@ export class SqliteDetectionDraftStore {
   async createDetectionDraft(input: DetectionDraftInput, now = Date.now()): Promise<DetectionDraft> {
     if (!Number.isFinite(input.amount) || input.amount <= 0) throw new DetectionDraftValidationError('amount');
     if (!input.currency.trim()) throw new DetectionDraftValidationError('currency');
+    const explicitId = input.id?.trim() || null;
+    if (explicitId) {
+      const existing = await this.getDetectionDraft(explicitId);
+      if (existing) return existing;
+    }
     const draft: DetectionDraft = {
-      id: uuid(),
+      id: explicitId ?? uuid(),
       merchant: input.merchant,
       amount: input.amount,
       currency: input.currency,
@@ -330,8 +337,13 @@ export class SqliteDetectionDraftStore {
     if (!sourceName) throw new DetectionDraftValidationError('sourceName');
     if (!Number.isFinite(input.amount) || input.amount <= 0) throw new DetectionDraftValidationError('amount');
     if (!input.currency.trim()) throw new DetectionDraftValidationError('currency');
+    const explicitId = input.id?.trim() || null;
+    if (explicitId) {
+      const existing = await this.getDetectionDraft(explicitId);
+      if (existing) return existing;
+    }
     const draft: DetectionDraft = {
-      id: uuid(),
+      id: explicitId ?? uuid(),
       merchant: sourceName,
       amount: input.amount,
       currency: input.currency,

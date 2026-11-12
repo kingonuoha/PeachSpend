@@ -5,9 +5,12 @@ const LISTENER_SERVICE = 'expo.modules.autocapture.AutoCaptureNotificationListen
 const GUARD_SERVICE = 'expo.modules.autocapture.AutoCaptureGuardService';
 const BOOT_RECEIVER = 'expo.modules.autocapture.AutoCaptureBootReceiver';
 const ALERT_RECEIVER = 'expo.modules.autocapture.AutoCaptureAlertReceiver';
+const KEEP_ALIVE_RECEIVER = 'expo.modules.autocapture.AutoCaptureKeepAliveReceiver';
 const LISTENER_PERMISSION = 'android.permission.BIND_NOTIFICATION_LISTENER_SERVICE';
 const LISTENER_ACTION = 'android.service.notification.NotificationListenerService';
 const BOOT_COMPLETED_ACTION = 'android.intent.action.BOOT_COMPLETED';
+const LOCKED_BOOT_COMPLETED_ACTION = 'android.intent.action.LOCKED_BOOT_COMPLETED';
+const MY_PACKAGE_REPLACED_ACTION = 'android.intent.action.MY_PACKAGE_REPLACED';
 const GUARD_FOREGROUND_TYPE = 'dataSync';
 
 // Phase 14 M1 manifest surface. Adds only what the always on listener needs:
@@ -75,8 +78,17 @@ export function applyAutoCaptureManifest(manifest: AndroidManifest): AndroidMani
       $: {
         'android:name': BOOT_RECEIVER,
         'android:exported': 'true',
+        'android:directBootAware': 'true',
       },
-      'intent-filter': [{ action: [{ $: { 'android:name': BOOT_COMPLETED_ACTION } }] }],
+      'intent-filter': [
+        {
+          action: [
+            { $: { 'android:name': BOOT_COMPLETED_ACTION } },
+            { $: { 'android:name': LOCKED_BOOT_COMPLETED_ACTION } },
+            { $: { 'android:name': MY_PACKAGE_REPLACED_ACTION } },
+          ],
+        },
+      ],
     });
   }
   // Phase 14 M2 alert action receiver. It answers only our own explicit
@@ -86,6 +98,16 @@ export function applyAutoCaptureManifest(manifest: AndroidManifest): AndroidMani
     receivers.push({
       $: {
         'android:name': ALERT_RECEIVER,
+        'android:exported': 'false',
+      },
+    });
+  }
+  // Phase 17 keep-alive alarm receiver. Triggered only by explicit internal
+  // AlarmManager PendingIntents to rebind the notification listener if unbound.
+  if (!hasName(receivers, KEEP_ALIVE_RECEIVER)) {
+    receivers.push({
+      $: {
+        'android:name': KEEP_ALIVE_RECEIVER,
         'android:exported': 'false',
       },
     });

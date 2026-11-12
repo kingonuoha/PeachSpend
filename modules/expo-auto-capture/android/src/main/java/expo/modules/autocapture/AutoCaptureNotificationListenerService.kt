@@ -5,6 +5,23 @@ import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 
 class AutoCaptureNotificationListenerService : NotificationListenerService() {
+  override fun onListenerConnected() {
+    super.onListenerConnected()
+    AutoCaptureModule.setListenerConnected(true)
+    if (AutoCaptureModule.isCaptureEnabled(applicationContext) && AutoCaptureModule.isListenerEnabled(applicationContext)) {
+      AutoCaptureKeepAliveScheduler.schedule(applicationContext)
+    }
+  }
+
+  override fun onListenerDisconnected() {
+    AutoCaptureModule.setListenerConnected(false)
+    if (AutoCaptureModule.isCaptureEnabled(applicationContext) && AutoCaptureModule.isListenerEnabled(applicationContext)) {
+      AutoCaptureModule.requestListenerRebind(applicationContext)
+      AutoCaptureKeepAliveScheduler.schedule(applicationContext)
+    }
+    super.onListenerDisconnected()
+  }
+
   override fun onNotificationPosted(sbn: StatusBarNotification) {
     if (!AutoCaptureModule.isCaptureEnabled(applicationContext)) return
     if (!AutoCaptureModule.isListenerEnabled(applicationContext)) return
@@ -30,7 +47,7 @@ class AutoCaptureNotificationListenerService : NotificationListenerService() {
       "receivedAt" to sbn.postTime,
     )
     if (sanitized.title != null) payload["title"] = sanitized.title
-    AutoCaptureModule.publishNotification(payload)
+    AutoCaptureModule.publishNotification(applicationContext, payload)
   }
 
   private data class SanitizedNotification(val title: String?, val text: String)
